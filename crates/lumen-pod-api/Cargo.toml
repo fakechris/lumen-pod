@@ -1,0 +1,24 @@
+[package]
+name = "lumen-pod-api"
+description = "Public REST API server for lumen-pod — axum, Google OAuth, whitelist invite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lumen-pod-server"
+path = "src/main.rs"
+
+[dependencies]
+lumen-pod-core = { path = "../lumen-pod-core" }
+lumen-pod-mcp = { path = "../lumen-pod-mcp" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

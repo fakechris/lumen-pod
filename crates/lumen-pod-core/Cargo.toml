@@ -1,0 +1,15 @@
+[package]
+name = "lumen-pod-core"
+description = "Episode data model, SQLite storage, and full-text search for lumen-pod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true }
