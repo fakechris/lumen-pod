@@ -74,7 +74,7 @@ fn tools() -> Vec<Value> {
     vec![
         tool(
             "pod_publish",
-            "Publish a fully processed episode (transcript + summary + chapters). The episode JSON must include source, processing, and at least summary or transcript.",
+            "Publish a fully processed episode. The episode JSON should include: source (url, platform, title, author, duration, description, podcast_name, language), processing (status, asr_engine, llm_model), summary (one_liner, abstract, key_takeaways, thinking_questions, glossary), transcript (paragraphs with speaker/sentences/words), chapters (title, start_time, end_time, summary, has_ads), mindmap (markdown, opml), keywords [{key, desc}], highlights [{time, content}], qas [{question, answer, question_speaker, answer_speaker}], clips, shownotes, tags.",
             &["episode_json"],
         ),
         tool(
@@ -101,6 +101,11 @@ fn tools() -> Vec<Value> {
             "pod_exists",
             "Check if an episode with the given source URL already exists.",
             &["url"],
+        ),
+        tool(
+            "pod_update",
+            "Update an existing episode's fields. Pass the episode id and a partial JSON with only the fields to update (e.g. is_read, tags, collection_id, summary, keywords, qas, clips, highlights, article, shownotes, mindmap, chapters).",
+            &["id", "updates_json"],
         ),
     ]
 }
@@ -209,6 +214,16 @@ fn call_tool(
             let id = args.get("id").and_then(|v| v.as_str()).ok_or("missing id")?;
             let deleted = store.delete_episode(id)?;
             Ok(json!({"deleted": deleted}).to_string())
+        }
+        "pod_update" => {
+            let id = args.get("id").and_then(|v| v.as_str()).ok_or("missing id")?;
+            let updates_json = args
+                .get("updates_json")
+                .and_then(|v| v.as_str())
+                .ok_or("missing updates_json")?;
+            let updates: Value = serde_json::from_str(updates_json)?;
+            let episode = store.update_episode(id, &updates)?;
+            Ok(json!({"status": "ok", "id": episode.id, "updated_at": episode.updated_at}).to_string())
         }
         "pod_exists" => {
             let url = args

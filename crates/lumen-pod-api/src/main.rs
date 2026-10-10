@@ -45,8 +45,11 @@ async fn main() {
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/api/episodes", get(list_episodes))
-        .route("/api/episodes/{id}", get(get_episode).delete(delete_episode))
+        .route("/api/episodes", get(list_episodes).post(create_episode))
+        .route(
+            "/api/episodes/{id}",
+            get(get_episode).patch(update_episode).delete(delete_episode),
+        )
         .route("/api/search", get(search_episodes))
         .route("/api/stats", get(stats))
         .route("/healthz", get(healthz))
@@ -114,6 +117,50 @@ async fn get_episode(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match store.get_episode(&id) {
+        Ok(ep) => (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response(),
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn create_episode(
+    State(store): State<AppState>,
+    Json(mut episode): Json<lumen_pod_core::episode::Episode>,
+) -> impl IntoResponse {
+    if episode.id.is_empty() {
+        episode.id = uuid::Uuid::new_v4().to_string();
+    }
+    let now = chrono::Utc::now();
+    episode.created_at = now;
+    episode.updated_at = now;
+    match store.insert_episode(&episode) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"id": episode.id})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn update_episode(
+    State(store): State<AppState>,
+    Path(id): Path<String>,
+    Json(updates): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    match store.update_episode(&id, &updates) {
         Ok(ep) => (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response(),
         Err(lumen_pod_core::error::PodError::NotFound(_)) => (
             StatusCode::NOT_FOUND,

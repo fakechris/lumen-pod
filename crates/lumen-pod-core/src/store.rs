@@ -267,6 +267,95 @@ impl Store {
         ids.iter().map(|id| self.get_episode(id)).collect()
     }
 
+    pub fn update_episode(&self, id: &str, updates: &serde_json::Value) -> PodResult<Episode> {
+        let mut ep = self.get_episode(id)?;
+        if let Some(v) = updates.get("is_read") {
+            ep.is_read = v.as_bool().unwrap_or(false);
+        }
+        if let Some(v) = updates.get("tags") {
+            if let Ok(tags) = serde_json::from_value(v.clone()) {
+                ep.tags = tags;
+            }
+        }
+        if let Some(v) = updates.get("collection_id") {
+            ep.collection_id = v.as_str().map(String::from);
+        }
+        if let Some(v) = updates.get("summary") {
+            if let Ok(s) = serde_json::from_value(v.clone()) {
+                ep.summary = Some(s);
+            }
+        }
+        if let Some(v) = updates.get("keywords") {
+            if let Ok(k) = serde_json::from_value(v.clone()) {
+                ep.keywords = k;
+            }
+        }
+        if let Some(v) = updates.get("qas") {
+            if let Ok(q) = serde_json::from_value(v.clone()) {
+                ep.qas = q;
+            }
+        }
+        if let Some(v) = updates.get("clips") {
+            if let Ok(c) = serde_json::from_value(v.clone()) {
+                ep.clips = c;
+            }
+        }
+        if let Some(v) = updates.get("highlights") {
+            if let Ok(h) = serde_json::from_value(v.clone()) {
+                ep.highlights = h;
+            }
+        }
+        if let Some(v) = updates.get("article") {
+            if let Ok(a) = serde_json::from_value(v.clone()) {
+                ep.article = Some(a);
+            }
+        }
+        if let Some(v) = updates.get("shownotes") {
+            ep.shownotes = v.as_str().map(String::from);
+        }
+        if let Some(v) = updates.get("mindmap") {
+            if let Ok(m) = serde_json::from_value(v.clone()) {
+                ep.mindmap = Some(m);
+            }
+        }
+        if let Some(v) = updates.get("chapters") {
+            if let Ok(c) = serde_json::from_value(v.clone()) {
+                ep.chapters = c;
+            }
+        }
+
+        ep.updated_at = chrono::Utc::now();
+
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE episodes SET
+             summary_json = ?1, chapters_json = ?2, mindmap_json = ?3,
+             keywords_json = ?4, highlights_json = ?5, qas_json = ?6,
+             clips_json = ?7, article_json = ?8, shownotes = ?9,
+             is_read = ?10, tags_json = ?11, collection_id = ?12,
+             updated_at = ?13
+             WHERE id = ?14",
+            params![
+                ep.summary.as_ref().map(|s| serde_json::to_string(s).unwrap()),
+                serde_json::to_string(&ep.chapters)?,
+                ep.mindmap.as_ref().map(|m| serde_json::to_string(m).unwrap()),
+                serde_json::to_string(&ep.keywords)?,
+                serde_json::to_string(&ep.highlights)?,
+                serde_json::to_string(&ep.qas)?,
+                serde_json::to_string(&ep.clips)?,
+                ep.article.as_ref().map(|a| serde_json::to_string(a).unwrap()),
+                ep.shownotes,
+                ep.is_read as i32,
+                serde_json::to_string(&ep.tags)?,
+                ep.collection_id,
+                ep.updated_at.to_rfc3339(),
+                id,
+            ],
+        )?;
+
+        Ok(ep)
+    }
+
     pub fn delete_episode(&self, id: &str) -> PodResult<bool> {
         let conn = self.conn();
         let deleted = conn.execute("DELETE FROM episodes WHERE id = ?1", params![id])?;
