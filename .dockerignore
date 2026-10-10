@@ -1,0 +1,8 @@
+target/
+web/node_modules/
+web/.next/
+.git/
+*.md
+.env
+.env.*
+!.env.example

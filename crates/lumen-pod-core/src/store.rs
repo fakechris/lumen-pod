@@ -421,6 +421,117 @@ impl Store {
             .collect())
     }
 
+    // ---- Chat Messages ----
+
+    pub async fn add_chat_message(
+        &self,
+        episode_id: &str,
+        role: &str,
+        content: &str,
+    ) -> PodResult<crate::episode::ChatMessage> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = sqlx::query(
+            "INSERT INTO chat_messages (id, episode_id, role, content, created_at)
+             VALUES ($1, $2, $3, $4, NOW())
+             RETURNING id, episode_id, role, content, created_at",
+        )
+        .bind(&id)
+        .bind(episode_id)
+        .bind(role)
+        .bind(content)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(crate::episode::ChatMessage {
+            id: row.get("id"),
+            episode_id: row.get("episode_id"),
+            role: match row.get::<String, _>("role").as_str() {
+                "assistant" => crate::episode::ChatRole::Assistant,
+                _ => crate::episode::ChatRole::User,
+            },
+            content: row.get("content"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    pub async fn list_chat_messages(
+        &self,
+        episode_id: &str,
+    ) -> PodResult<Vec<crate::episode::ChatMessage>> {
+        let rows = sqlx::query(
+            "SELECT id, episode_id, role, content, created_at
+             FROM chat_messages WHERE episode_id = $1
+             ORDER BY created_at ASC",
+        )
+        .bind(episode_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::episode::ChatMessage {
+                id: r.get("id"),
+                episode_id: r.get("episode_id"),
+                role: match r.get::<String, _>("role").as_str() {
+                    "assistant" => crate::episode::ChatRole::Assistant,
+                    _ => crate::episode::ChatRole::User,
+                },
+                content: r.get("content"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    // ---- Collections ----
+
+    pub async fn create_collection(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> PodResult<crate::episode::Collection> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = sqlx::query(
+            "INSERT INTO collections (id, name, description, created_at, updated_at)
+             VALUES ($1, $2, $3, NOW(), NOW())
+             RETURNING id, name, description, cover_url, created_at, updated_at",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(description)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(crate::episode::Collection {
+            id: row.get("id"),
+            name: row.get("name"),
+            description: row.get("description"),
+            cover_url: row.get("cover_url"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+    }
+
+    pub async fn list_collections(&self) -> PodResult<Vec<crate::episode::Collection>> {
+        let rows = sqlx::query(
+            "SELECT id, name, description, cover_url, created_at, updated_at
+             FROM collections ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::episode::Collection {
+                id: r.get("id"),
+                name: r.get("name"),
+                description: r.get("description"),
+                cover_url: r.get("cover_url"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
     // ---- Helpers ----
 
     fn build_search_text(ep: &Episode) -> String {

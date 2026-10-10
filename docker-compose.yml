@@ -1,0 +1,59 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: lumenpod
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-lumenpod}
+      POSTGRES_DB: lumenpod
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5488:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumenpod"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-3210}:3210"
+    environment:
+      DATABASE_URL: postgres://lumenpod:${DB_PASSWORD:-lumenpod}@db:5432/lumenpod
+      PORT: "3210"
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:3210/auth/google/callback}
+      ALLOW_ALL_USERS: ${ALLOW_ALL_USERS:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      RUST_LOG: lumen_pod_api=info,tower_http=info
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3210/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3210}
+
+volumes:
+  pgdata:
