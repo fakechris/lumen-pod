@@ -46,9 +46,35 @@ impl Store {
                 chapters_json TEXT NOT NULL DEFAULT '[]',
                 mindmap_json TEXT,
                 transcript_json TEXT,
+                keywords_json TEXT NOT NULL DEFAULT '[]',
                 highlights_json TEXT NOT NULL DEFAULT '[]',
+                qas_json TEXT NOT NULL DEFAULT '[]',
+                clips_json TEXT NOT NULL DEFAULT '[]',
+                article_json TEXT,
+                shownotes TEXT,
+                is_read INTEGER NOT NULL DEFAULT 0,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                collection_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS collections (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                cover_url TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id TEXT PRIMARY KEY,
+                episode_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (episode_id) REFERENCES episodes(id)
             );
 
             CREATE TABLE IF NOT EXISTS users (
@@ -92,8 +118,10 @@ impl Store {
         conn.execute(
             "INSERT INTO episodes (id, source_url, source_json, processing_json,
              summary_json, chapters_json, mindmap_json, transcript_json,
-             highlights_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             keywords_json, highlights_json, qas_json, clips_json,
+             article_json, shownotes, is_read, tags_json, collection_id,
+             created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 ep.id,
                 ep.source.url,
@@ -112,7 +140,18 @@ impl Store {
                     .as_ref()
                     .map(|t| serde_json::to_string(t))
                     .transpose()?,
+                serde_json::to_string(&ep.keywords)?,
                 serde_json::to_string(&ep.highlights)?,
+                serde_json::to_string(&ep.qas)?,
+                serde_json::to_string(&ep.clips)?,
+                ep.article
+                    .as_ref()
+                    .map(|a| serde_json::to_string(a))
+                    .transpose()?,
+                ep.shownotes,
+                ep.is_read as i32,
+                serde_json::to_string(&ep.tags)?,
+                ep.collection_id,
                 ep.created_at.to_rfc3339(),
                 ep.updated_at.to_rfc3339(),
             ],
@@ -132,15 +171,29 @@ impl Store {
                     .join(" ")
             })
             .unwrap_or_default();
+        let keywords_text = ep
+            .keywords
+            .iter()
+            .map(|k| {
+                let mut s = k.key.clone();
+                if let Some(d) = &k.desc {
+                    s.push(' ');
+                    s.push_str(d);
+                }
+                s
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
         let summary_text = ep
             .summary
             .as_ref()
             .map(|s| {
                 format!(
-                    "{} {} {}",
+                    "{} {} {} {}",
                     s.one_liner,
                     s.r#abstract,
-                    s.key_takeaways.join(" ")
+                    s.key_takeaways.join(" "),
+                    keywords_text,
                 )
             })
             .unwrap_or_default();
@@ -156,45 +209,46 @@ impl Store {
 
     pub fn get_episode(&self, id: &str) -> PodResult<Episode> {
         let conn = self.conn();
-        let row = conn
+        let ep = conn
             .query_row(
                 "SELECT source_json, processing_json, summary_json, chapters_json,
-                 mindmap_json, transcript_json, highlights_json, created_at, updated_at
+                 mindmap_json, transcript_json, keywords_json, highlights_json,
+                 qas_json, clips_json, article_json, shownotes,
+                 is_read, tags_json, collection_id, created_at, updated_at
                  FROM episodes WHERE id = ?1",
                 params![id],
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
-                    ))
+                    let parse_dt = |s: String| {
+                        chrono::DateTime::parse_from_rfc3339(&s)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now())
+                    };
+                    Ok(Episode {
+                        id: id.to_string(),
+                        source: serde_json::from_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| panic!("bad source json")),
+                        processing: serde_json::from_str(&row.get::<_, String>(1)?).unwrap_or_else(|_| panic!("bad processing json")),
+                        summary: row.get::<_, Option<String>>(2)?.and_then(|s| serde_json::from_str(&s).ok()),
+                        chapters: row.get::<_, String>(3).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                        mindmap: row.get::<_, Option<String>>(4)?.and_then(|s| serde_json::from_str(&s).ok()),
+                        transcript: row.get::<_, Option<String>>(5)?.and_then(|s| serde_json::from_str(&s).ok()),
+                        keywords: row.get::<_, String>(6).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                        highlights: row.get::<_, String>(7).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                        qas: row.get::<_, String>(8).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                        clips: row.get::<_, String>(9).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                        article: row.get::<_, Option<String>>(10)?.and_then(|s| serde_json::from_str(&s).ok()),
+                        shownotes: row.get(11)?,
+                        is_read: row.get::<_, i32>(12).unwrap_or(0) != 0,
+                        tags: row.get::<_, String>(13).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                        collection_id: row.get(14)?,
+                        created_at: parse_dt(row.get::<_, String>(15)?),
+                        updated_at: parse_dt(row.get::<_, String>(16)?),
+                    })
                 },
             )
             .optional()?
             .ok_or_else(|| PodError::NotFound(id.to_string()))?;
 
-        Ok(Episode {
-            id: id.to_string(),
-            source: serde_json::from_str(&row.0)?,
-            processing: serde_json::from_str(&row.1)?,
-            summary: row.2.as_deref().map(serde_json::from_str).transpose()?,
-            chapters: serde_json::from_str(&row.3)?,
-            mindmap: row.4.as_deref().map(serde_json::from_str).transpose()?,
-            transcript: row.5.as_deref().map(serde_json::from_str).transpose()?,
-            highlights: serde_json::from_str(&row.6)?,
-            created_at: chrono::DateTime::parse_from_rfc3339(&row.7)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| PodError::InvalidInput(e.to_string()))?,
-            updated_at: chrono::DateTime::parse_from_rfc3339(&row.8)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| PodError::InvalidInput(e.to_string()))?,
-        })
+        Ok(ep)
     }
 
     pub fn list_episodes(&self, limit: usize, offset: usize) -> PodResult<Vec<Episode>> {
@@ -377,10 +431,16 @@ mod tests {
                 thumbnail_url: Some("https://img.youtube.com/vi/test123/0.jpg".into()),
                 duration: 3600.0,
                 feed_url: None,
+                description: Some("Original show notes".into()),
+                podcast_name: Some("Test Podcast".into()),
+                episode_cover_url: None,
+                language: Some("en".into()),
+                audio_path: None,
             },
             processing: Processing {
                 status: ProcessingStatus::Done,
                 asr_engine: Some("qwen3-asr".into()),
+                llm_model: Some("claude-4-opus".into()),
                 processed_at: Some(Utc::now()),
                 agent_id: Some("claude".into()),
                 error: None,
@@ -392,15 +452,23 @@ mod tests {
                     "AI is changing fast".into(),
                     "Local models are improving".into(),
                 ],
-                keywords: vec!["AI".into(), "podcast".into()],
+                thinking_questions: vec!["What if local models surpass cloud?".into()],
+                glossary: vec![GlossaryTerm {
+                    term: "LLM".into(),
+                    definition: "Large Language Model".into(),
+                }],
             }),
             chapters: vec![Chapter {
                 title: "Introduction".into(),
                 start_time: 0.0,
                 end_time: 120.0,
                 summary: "The host introduces the topic".into(),
+                has_ads: false,
             }],
-            mindmap: None,
+            mindmap: Some(Mindmap {
+                markdown: "# AI\n## Local Models\n## Cloud".into(),
+                opml: None,
+            }),
             transcript: Some(Transcript {
                 paragraphs: vec![Paragraph {
                     id: 1,
@@ -409,36 +477,38 @@ mod tests {
                         id: "s1".into(),
                         text: "Welcome to the show".into(),
                         words: vec![
-                            Word {
-                                id: "w0".into(),
-                                text: "Welcome".into(),
-                                start: 0.0,
-                                end: 0.5,
-                            },
-                            Word {
-                                id: "w1".into(),
-                                text: "to".into(),
-                                start: 0.5,
-                                end: 0.6,
-                            },
-                            Word {
-                                id: "w2".into(),
-                                text: "the".into(),
-                                start: 0.6,
-                                end: 0.7,
-                            },
-                            Word {
-                                id: "w3".into(),
-                                text: "show".into(),
-                                start: 0.7,
-                                end: 1.0,
-                            },
+                            Word { id: "w0".into(), text: "Welcome".into(), start: 0.0, end: 0.5 },
+                            Word { id: "w1".into(), text: "to".into(), start: 0.5, end: 0.6 },
+                            Word { id: "w2".into(), text: "the".into(), start: 0.6, end: 0.7 },
+                            Word { id: "w3".into(), text: "show".into(), start: 0.7, end: 1.0 },
                         ],
                     }],
                 }],
                 translations: Default::default(),
             }),
-            highlights: vec![],
+            keywords: vec![
+                Keyword { key: "AI".into(), desc: Some("Artificial Intelligence".into()) },
+                Keyword { key: "podcast".into(), desc: None },
+            ],
+            highlights: vec![Highlight {
+                time: 12.5,
+                content: "Key insight about AI models".into(),
+                cue_id: Some("s1".into()),
+                note: None,
+                created_at: Utc::now(),
+            }],
+            qas: vec![QA {
+                question: "What is the main thesis?".into(),
+                answer: "AI models are becoming local-first".into(),
+                question_speaker: Some("Host".into()),
+                answer_speaker: Some("Guest".into()),
+            }],
+            clips: vec![],
+            article: None,
+            shownotes: Some("Original show notes from the podcast feed".into()),
+            is_read: false,
+            tags: vec!["ai".into(), "tech".into()],
+            collection_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
