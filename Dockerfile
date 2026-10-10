@@ -13,7 +13,7 @@ RUN cargo build --release --bin lumen-pod-server
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y ca-certificates libssl3 && \
+    apt-get install -y ca-certificates libssl3 curl && \
     rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash lumenpod
