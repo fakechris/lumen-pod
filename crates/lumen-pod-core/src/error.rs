@@ -6,7 +6,7 @@ pub enum PodError {
     NotFound(String),
 
     #[error("database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] sqlx::Error),
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

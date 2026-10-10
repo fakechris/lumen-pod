@@ -1,6 +1,6 @@
 [package]
 name = "lumen-pod-core"
-description = "Episode data model, SQLite storage, and full-text search for lumen-pod"
+description = "Episode data model, PostgreSQL storage, and full-text search for lumen-pod"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,4 +12,5 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-rusqlite = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }

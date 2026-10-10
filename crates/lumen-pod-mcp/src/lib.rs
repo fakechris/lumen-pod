@@ -2,23 +2,22 @@
 //!
 //! Agents (Claude, Grokbot, etc.) launch `lumen-pod mcp` and talk JSON-RPC
 //! over stdio. Tools: pod_publish, pod_list, pod_get, pod_search, pod_delete,
-//! pod_pending, pod_bookmark_sync.
+//! pod_exists, pod_update.
 
-use std::io::BufRead;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use tokio::io::AsyncBufReadExt;
 
 use lumen_pod_core::store::Store;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub fn run_stdio(db_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(Store::open(db_path.as_path())?);
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line?;
+pub async fn run_stdio(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(Store::new(database_url).await?);
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut lines = stdin.lines();
+    while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
         }
@@ -26,7 +25,7 @@ pub fn run_stdio(db_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let resp = handle(&store, req);
+        let resp = handle(&store, req).await;
         if let Ok(resp) = resp {
             if resp != Value::Null {
                 println!("{}", resp);
@@ -36,7 +35,7 @@ pub fn run_stdio(db_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn handle(store: &Store, req: Value) -> Result<Value, Box<dyn std::error::Error>> {
+async fn handle(store: &Store, req: Value) -> Result<Value, Box<dyn std::error::Error>> {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let ok = |result: Value| json!({"jsonrpc":"2.0","id":id,"result":result});
@@ -58,7 +57,7 @@ fn handle(store: &Store, req: Value) -> Result<Value, Box<dyn std::error::Error>
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or(json!({}));
-            match call_tool(store, name, &args) {
+            match call_tool(store, name, &args).await {
                 Ok(text) => Ok(ok(json!({"content":[{"type":"text","text":text}]}))),
                 Err(e) => Ok(ok(json!({
                     "isError": true,
@@ -66,7 +65,9 @@ fn handle(store: &Store, req: Value) -> Result<Value, Box<dyn std::error::Error>
                 }))),
             }
         }
-        _ => Ok(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"unknown method"}})),
+        _ => Ok(
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"unknown method"}}),
+        ),
     }
 }
 
@@ -126,7 +127,7 @@ fn tool(name: &str, desc: &str, required: &[&str]) -> Value {
     })
 }
 
-fn call_tool(
+async fn call_tool(
     store: &Store,
     name: &str,
     args: &Value,
@@ -143,14 +144,14 @@ fn call_tool(
             if episode.id.is_empty() {
                 episode.id = uuid::Uuid::new_v4().to_string();
             }
-            if store.episode_exists_by_url(&episode.source.url)? {
+            if store.episode_exists_by_url(&episode.source.url).await? {
                 return Ok(json!({"status": "duplicate", "url": episode.source.url}).to_string());
             }
 
             let now = chrono::Utc::now();
             episode.created_at = now;
             episode.updated_at = now;
-            store.insert_episode(&episode)?;
+            store.insert_episode(&episode).await?;
 
             Ok(json!({"status": "ok", "id": episode.id}).to_string())
         }
@@ -163,8 +164,8 @@ fn call_tool(
                 .get("offset")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
-            let episodes = store.list_episodes(limit, offset)?;
-            let total = store.episode_count()?;
+            let episodes = store.list_episodes(limit, offset).await?;
+            let total = store.episode_count().await?;
             let items: Vec<Value> = episodes
                 .iter()
                 .map(|ep| {
@@ -183,7 +184,7 @@ fn call_tool(
         }
         "pod_get" => {
             let id = args.get("id").and_then(|v| v.as_str()).ok_or("missing id")?;
-            let episode = store.get_episode(id)?;
+            let episode = store.get_episode(id).await?;
             Ok(serde_json::to_string_pretty(&episode)?)
         }
         "pod_search" => {
@@ -195,25 +196,32 @@ fn call_tool(
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10) as usize;
-            let ids = store.search_episodes(query, limit)?;
-            let episodes: Vec<Value> = ids
-                .iter()
-                .filter_map(|id| store.get_episode(id).ok())
-                .map(|ep| {
-                    json!({
+            let ids = store.search_episodes(query, limit).await?;
+            let mut episodes = Vec::new();
+            for id in &ids {
+                if let Ok(ep) = store.get_episode(id).await {
+                    episodes.push(json!({
                         "id": ep.id,
                         "title": ep.source.title,
                         "author": ep.source.author,
                         "oneLiner": ep.summary.as_ref().map(|s| s.one_liner.as_str()),
-                    })
-                })
-                .collect();
+                    }));
+                }
+            }
             Ok(json!({"results": episodes}).to_string())
         }
         "pod_delete" => {
             let id = args.get("id").and_then(|v| v.as_str()).ok_or("missing id")?;
-            let deleted = store.delete_episode(id)?;
+            let deleted = store.delete_episode(id).await?;
             Ok(json!({"deleted": deleted}).to_string())
+        }
+        "pod_exists" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or("missing url")?;
+            let exists = store.episode_exists_by_url(url).await?;
+            Ok(json!({"exists": exists}).to_string())
         }
         "pod_update" => {
             let id = args.get("id").and_then(|v| v.as_str()).ok_or("missing id")?;
@@ -222,16 +230,11 @@ fn call_tool(
                 .and_then(|v| v.as_str())
                 .ok_or("missing updates_json")?;
             let updates: Value = serde_json::from_str(updates_json)?;
-            let episode = store.update_episode(id, &updates)?;
-            Ok(json!({"status": "ok", "id": episode.id, "updated_at": episode.updated_at}).to_string())
-        }
-        "pod_exists" => {
-            let url = args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or("missing url")?;
-            let exists = store.episode_exists_by_url(url)?;
-            Ok(json!({"exists": exists}).to_string())
+            let episode = store.update_episode(id, &updates).await?;
+            Ok(
+                json!({"status": "ok", "id": episode.id, "updated_at": episode.updated_at})
+                    .to_string(),
+            )
         }
         _ => Err(format!("unknown MCP tool: {name}").into()),
     }
@@ -241,27 +244,30 @@ fn call_tool(
 mod tests {
     use super::*;
 
-    fn test_store() -> Store {
-        Store::open_memory().unwrap()
+    async fn test_store() -> Store {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://lumenpod:lumenpod@127.0.0.1:5488/lumenpod".into());
+        Store::new(&url).await.unwrap()
     }
 
-    #[test]
-    fn initialize_returns_server_info() {
-        let store = test_store();
+    #[tokio::test]
+    async fn initialize_returns_server_info() {
+        let store = test_store().await;
         let req = json!({"jsonrpc":"2.0","id":1,"method":"initialize"});
-        let resp = handle(&store, req).unwrap();
+        let resp = handle(&store, req).await.unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "lumen-pod");
     }
 
-    #[test]
-    fn tools_list_advertises_tools() {
-        let store = test_store();
+    #[tokio::test]
+    async fn tools_list_advertises_tools() {
+        let store = test_store().await;
         let req = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
-        let resp = handle(&store, req).unwrap();
+        let resp = handle(&store, req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert!(tools.len() >= 6);
+        assert!(tools.len() >= 7);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"pod_publish"));
         assert!(names.contains(&"pod_search"));
+        assert!(names.contains(&"pod_update"));
     }
 }
