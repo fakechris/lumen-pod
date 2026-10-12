@@ -176,14 +176,25 @@ export default function Home() {
       .then((data) => {
         setEpisodes(data.episodes);
         setTotal(data.total);
+        setError(null);
       })
-      .catch((e) => setError(e.message))
+      .catch((e) => {
+        if (e.message?.includes("401")) {
+          setError(null);
+        } else {
+          setError(e.message);
+        }
+      })
       .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
-    fetchEpisodes();
-  }, [fetchEpisodes]);
+    if (!authLoading && user) {
+      fetchEpisodes();
+    } else if (!authLoading) {
+      setLoading(false);
+    }
+  }, [authLoading, user, fetchEpisodes]);
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">

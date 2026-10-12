@@ -7,14 +7,18 @@ const API_BASE =
     ? ""
     : (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3210");
 
-async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+async function apiFetch<T>(
+  path: string,
+  init?: RequestInit & { skipAuthRedirect?: boolean },
+): Promise<T> {
+  const { skipAuthRedirect, ...fetchInit } = init ?? {};
   const res = await fetch(`${API_BASE}${path}`, {
     credentials: "include",
-    headers: { "Content-Type": "application/json", ...init?.headers },
-    ...init,
+    headers: { "Content-Type": "application/json", ...fetchInit?.headers },
+    ...fetchInit,
   });
   if (!res.ok) {
-    if (res.status === 401 && typeof window !== "undefined") {
+    if (res.status === 401 && typeof window !== "undefined" && !skipAuthRedirect) {
       window.location.href = getGoogleLoginUrl();
       return new Promise(() => {});
     }
@@ -37,7 +41,7 @@ export async function listEpisodes(
   limit = 20,
   offset = 0
 ): Promise<{ total: number; episodes: Episode[] }> {
-  return apiFetch(`/api/episodes?limit=${limit}&offset=${offset}`);
+  return apiFetch(`/api/episodes?limit=${limit}&offset=${offset}`, { skipAuthRedirect: true });
 }
 
 export async function getEpisode(id: string): Promise<Episode> {
