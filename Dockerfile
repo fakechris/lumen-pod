@@ -16,7 +16,8 @@ RUN apt-get update && \
     apt-get install -y ca-certificates libssl3 curl && \
     rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -s /bin/bash lumenpod
+RUN useradd -m -s /bin/bash lumenpod && \
+    mkdir -p /data/audio && chown lumenpod:lumenpod /data/audio
 
 COPY --from=builder /app/target/release/lumen-pod-server /usr/local/bin/lumen-pod-server
 
