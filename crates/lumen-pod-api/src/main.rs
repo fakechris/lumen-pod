@@ -66,9 +66,20 @@ async fn run_server(database_url: &str) {
         .expect("failed to connect to database");
     tracing::info!(url = %database_url, "database connected");
 
+    let auth_config = auth::AuthConfig::from_env();
+
+    // Seed built-in admin(s)
+    for email in &auth_config.admin_emails {
+        if let Err(e) = store.seed_admin(email).await {
+            tracing::warn!(%email, error = %e, "failed to seed admin");
+        } else {
+            tracing::info!(%email, "admin user seeded");
+        }
+    }
+
     let state = AppState {
         store: Arc::new(store),
-        auth: auth::AuthConfig::from_env(),
+        auth: auth_config,
     };
 
     use axum::http::Method;
@@ -115,6 +126,11 @@ async fn run_server(database_url: &str) {
         .route(
             "/api/invites",
             get(auth::list_invites).post(auth::create_invite),
+        )
+        .route("/api/admin/users", get(auth::list_users))
+        .route(
+            "/api/admin/users/{id}",
+            axum::routing::patch(auth::update_user).delete(auth::delete_user),
         )
         .layer(cors)
         .layer(TraceLayer::new_for_http())

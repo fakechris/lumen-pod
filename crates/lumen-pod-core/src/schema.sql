@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS invites (
     accepted_at TIMESTAMPTZ
 );
 
+-- Migration: add approved column to users
+ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS idx_episodes_source_url ON episodes(source_url);
 CREATE INDEX IF NOT EXISTS idx_episodes_created_at ON episodes(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_episodes_search ON episodes USING GIN(search_vector);

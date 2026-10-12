@@ -1,7 +1,11 @@
-//! Google OAuth 2.0 + JWT session management + whitelist auth middleware.
+//! Google OAuth 2.0 + JWT session management.
+//!
+//! Auth flow: anyone can log in via Google → user record created →
+//! built-in admins auto-approved → invited emails auto-approved →
+//! others are "pending" and get 403 on content endpoints.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect},
     Json,
@@ -22,11 +26,18 @@ pub struct AuthConfig {
     pub google_client_secret: String,
     pub google_redirect_uri: String,
     pub jwt_secret: String,
-    pub allow_all: bool,
+    pub admin_emails: Vec<String>,
 }
 
 impl AuthConfig {
     pub fn from_env() -> Self {
+        let admin_emails: Vec<String> = std::env::var("ADMIN_EMAILS")
+            .unwrap_or_else(|_| "fakechris@gmail.com".into())
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         Self {
             google_client_id: std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
             google_client_secret: std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
@@ -34,9 +45,7 @@ impl AuthConfig {
                 .unwrap_or_else(|_| "http://localhost:3210/auth/google/callback".into()),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "dev-secret-change-in-production".into()),
-            allow_all: std::env::var("ALLOW_ALL_USERS")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+            admin_emails,
         }
     }
 }
@@ -48,17 +57,19 @@ pub struct Claims {
     pub sub: String,
     pub email: String,
     pub role: String,
+    pub approved: bool,
     pub exp: usize,
     pub iat: usize,
 }
 
 impl Claims {
-    pub fn new(user_id: &str, email: &str, role: &str) -> Self {
+    pub fn new(user_id: &str, email: &str, role: &str, approved: bool) -> Self {
         let now = Utc::now();
         Self {
             sub: user_id.into(),
             email: email.into(),
             role: role.into(),
+            approved,
             iat: now.timestamp() as usize,
             exp: (now + Duration::days(7)).timestamp() as usize,
         }
@@ -82,7 +93,7 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::err
     Ok(data.claims)
 }
 
-// ---- Auth middleware ----
+// ---- Auth middleware helpers ----
 
 pub fn extract_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims> {
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
@@ -105,6 +116,40 @@ pub fn extract_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims> {
     }
 
     None
+}
+
+/// Require authenticated + approved user. Returns claims or error response.
+pub fn require_approved(headers: &HeaderMap, jwt_secret: &str) -> Result<Claims, axum::response::Response> {
+    match extract_claims(headers, jwt_secret) {
+        None => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "not authenticated"})),
+        )
+            .into_response()),
+        Some(c) if !c.approved => Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "pending_approval",
+                "message": "Your account is awaiting admin approval.",
+                "email": c.email,
+            })),
+        )
+            .into_response()),
+        Some(c) => Ok(c),
+    }
+}
+
+/// Require authenticated + approved + admin role.
+pub fn require_admin(headers: &HeaderMap, jwt_secret: &str) -> Result<Claims, axum::response::Response> {
+    let claims = require_approved(headers, jwt_secret)?;
+    if claims.role != "admin" {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin only"})),
+        )
+            .into_response());
+    }
+    Ok(claims)
 }
 
 // ---- Google OAuth Handlers ----
@@ -217,30 +262,7 @@ pub async fn google_callback(
         }
     };
 
-    if !state.auth.allow_all {
-        match state.store.is_email_invited(&user_info.email).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({
-                        "error": "not invited",
-                        "email": user_info.email,
-                        "message": "Your email is not on the whitelist. Please ask an admin for an invite."
-                    })),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("db error: {e}")})),
-                )
-                    .into_response();
-            }
-        }
-    }
-
+    // Let everyone in — admin/invited auto-approved, others pending
     let user = match state
         .store
         .upsert_user_google(
@@ -248,6 +270,7 @@ pub async fn google_callback(
             user_info.name.as_deref(),
             user_info.picture.as_deref(),
             &user_info.sub,
+            &state.auth.admin_emails,
         )
         .await
     {
@@ -266,7 +289,7 @@ pub async fn google_callback(
         UserRole::Member => "member",
     };
 
-    let claims = Claims::new(&user.id, &user.email, role_str);
+    let claims = Claims::new(&user.id, &user.email, role_str, user.approved);
     let jwt = match create_jwt(&claims, &state.auth.jwt_secret) {
         Ok(t) => t,
         Err(e) => {
@@ -295,34 +318,44 @@ pub async fn google_callback(
                 "name": user.name,
                 "avatar_url": user.avatar_url,
                 "role": role_str,
+                "approved": user.approved,
             }
         })),
     )
         .into_response()
 }
 
+/// GET /api/me — always works for authenticated users (even pending)
 pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     match extract_claims(&headers, &state.auth.jwt_secret) {
         Some(claims) => {
             let user = state.store.get_user_by_email(&claims.email).await;
             match user {
-                Ok(Some(u)) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "id": u.id,
-                        "email": u.email,
-                        "name": u.name,
-                        "avatar_url": u.avatar_url,
-                        "role": claims.role,
-                    })),
-                )
-                    .into_response(),
+                Ok(Some(u)) => {
+                    let role_str = match u.role {
+                        UserRole::Admin => "admin",
+                        UserRole::Member => "member",
+                    };
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": u.id,
+                            "email": u.email,
+                            "name": u.name,
+                            "avatar_url": u.avatar_url,
+                            "role": role_str,
+                            "approved": u.approved,
+                        })),
+                    )
+                        .into_response()
+                }
                 _ => (
                     StatusCode::OK,
                     Json(serde_json::json!({
                         "id": claims.sub,
                         "email": claims.email,
                         "role": claims.role,
+                        "approved": claims.approved,
                     })),
                 )
                     .into_response(),
@@ -331,6 +364,94 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         None => (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "not authenticated"})),
+        )
+            .into_response(),
+    }
+}
+
+// ---- Admin: User management ----
+
+pub async fn list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state.auth.jwt_secret) {
+        return e;
+    }
+
+    match state.store.list_users().await {
+        Ok(users) => {
+            let data: Vec<_> = users
+                .iter()
+                .map(|u| {
+                    serde_json::json!({
+                        "id": u.id,
+                        "email": u.email,
+                        "name": u.name,
+                        "avatar_url": u.avatar_url,
+                        "role": match u.role { UserRole::Admin => "admin", UserRole::Member => "member" },
+                        "approved": u.approved,
+                        "created_at": u.created_at,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({"users": data}))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUserRequest {
+    pub approved: Option<bool>,
+    pub role: Option<String>,
+}
+
+pub async fn update_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Json(req): Json<UpdateUserRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state.auth.jwt_secret) {
+        return e;
+    }
+
+    if let Some(true) = req.approved {
+        let _ = state.store.approve_user(&user_id).await;
+    }
+    if let Some(role) = &req.role {
+        if role == "admin" || role == "member" {
+            let _ = state.store.set_user_role(&user_id, role).await;
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"updated": true}))).into_response()
+}
+
+pub async fn delete_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state.auth.jwt_secret) {
+        return e;
+    }
+
+    match state.store.reject_user(&user_id).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response(),
+        Ok(false) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "cannot delete admin user or user not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
     }
@@ -348,22 +469,9 @@ pub async fn create_invite(
     headers: HeaderMap,
     Json(req): Json<CreateInviteRequest>,
 ) -> impl IntoResponse {
-    let claims = match extract_claims(&headers, &state.auth.jwt_secret) {
-        Some(c) if c.role == "admin" => c,
-        Some(_) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "admin only"})),
-            )
-                .into_response();
-        }
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "not authenticated"})),
-            )
-                .into_response();
-        }
+    let claims = match require_admin(&headers, &state.auth.jwt_secret) {
+        Ok(c) => c,
+        Err(e) => return e,
     };
 
     let invite = lumen_pod_core::episode::Invite {
@@ -392,23 +500,9 @@ pub async fn list_invites(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    match extract_claims(&headers, &state.auth.jwt_secret) {
-        Some(c) if c.role == "admin" => {}
-        Some(_) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "admin only"})),
-            )
-                .into_response();
-        }
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "not authenticated"})),
-            )
-                .into_response();
-        }
-    };
+    if let Err(e) = require_admin(&headers, &state.auth.jwt_secret) {
+        return e;
+    }
 
     match state.store.list_invites().await {
         Ok(invites) => (StatusCode::OK, Json(serde_json::json!({"invites": invites}))).into_response(),

@@ -294,8 +294,8 @@ impl Store {
 
     pub async fn upsert_user(&self, user: &User) -> PodResult<()> {
         sqlx::query(
-            "INSERT INTO users (id, email, name, avatar_url, role, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO users (id, email, name, avatar_url, role, approved, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT(email) DO UPDATE SET
                name = EXCLUDED.name,
                avatar_url = EXCLUDED.avatar_url",
@@ -308,77 +308,121 @@ impl Store {
             UserRole::Admin => "admin",
             UserRole::Member => "member",
         })
+        .bind(user.approved)
         .bind(user.created_at)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
+    /// Seed a built-in admin. Idempotent: if user exists, upgrades to admin+approved.
+    pub async fn seed_admin(&self, email: &str) -> PodResult<()> {
+        sqlx::query(
+            "INSERT INTO users (id, email, role, approved, created_at)
+             VALUES ($1, $2, 'admin', TRUE, NOW())
+             ON CONFLICT(email) DO UPDATE SET role = 'admin', approved = TRUE",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(email)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Upsert user from Google OAuth. Does NOT block anyone.
+    /// - Admin emails → role=admin, approved=true
+    /// - Invited emails → role=member, approved=true
+    /// - Others → role=member, approved=false (pending)
     pub async fn upsert_user_google(
         &self,
         email: &str,
         name: Option<&str>,
         avatar_url: Option<&str>,
         google_sub: &str,
+        admin_emails: &[String],
     ) -> PodResult<User> {
+        let is_admin = admin_emails.iter().any(|e| e.eq_ignore_ascii_case(email));
+        let is_invited = self.is_email_invited(email).await.unwrap_or(false);
+        let auto_approved = is_admin || is_invited;
+
+        let role = if is_admin { "admin" } else { "member" };
+
         let row = sqlx::query(
-            "INSERT INTO users (id, email, name, avatar_url, role, google_sub, created_at)
-             VALUES ($1, $2, $3, $4, 'member', $5, NOW())
+            "INSERT INTO users (id, email, name, avatar_url, role, approved, google_sub, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
              ON CONFLICT(email) DO UPDATE SET
                name = COALESCE(EXCLUDED.name, users.name),
                avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
-               google_sub = EXCLUDED.google_sub
-             RETURNING id, email, name, avatar_url, role, created_at",
+               google_sub = EXCLUDED.google_sub,
+               role = CASE WHEN EXCLUDED.role = 'admin' THEN 'admin' ELSE users.role END,
+               approved = CASE WHEN EXCLUDED.approved THEN TRUE ELSE users.approved END
+             RETURNING id, email, name, avatar_url, role, approved, created_at",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(email)
         .bind(name)
         .bind(avatar_url)
+        .bind(role)
+        .bind(auto_approved)
         .bind(google_sub)
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(User {
-            id: row.get("id"),
-            email: row.get("email"),
-            name: row.get("name"),
-            avatar_url: row.get("avatar_url"),
-            role: match row.get::<String, _>("role").as_str() {
-                "admin" => UserRole::Admin,
-                _ => UserRole::Member,
-            },
-            created_at: row.get("created_at"),
-        })
+        Ok(Self::row_to_user(&row))
     }
 
     pub async fn get_user_by_email(&self, email: &str) -> PodResult<Option<User>> {
         let row = sqlx::query(
-            "SELECT id, email, name, avatar_url, role, created_at FROM users WHERE email = $1",
+            "SELECT id, email, name, avatar_url, role, approved, created_at
+             FROM users WHERE email = $1",
         )
         .bind(email)
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| User {
-            id: r.get("id"),
-            email: r.get("email"),
-            name: r.get("name"),
-            avatar_url: r.get("avatar_url"),
-            role: match r.get::<String, _>("role").as_str() {
-                "admin" => UserRole::Admin,
-                _ => UserRole::Member,
-            },
-            created_at: r.get("created_at"),
-        }))
+        Ok(row.as_ref().map(Self::row_to_user))
+    }
+
+    pub async fn list_users(&self) -> PodResult<Vec<User>> {
+        let rows = sqlx::query(
+            "SELECT id, email, name, avatar_url, role, approved, created_at
+             FROM users ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_user).collect())
+    }
+
+    pub async fn approve_user(&self, user_id: &str) -> PodResult<bool> {
+        let result = sqlx::query("UPDATE users SET approved = TRUE WHERE id = $1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn reject_user(&self, user_id: &str) -> PodResult<bool> {
+        let result = sqlx::query("DELETE FROM users WHERE id = $1 AND role != 'admin'")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_user_role(&self, user_id: &str, role: &str) -> PodResult<bool> {
+        let result =
+            sqlx::query("UPDATE users SET role = $1 WHERE id = $2")
+                .bind(role)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn is_email_invited(&self, email: &str) -> PodResult<bool> {
         let row = sqlx::query(
-            "SELECT EXISTS(
-                SELECT 1 FROM invites WHERE email = $1
-                UNION
-                SELECT 1 FROM users WHERE email = $1
-             ) as exists",
+            "SELECT EXISTS(SELECT 1 FROM invites WHERE email = $1) as exists",
         )
         .bind(email)
         .fetch_one(&self.pool)
@@ -389,7 +433,8 @@ impl Store {
     pub async fn create_invite(&self, invite: &Invite) -> PodResult<()> {
         sqlx::query(
             "INSERT INTO invites (id, email, invited_by, created_at, accepted_at)
-             VALUES ($1, $2, $3, $4, $5)",
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT DO NOTHING",
         )
         .bind(&invite.id)
         .bind(&invite.email)
@@ -398,6 +443,13 @@ impl Store {
         .bind(invite.accepted_at)
         .execute(&self.pool)
         .await?;
+
+        // Auto-approve the user if they already registered
+        sqlx::query("UPDATE users SET approved = TRUE WHERE email = $1 AND NOT approved")
+            .bind(&invite.email)
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
 
@@ -419,6 +471,21 @@ impl Store {
                 accepted_at: r.get("accepted_at"),
             })
             .collect())
+    }
+
+    fn row_to_user(r: &sqlx::postgres::PgRow) -> User {
+        User {
+            id: r.get("id"),
+            email: r.get("email"),
+            name: r.get("name"),
+            avatar_url: r.get("avatar_url"),
+            role: match r.get::<String, _>("role").as_str() {
+                "admin" => UserRole::Admin,
+                _ => UserRole::Member,
+            },
+            approved: r.get("approved"),
+            created_at: r.get("created_at"),
+        }
     }
 
     // ---- Chat Messages ----
@@ -827,6 +894,7 @@ mod tests {
             name: Some("Test User".into()),
             avatar_url: None,
             role: UserRole::Member,
+            approved: false,
             created_at: Utc::now(),
         };
         store.upsert_user(&user).await.unwrap();

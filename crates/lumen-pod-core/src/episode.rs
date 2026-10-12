@@ -327,6 +327,7 @@ pub struct User {
     pub name: Option<String>,
     pub avatar_url: Option<String>,
     pub role: UserRole,
+    pub approved: bool,
     pub created_at: DateTime<Utc>,
 }
 
