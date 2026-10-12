@@ -244,7 +244,7 @@ type TabName = (typeof TABS)[number];
 // Main Component — single-column layout
 // ---------------------------------------------------------------------------
 
-type DeepReadState = Record<number, { loading: boolean; content?: string; error?: string }>;
+type DeepReadState = Record<number, { loading: boolean; content?: string; error?: string; collapsed?: boolean }>;
 
 export default function EpisodeDetail({ id }: { id: string }) {
   const [episode, setEpisode] = useState<Episode | null>(null);
@@ -506,114 +506,182 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
   };
 
   const handleDeepRead = async (idx: number, regenerate = false) => {
-    if (!regenerate && deepReads[idx]?.content) { setDeepReads((p) => { const c = { ...p }; delete c[idx]; return c; }); return; }
+    // Toggle collapse if content exists and not regenerating
+    if (!regenerate && deepReads[idx]?.content) {
+      setDeepReads((p) => ({ ...p, [idx]: { ...p[idx], collapsed: !p[idx].collapsed } }));
+      return;
+    }
     setDeepReads((p) => ({ ...p, [idx]: { loading: true } }));
     try {
       const result = await requestChapterDeepRead(episodeId, idx, { lang: deepReadLang, regenerate });
-      setDeepReads((p) => ({ ...p, [idx]: { loading: false, content: result.content } }));
+      setDeepReads((p) => ({ ...p, [idx]: { loading: false, content: result.content, collapsed: false } }));
     } catch (e: any) {
       setDeepReads((p) => ({ ...p, [idx]: { loading: false, error: e.message } }));
     }
   };
 
-  return (
-    <div className="space-y-4">
-      {/* Language selector + Batch controls */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <select value={deepReadLang} onChange={(e) => setDeepReadLang(e.target.value)} className="px-3 py-2 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-purple-500 outline-none">
-          {DEEP_READ_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
-        </select>
-        {!batchRunning && pendingCount > 0 && (
-          <button onClick={handleBatchStart} className="px-4 py-2 text-sm font-medium rounded-lg bg-purple-600 text-white hover:bg-purple-700 transition-colors">
-            📖 Deep Read All ({pendingCount} remaining)
-          </button>
-        )}
-        {batchRunning && (
-          <>
-            <div className="flex-1 min-w-[200px]">
-              <div className="flex items-center gap-3">
-                <div className="flex-1 h-2.5 bg-zinc-200 dark:bg-zinc-700 rounded-full overflow-hidden">
-                  <div className="h-full bg-purple-500 rounded-full transition-all duration-500" style={{ width: `${batch?.total ? ((batch.completed ?? 0) / batch.total) * 100 : 0}%` }} />
-                </div>
-                <span className="text-sm text-zinc-500 whitespace-nowrap">
-                  {batch?.completed ?? 0}/{batch?.total ?? 0}
-                  {(batch?.failed ?? 0) > 0 && <span className="text-red-400 ml-1">({batch?.failed} failed)</span>}
-                </span>
-              </div>
-              <div className="text-xs text-zinc-400 mt-1">
-                {batch?.status === "cancelling" ? "⏳ Cancelling..." : batch?.currentIdx != null ? `Processing chapter ${batch.currentIdx + 1}...` : "Starting..."}
-                {batch?.elapsedMs ? ` · ${Math.round(batch.elapsedMs / 1000)}s elapsed` : ""}
-              </div>
-            </div>
-            {batch?.status !== "cancelling" && (
-              <button onClick={handleBatchCancel} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors">
-                ✕ Cancel
-              </button>
-            )}
-          </>
-        )}
-        {batch?.status === "complete" && (
-          <span className="text-sm text-green-600 dark:text-green-400">✓ All done — {batch.completed} chapters processed{(batch.failed ?? 0) > 0 ? `, ${batch.failed} failed` : ""}</span>
-        )}
-      </div>
+  const expandedCount = Object.values(deepReads).filter((d) => d.content && !d.collapsed).length;
+  const withContentCount = Object.values(deepReads).filter((d) => d.content).length;
 
-      {canSeek && (
-        <div className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-4">
-          <div className="relative h-8 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
-            {episode.chapters.map((ch, i) => {
-              const left = (ch.startTime / totalDuration) * 100;
-              const width = ((ch.endTime - ch.startTime) / totalDuration) * 100;
-              const isActive = currentTime >= ch.startTime && currentTime < ch.endTime;
-              const colors = ["bg-blue-400", "bg-purple-400", "bg-teal-400", "bg-amber-400", "bg-rose-400", "bg-indigo-400", "bg-emerald-400", "bg-orange-400"];
-              return <button key={i} onClick={() => seekTo(ch.startTime)} title={ch.title} className={`absolute top-0 h-full ${colors[i % colors.length]} ${isActive ? "opacity-100 ring-2 ring-blue-600 z-10" : "opacity-60 hover:opacity-80"} transition-opacity`} style={{ left: `${left}%`, width: `${Math.max(width, 0.5)}%` }} />;
-            })}
-            <div className="absolute top-0 w-0.5 h-full bg-red-500 z-20 pointer-events-none" style={{ left: `${(currentTime / totalDuration) * 100}%` }} />
-          </div>
-        </div>
+  const collapseAll = () => setDeepReads((p) => {
+    const next = { ...p };
+    for (const k in next) if (next[k].content) next[k] = { ...next[k], collapsed: true };
+    return next;
+  });
+  const expandAll = () => setDeepReads((p) => {
+    const next = { ...p };
+    for (const k in next) if (next[k].content) next[k] = { ...next[k], collapsed: false };
+    return next;
+  });
+
+  // Track which chapter is in viewport for TOC highlight
+  const [visibleChapter, setVisibleChapter] = useState(0);
+  const chapterRefs = useRef<(HTMLDivElement | null)[]>([]);
+  useEffect(() => {
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          const idx = Number(entry.target.getAttribute("data-ch-idx"));
+          if (!isNaN(idx)) setVisibleChapter(idx);
+        }
+      }
+    }, { rootMargin: "-20% 0px -60% 0px" });
+    chapterRefs.current.forEach((el) => { if (el) observer.observe(el); });
+    return () => observer.disconnect();
+  }, [episode.chapters.length]);
+
+  const scrollToChapter = (idx: number) => {
+    chapterRefs.current[idx]?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  return (
+    <div className="relative">
+      {/* Floating TOC sidebar — visible on xl screens */}
+      {episode.chapters.length > 3 && (
+        <nav className="hidden xl:block fixed right-4 top-1/3 w-56 max-h-[50vh] overflow-y-auto z-30 bg-white/90 dark:bg-zinc-900/90 backdrop-blur-sm rounded-xl border border-zinc-200 dark:border-zinc-800 shadow-lg p-3 text-xs">
+          <div className="font-semibold text-zinc-500 dark:text-zinc-400 mb-2 uppercase tracking-wider text-[10px]">Chapters</div>
+          {episode.chapters.map((ch, i) => {
+            const dr = deepReads[i];
+            const isCurrent = visibleChapter === i;
+            return (
+              <button key={i} onClick={() => scrollToChapter(i)} className={`w-full text-left px-2 py-1.5 rounded-lg flex items-start gap-2 transition-colors ${isCurrent ? "bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}>
+                <span className={`shrink-0 mt-1 w-2 h-2 rounded-full ${dr?.content ? "bg-purple-500" : dr?.loading ? "bg-amber-400 animate-pulse" : "bg-zinc-300 dark:bg-zinc-600"}`} />
+                <span className="line-clamp-1">{ch.title}</span>
+              </button>
+            );
+          })}
+        </nav>
       )}
 
-      <div className="space-y-3">
-        {episode.chapters.map((ch, i) => {
-          const isActive = currentTime >= ch.startTime && currentTime < ch.endTime;
-          const dr = deepReads[i];
-          const isBatchProcessing = batchRunning && batch?.currentIdx === i;
-          return (
-            <div key={i} className={`rounded-xl border transition-all ${isActive ? "bg-blue-50 dark:bg-blue-950/50 border-blue-300 dark:border-blue-800 shadow-sm" : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 hover:border-blue-300 dark:hover:border-blue-700"}`}>
-              <button onClick={() => canSeek && seekTo(ch.startTime)} className={`w-full text-left p-4 ${canSeek ? "cursor-pointer" : "cursor-default"}`}>
-                <div className="flex items-start gap-3">
-                  <div className="shrink-0 w-16 text-center">
-                    <span className="font-mono text-sm text-blue-600 dark:text-blue-400">{formatTimestamp(ch.startTime)}</span>
-                    <div className="text-xs text-zinc-400 mt-0.5">{formatDuration(ch.endTime - ch.startTime)}</div>
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <h3 className={`font-semibold ${isActive ? "text-blue-700 dark:text-blue-300" : "text-zinc-900 dark:text-zinc-100"}`}>{ch.title}</h3>
-                    <p className="text-sm text-zinc-500 mt-1 line-clamp-2">{ch.summary}</p>
-                  </div>
-                  {ch.hasAds && <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">AD</span>}
-                  {isBatchProcessing && <span className="text-xs px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 animate-pulse">Generating...</span>}
-                </div>
+      <div className="space-y-4">
+        {/* Language selector + Batch controls + Expand/Collapse */}
+        <div className="flex items-center gap-3 flex-wrap">
+          <select value={deepReadLang} onChange={(e) => setDeepReadLang(e.target.value)} className="px-3 py-2 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-purple-500 outline-none">
+            {DEEP_READ_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+          </select>
+          {!batchRunning && pendingCount > 0 && (
+            <button onClick={handleBatchStart} className="px-4 py-2 text-sm font-medium rounded-lg bg-purple-600 text-white hover:bg-purple-700 transition-colors">
+              📖 Deep Read All ({pendingCount} remaining)
+            </button>
+          )}
+          {withContentCount > 0 && (
+            <div className="flex gap-1 ml-auto">
+              <button onClick={expandAll} disabled={expandedCount === withContentCount} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors disabled:opacity-30">
+                ▼ Expand All
               </button>
-              <div className="px-4 pb-3 flex items-center gap-2">
-                <button onClick={() => handleDeepRead(i)} disabled={dr?.loading || isBatchProcessing} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors disabled:opacity-50">
-                  {dr?.loading || isBatchProcessing ? "⏳ Generating..." : dr?.content ? "📖 Hide Deep Read" : "📖 Deep Read"}
-                </button>
-                {dr?.content && !dr.loading && !isBatchProcessing && (
-                  <button onClick={() => handleDeepRead(i, true)} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 hover:text-amber-700 dark:hover:text-amber-400 transition-colors">
-                    🔄 Regenerate
-                  </button>
-                )}
-              </div>
-              {dr?.content && (
-                <div className="px-4 pb-4 border-t border-zinc-100 dark:border-zinc-800 pt-3">
-                  <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-li:my-0.5 prose-blockquote:my-2 prose-table:my-3 prose-pre:my-2 prose-hr:my-4">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{dr.content}</ReactMarkdown>
-                  </div>
-                </div>
-              )}
-              {dr?.error && <div className="px-4 pb-4"><p className="text-sm text-red-500">{dr.error}</p></div>}
+              <button onClick={collapseAll} disabled={expandedCount === 0} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors disabled:opacity-30">
+                ▲ Collapse All
+              </button>
             </div>
-          );
-        })}
+          )}
+          {batchRunning && (
+            <>
+              <div className="flex-1 min-w-[200px]">
+                <div className="flex items-center gap-3">
+                  <div className="flex-1 h-2.5 bg-zinc-200 dark:bg-zinc-700 rounded-full overflow-hidden">
+                    <div className="h-full bg-purple-500 rounded-full transition-all duration-500" style={{ width: `${batch?.total ? ((batch.completed ?? 0) / batch.total) * 100 : 0}%` }} />
+                  </div>
+                  <span className="text-sm text-zinc-500 whitespace-nowrap">
+                    {batch?.completed ?? 0}/{batch?.total ?? 0}
+                    {(batch?.failed ?? 0) > 0 && <span className="text-red-400 ml-1">({batch?.failed} failed)</span>}
+                  </span>
+                </div>
+                <div className="text-xs text-zinc-400 mt-1">
+                  {batch?.status === "cancelling" ? "⏳ Cancelling..." : batch?.currentIdx != null ? `Processing chapter ${batch.currentIdx + 1}...` : "Starting..."}
+                  {batch?.elapsedMs ? ` · ${Math.round(batch.elapsedMs / 1000)}s elapsed` : ""}
+                </div>
+              </div>
+              {batch?.status !== "cancelling" && (
+                <button onClick={handleBatchCancel} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors">
+                  ✕ Cancel
+                </button>
+              )}
+            </>
+          )}
+          {batch?.status === "complete" && (
+            <span className="text-sm text-green-600 dark:text-green-400">✓ All done — {batch.completed} chapters processed{(batch.failed ?? 0) > 0 ? `, ${batch.failed} failed` : ""}</span>
+          )}
+        </div>
+
+        {canSeek && (
+          <div className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-4">
+            <div className="relative h-8 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
+              {episode.chapters.map((ch, i) => {
+                const left = (ch.startTime / totalDuration) * 100;
+                const width = ((ch.endTime - ch.startTime) / totalDuration) * 100;
+                const isActive = currentTime >= ch.startTime && currentTime < ch.endTime;
+                const colors = ["bg-blue-400", "bg-purple-400", "bg-teal-400", "bg-amber-400", "bg-rose-400", "bg-indigo-400", "bg-emerald-400", "bg-orange-400"];
+                return <button key={i} onClick={() => seekTo(ch.startTime)} title={ch.title} className={`absolute top-0 h-full ${colors[i % colors.length]} ${isActive ? "opacity-100 ring-2 ring-blue-600 z-10" : "opacity-60 hover:opacity-80"} transition-opacity`} style={{ left: `${left}%`, width: `${Math.max(width, 0.5)}%` }} />;
+              })}
+              <div className="absolute top-0 w-0.5 h-full bg-red-500 z-20 pointer-events-none" style={{ left: `${(currentTime / totalDuration) * 100}%` }} />
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-3">
+          {episode.chapters.map((ch, i) => {
+            const isActive = currentTime >= ch.startTime && currentTime < ch.endTime;
+            const dr = deepReads[i];
+            const isBatchProcessing = batchRunning && batch?.currentIdx === i;
+            const isExpanded = dr?.content && !dr.collapsed;
+            return (
+              <div key={i} ref={(el) => { chapterRefs.current[i] = el; }} data-ch-idx={i} className={`rounded-xl border transition-all scroll-mt-20 ${isActive ? "bg-blue-50 dark:bg-blue-950/50 border-blue-300 dark:border-blue-800 shadow-sm" : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 hover:border-blue-300 dark:hover:border-blue-700"}`}>
+                <button onClick={() => canSeek && seekTo(ch.startTime)} className={`w-full text-left p-4 ${canSeek ? "cursor-pointer" : "cursor-default"}`}>
+                  <div className="flex items-start gap-3">
+                    <div className="shrink-0 w-16 text-center">
+                      <span className="font-mono text-sm text-blue-600 dark:text-blue-400">{formatTimestamp(ch.startTime)}</span>
+                      <div className="text-xs text-zinc-400 mt-0.5">{formatDuration(ch.endTime - ch.startTime)}</div>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <h3 className={`font-semibold ${isActive ? "text-blue-700 dark:text-blue-300" : "text-zinc-900 dark:text-zinc-100"}`}>{ch.title}</h3>
+                      <p className="text-sm text-zinc-500 mt-1 line-clamp-2">{ch.summary}</p>
+                    </div>
+                    {ch.hasAds && <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">AD</span>}
+                    {isBatchProcessing && <span className="text-xs px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 animate-pulse">Generating...</span>}
+                  </div>
+                </button>
+                <div className="px-4 pb-3 flex items-center gap-2">
+                  <button onClick={() => handleDeepRead(i)} disabled={dr?.loading || isBatchProcessing} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors disabled:opacity-50">
+                    {dr?.loading || isBatchProcessing ? "⏳ Generating..." : dr?.content ? (dr.collapsed ? "📖 Expand" : "📖 Collapse") : "📖 Deep Read"}
+                  </button>
+                  {dr?.content && !dr.loading && !isBatchProcessing && (
+                    <button onClick={() => handleDeepRead(i, true)} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 hover:text-amber-700 dark:hover:text-amber-400 transition-colors">
+                      🔄 Regenerate
+                    </button>
+                  )}
+                </div>
+                {isExpanded && (
+                  <div className="px-4 pb-4 border-t border-zinc-100 dark:border-zinc-800 pt-3">
+                    <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-li:my-0.5 prose-blockquote:my-2 prose-table:my-3 prose-pre:my-2 prose-hr:my-4">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{dr.content}</ReactMarkdown>
+                    </div>
+                  </div>
+                )}
+                {dr?.error && <div className="px-4 pb-4"><p className="text-sm text-red-500">{dr.error}</p></div>}
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
