@@ -21,6 +21,11 @@ function extractBilibiliId(url: string): string | null {
   return m ? m[1] : null;
 }
 
+function extractXTweetId(url: string): string | null {
+  const m = url.match(/(?:twitter\.com|x\.com)\/\w+\/status\/(\d+)/);
+  return m ? m[1] : null;
+}
+
 const platformIcons: Record<string, string> = {
   youtube: "🎬", bilibili: "📺", spotify: "🎵",
   apple: "🍎", twitter: "𝕏", xiaoyuzhou: "🎧", default: "🎙️",
@@ -277,11 +282,61 @@ function YouTubePlayer({
 function BilibiliPlayer({ bvid }: { bvid: string }) {
   return (
     <iframe
-      src={`https://player.bilibili.com/player.html?bvid=${bvid}&high_quality=1&danmaku=0`}
+      src={`https://player.bilibili.com/player.html?bvid=${bvid}&high_quality=1&danmaku=0&autoplay=0`}
       className="w-full aspect-video rounded-xl"
       allowFullScreen
       sandbox="allow-scripts allow-same-origin allow-popups"
     />
+  );
+}
+
+function XTweetEmbed({ tweetId, url }: { tweetId: string; url: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+    let cancelled = false;
+
+    function renderWidget() {
+      if (cancelled || !containerRef.current) return;
+      const w = (window as any).twttr;
+      if (w?.widgets) {
+        w.widgets.createTweet(tweetId, containerRef.current, {
+          theme: "dark",
+          dnt: true,
+          align: "center",
+        }).then(() => { if (!cancelled) setLoaded(true); });
+      }
+    }
+
+    if ((window as any).twttr?.widgets) {
+      renderWidget();
+    } else {
+      const tag = document.createElement("script");
+      tag.src = "https://platform.twitter.com/widgets.js";
+      tag.async = true;
+      tag.onload = renderWidget;
+      document.head.appendChild(tag);
+    }
+
+    return () => { cancelled = true; };
+  }, [tweetId]);
+
+  return (
+    <div className="rounded-xl overflow-hidden">
+      <div ref={containerRef} className="min-h-[200px]" />
+      {!loaded && (
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener"
+          className="block p-4 bg-zinc-900 rounded-xl text-center text-blue-400 hover:text-blue-300 transition-colors"
+        >
+          View on X/Twitter ↗
+        </a>
+      )}
+    </div>
   );
 }
 
@@ -370,9 +425,10 @@ export default function EpisodeDetail({ id }: { id: string }) {
 
   const youtubeId = useMemo(() => episode ? extractYouTubeId(episode.source.url) : null, [episode]);
   const bilibiliId = useMemo(() => episode ? extractBilibiliId(episode.source.url) : null, [episode]);
+  const tweetId = useMemo(() => episode ? extractXTweetId(episode.source.url) : null, [episode]);
   const hasAudio = !!episode?.source.audioPath;
-  const hasVideo = !!(youtubeId || bilibiliId);
-  const hasPlayer = hasAudio || hasVideo;
+  const hasEmbed = !!(youtubeId || bilibiliId || tweetId);
+  const hasPlayer = hasAudio || hasEmbed;
 
   // Available translation languages
   const translationLangs = useMemo(() => {
@@ -429,7 +485,7 @@ export default function EpisodeDetail({ id }: { id: string }) {
                 />
               )}
 
-              {/* Video embed (fallback if no audio) */}
+              {/* Video/tweet embed (fallback if no audio) */}
               {!hasAudio && youtubeId && (
                 <YouTubePlayer
                   videoId={youtubeId}
@@ -439,17 +495,27 @@ export default function EpisodeDetail({ id }: { id: string }) {
                 />
               )}
               {!hasAudio && bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
+              {!hasAudio && tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
 
-              {/* If we have audio AND video, show small video preview */}
+              {/* If we have audio AND video/embed, show small preview */}
               {hasAudio && youtubeId && (
                 <details className="text-sm">
                   <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">Show Video</summary>
                   <div className="mt-2">
-                    <YouTubePlayer
-                      videoId={youtubeId}
-                      thumbnailUrl={episode.source.thumbnailUrl}
-                    />
+                    <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} />
                   </div>
+                </details>
+              )}
+              {hasAudio && bilibiliId && (
+                <details className="text-sm">
+                  <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">Show Video</summary>
+                  <div className="mt-2"><BilibiliPlayer bvid={bilibiliId} /></div>
+                </details>
+              )}
+              {hasAudio && tweetId && (
+                <details className="text-sm">
+                  <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">Show Tweet</summary>
+                  <div className="mt-2"><XTweetEmbed tweetId={tweetId} url={episode.source.url} /></div>
                 </details>
               )}
 

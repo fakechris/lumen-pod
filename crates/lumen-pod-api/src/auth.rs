@@ -217,6 +217,7 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub auth: AuthConfig,
     pub llm: crate::LlmConfig,
+    pub audio_dir: String,
 }
 
 pub async fn google_login(State(state): State<AppState>) -> impl IntoResponse {
