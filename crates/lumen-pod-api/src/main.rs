@@ -126,6 +126,11 @@ async fn run_server(database_url: &str) {
     let audio_serve = Router::new()
         .nest_service("/audio", tower_http::services::ServeDir::new(&state.audio_dir));
 
+    let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "/data/static".into());
+    tokio::fs::create_dir_all(&static_dir).await.ok();
+    let static_serve = Router::new()
+        .nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
+
     let protected = Router::new()
         .route("/api/episodes", get(list_episodes).post(create_episode))
         .route("/api/episodes/submit-url", axum::routing::post(submit_url))
@@ -176,6 +181,7 @@ async fn run_server(database_url: &str) {
 
     let app = public
         .merge(audio_serve)
+        .merge(static_serve)
         .merge(protected)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
