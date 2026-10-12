@@ -18,6 +18,8 @@ use tower_http::trace::TraceLayer;
 use auth::AppState;
 use lumen_pod_core::store::Store;
 
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
 #[derive(Parser)]
 #[command(name = "lumen-pod", version, about = "Agent-native podcast knowledge extraction")]
 struct Cli {
@@ -92,6 +94,7 @@ async fn run_server(database_url: &str) {
         auth: auth_config,
         llm: llm_config,
         audio_dir,
+        batch_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     use axum::http::Method;
@@ -143,6 +146,12 @@ async fn run_server(database_url: &str) {
             "/api/episodes/{id}/chapters/{idx}/deep-read",
             axum::routing::post(chapter_deep_read),
         )
+        .route(
+            "/api/episodes/{id}/deep-read-all",
+            axum::routing::post(batch_deep_read_start)
+                .get(batch_deep_read_status)
+                .delete(batch_deep_read_cancel),
+        )
         .route("/api/episodes/{id}/export/{format}", get(export_episode))
         .route("/api/search", get(search_episodes))
         .route("/api/stats", get(stats))
@@ -180,6 +189,44 @@ async fn run_server(database_url: &str) {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+// ---- Batch Deep Read Task ----
+
+pub struct BatchDeepReadTask {
+    cancelled: Arc<AtomicBool>,
+    /// Index of the chapter currently being processed (usize::MAX = finished).
+    current_idx: Arc<AtomicUsize>,
+    total: usize,
+    completed: Arc<AtomicUsize>,
+    failed: Arc<AtomicUsize>,
+    /// Epoch millis of last activity (chapter start or finish). Used for stale detection.
+    last_heartbeat: Arc<AtomicU64>,
+    started_at_ms: u64,
+}
+
+impl BatchDeepReadTask {
+    fn is_stale(&self) -> bool {
+        let now = epoch_ms();
+        let hb = self.last_heartbeat.load(Ordering::Relaxed);
+        // Stale if no heartbeat for 5 minutes
+        now.saturating_sub(hb) > 5 * 60 * 1000
+    }
+
+    fn is_done(&self) -> bool {
+        self.current_idx.load(Ordering::Relaxed) == usize::MAX
+    }
+
+    fn touch(&self) {
+        self.last_heartbeat.store(epoch_ms(), Ordering::Relaxed);
+    }
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 // ---- LLM Config (Anthropic Messages API) ----
@@ -768,6 +815,254 @@ async fn chapter_deep_read(
     }
 
     (StatusCode::OK, Json(serde_json::json!({"content": content, "cached": false}))).into_response()
+}
+
+// ---- Batch Deep Read ----
+
+async fn batch_deep_read_start(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+
+    if ep.chapters.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "no chapters"}))).into_response();
+    }
+
+    // Chapters that still need deep reads
+    let pending: Vec<usize> = ep.chapters.iter().enumerate()
+        .filter(|(_, ch)| ch.deep_read.is_none())
+        .map(|(i, _)| i)
+        .collect();
+
+    if pending.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "status": "complete", "message": "all chapters already have deep reads",
+            "total": ep.chapters.len(), "completed": ep.chapters.len(), "pending": 0
+        }))).into_response();
+    }
+
+    // Acquire lock — one batch per episode
+    {
+        let mut tasks = state.batch_tasks.lock().unwrap();
+        if let Some(existing) = tasks.get(&id) {
+            if !existing.is_done() && !existing.is_stale() {
+                return (StatusCode::CONFLICT, Json(serde_json::json!({
+                    "error": "batch already running",
+                    "currentIdx": existing.current_idx.load(Ordering::Relaxed),
+                    "completed": existing.completed.load(Ordering::Relaxed),
+                    "total": existing.total,
+                }))).into_response();
+            }
+            // Stale or done — remove and proceed
+        }
+
+        let now = epoch_ms();
+        let task = BatchDeepReadTask {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            current_idx: Arc::new(AtomicUsize::new(pending[0])),
+            total: pending.len(),
+            completed: Arc::new(AtomicUsize::new(0)),
+            failed: Arc::new(AtomicUsize::new(0)),
+            last_heartbeat: Arc::new(AtomicU64::new(now)),
+            started_at_ms: now,
+        };
+        tasks.insert(id.clone(), task);
+    }
+
+    // Clone what the background task needs
+    let task_state = state.clone();
+    let task_id = id.clone();
+    let task_pending = pending.clone();
+
+    tokio::spawn(async move {
+        batch_deep_read_worker(task_state, task_id, task_pending).await;
+    });
+
+    (StatusCode::ACCEPTED, Json(serde_json::json!({
+        "status": "started",
+        "pending": pending.len(),
+        "chapters": pending,
+    }))).into_response()
+}
+
+async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Vec<usize>) {
+    for &idx in &pending {
+        // Check cancellation
+        let cancelled = {
+            let tasks = state.batch_tasks.lock().unwrap();
+            match tasks.get(&episode_id) {
+                Some(t) => {
+                    t.current_idx.store(idx, Ordering::Relaxed);
+                    t.touch();
+                    t.cancelled.load(Ordering::Relaxed)
+                }
+                None => true, // task removed externally
+            }
+        };
+        if cancelled { break; }
+
+        // Re-fetch episode each iteration to get latest state
+        let ep = match state.store.get_episode(&episode_id).await {
+            Ok(ep) => ep,
+            Err(_) => break,
+        };
+
+        // Skip if deep read already exists (race with single-chapter request)
+        if idx < ep.chapters.len() && ep.chapters[idx].deep_read.is_some() {
+            let tasks = state.batch_tasks.lock().unwrap();
+            if let Some(t) = tasks.get(&episode_id) {
+                t.completed.fetch_add(1, Ordering::Relaxed);
+                t.touch();
+            }
+            continue;
+        }
+
+        if idx >= ep.chapters.len() { continue; }
+
+        let chapter = &ep.chapters[idx];
+        let transcript_excerpt = build_chapter_transcript(&ep, chapter);
+
+        let system = "You are an expert content analyst. Write detailed, polished deep-read articles about podcast/video chapters. Include key insights, context, and analysis. Write in a clear, engaging style.";
+        let prompt = format!(
+            "Write a deep-read analysis of this chapter:\n\n\
+             Chapter: {}\nTime: {} — {}\nOriginal Summary: {}\n\n\
+             Transcript:\n{}",
+            chapter.title,
+            fmt_dur(chapter.start_time),
+            fmt_dur(chapter.end_time),
+            chapter.summary,
+            &transcript_excerpt[..transcript_excerpt.len().min(4000)]
+        );
+
+        let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
+
+        // Timeout: 3 minutes per chapter
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            call_llm_anthropic(&state.llm, system, &messages),
+        ).await;
+
+        let is_ok = match result {
+            Ok(content) if !content.starts_with("LLM API error") && !content.starts_with("Failed to") => {
+                // Persist
+                let mut chapters_val = serde_json::to_value(&ep.chapters).unwrap_or_default();
+                if let Some(arr) = chapters_val.as_array_mut() {
+                    if let Some(ch) = arr.get_mut(idx) {
+                        ch["deepRead"] = serde_json::Value::String(content);
+                    }
+                }
+                let updates = serde_json::json!({"chapters": chapters_val});
+                state.store.update_episode(&episode_id, &updates).await.is_ok()
+            }
+            Ok(err_content) => {
+                tracing::warn!(%episode_id, idx, %err_content, "batch deep read LLM error");
+                false
+            }
+            Err(_timeout) => {
+                tracing::warn!(%episode_id, idx, "batch deep read timed out (180s)");
+                false
+            }
+        };
+
+        {
+            let tasks = state.batch_tasks.lock().unwrap();
+            if let Some(t) = tasks.get(&episode_id) {
+                if is_ok {
+                    t.completed.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    t.failed.fetch_add(1, Ordering::Relaxed);
+                }
+                t.touch();
+            }
+        }
+    }
+
+    // Mark done and schedule cleanup
+    {
+        let tasks = state.batch_tasks.lock().unwrap();
+        if let Some(t) = tasks.get(&episode_id) {
+            t.current_idx.store(usize::MAX, Ordering::Relaxed);
+            t.touch();
+        }
+    }
+
+    // Remove task after 60 seconds so frontend can read final status
+    let cleanup_state = state.clone();
+    let cleanup_id = episode_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        cleanup_state.batch_tasks.lock().unwrap().remove(&cleanup_id);
+    });
+}
+
+fn build_chapter_transcript(ep: &lumen_pod_core::episode::Episode, chapter: &lumen_pod_core::episode::Chapter) -> String {
+    let Some(t) = &ep.transcript else { return String::new() };
+    let mut text = String::new();
+    for para in &t.paragraphs {
+        let para_start = para.sentences.first().and_then(|s| s.words.first().map(|w| w.start)).unwrap_or(0.0);
+        let para_end = para.sentences.last().and_then(|s| s.words.last().map(|w| w.end)).unwrap_or(0.0);
+        if para_end >= chapter.start_time && para_start <= chapter.end_time {
+            if let Some(speaker) = &para.speaker {
+                text.push_str(&format!("[{speaker}] "));
+            }
+            for sent in &para.sentences {
+                text.push_str(&sent.text);
+                text.push(' ');
+            }
+            text.push('\n');
+        }
+    }
+    text
+}
+
+async fn batch_deep_read_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tasks = state.batch_tasks.lock().unwrap();
+    match tasks.get(&id) {
+        Some(t) => {
+            let current = t.current_idx.load(Ordering::Relaxed);
+            let status = if t.cancelled.load(Ordering::Relaxed) {
+                "cancelled"
+            } else if current == usize::MAX {
+                "complete"
+            } else {
+                "running"
+            };
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": status,
+                "currentIdx": if current == usize::MAX { serde_json::Value::Null } else { serde_json::json!(current) },
+                "total": t.total,
+                "completed": t.completed.load(Ordering::Relaxed),
+                "failed": t.failed.load(Ordering::Relaxed),
+                "elapsedMs": epoch_ms().saturating_sub(t.started_at_ms),
+            }))).into_response()
+        }
+        None => (StatusCode::OK, Json(serde_json::json!({"status": "idle"}))).into_response(),
+    }
+}
+
+async fn batch_deep_read_cancel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let tasks = state.batch_tasks.lock().unwrap();
+    match tasks.get(&id) {
+        Some(t) if !t.is_done() => {
+            t.cancelled.store(true, Ordering::Relaxed);
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": "cancelling",
+                "completed": t.completed.load(Ordering::Relaxed),
+            }))).into_response()
+        }
+        _ => (StatusCode::OK, Json(serde_json::json!({"status": "idle"}))).into_response(),
+    }
 }
 
 // ---- Export ----

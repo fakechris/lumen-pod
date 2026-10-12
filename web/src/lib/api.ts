@@ -94,6 +94,30 @@ export async function requestChapterDeepRead(
   });
 }
 
+// ---- Batch Deep Read ----
+
+export interface BatchStatus {
+  status: "idle" | "started" | "running" | "complete" | "cancelled" | "cancelling";
+  currentIdx?: number | null;
+  total?: number;
+  completed?: number;
+  failed?: number;
+  elapsedMs?: number;
+  pending?: number;
+}
+
+export async function startBatchDeepRead(episodeId: string): Promise<BatchStatus> {
+  return apiFetch(`/api/episodes/${episodeId}/deep-read-all`, { method: "POST" });
+}
+
+export async function getBatchDeepReadStatus(episodeId: string): Promise<BatchStatus> {
+  return apiFetch(`/api/episodes/${episodeId}/deep-read-all`);
+}
+
+export async function cancelBatchDeepRead(episodeId: string): Promise<BatchStatus> {
+  return apiFetch(`/api/episodes/${episodeId}/deep-read-all`, { method: "DELETE" });
+}
+
 // ---- Formatting helpers ----
 
 export function formatDuration(seconds: number): string {

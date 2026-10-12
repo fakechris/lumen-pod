@@ -218,6 +218,7 @@ pub struct AppState {
     pub auth: AuthConfig,
     pub llm: crate::LlmConfig,
     pub audio_dir: String,
+    pub batch_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::BatchDeepReadTask>>>,
 }
 
 pub async fn google_login(State(state): State<AppState>) -> impl IntoResponse {

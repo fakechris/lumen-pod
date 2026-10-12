@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { getEpisode, formatTimestamp, formatDuration, getExportUrl, sendChatMessage, requestChapterDeepRead, type ChatMsg } from "@/lib/api";
+import { getEpisode, formatTimestamp, formatDuration, getExportUrl, sendChatMessage, requestChapterDeepRead, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, type ChatMsg, type BatchStatus } from "@/lib/api";
 import type { Episode } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -432,8 +432,67 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
   episode: Episode; episodeId: string; currentTime: number; seekTo: (t: number) => void; canSeek: boolean;
   deepReads: DeepReadState; setDeepReads: React.Dispatch<React.SetStateAction<DeepReadState>>;
 }) {
+  const [batch, setBatch] = useState<BatchStatus | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastCompletedRef = useRef(0);
+
+  // Poll batch status
+  const startPolling = useCallback(() => {
+    if (pollRef.current) return;
+    lastCompletedRef.current = 0;
+    pollRef.current = setInterval(async () => {
+      try {
+        const s = await getBatchDeepReadStatus(episodeId);
+        setBatch(s);
+        // When new chapters completed, refresh deep reads from episode
+        const completed = s.completed ?? 0;
+        if (completed > lastCompletedRef.current) {
+          lastCompletedRef.current = completed;
+          const ep = await getEpisode(episodeId);
+          const restored: DeepReadState = {};
+          ep.chapters.forEach((ch, i) => {
+            if (ch.deepRead) restored[i] = { loading: false, content: ch.deepRead };
+          });
+          setDeepReads(restored);
+        }
+        if (s.status === "complete" || s.status === "cancelled" || s.status === "idle") {
+          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+        }
+      } catch {
+        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+        setBatch(null);
+      }
+    }, 2500);
+  }, [episodeId, setDeepReads]);
+
+  // Check for existing batch on mount
+  useEffect(() => {
+    getBatchDeepReadStatus(episodeId).then((s) => {
+      if (s.status === "running" || s.status === "cancelling") { setBatch(s); startPolling(); }
+      else setBatch(null);
+    }).catch(() => {});
+    return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
+  }, [episodeId, startPolling]);
+
   if (episode.chapters.length === 0) return <EmptyState text="No chapters available" />;
   const totalDuration = episode.source.duration || episode.chapters.at(-1)?.endTime || 1;
+
+  const pendingCount = episode.chapters.filter((_, i) => !deepReads[i]?.content).length;
+  const batchRunning = batch?.status === "running" || batch?.status === "cancelling";
+
+  const handleBatchStart = async () => {
+    try {
+      const res = await startBatchDeepRead(episodeId);
+      setBatch(res);
+      if (res.status === "started") startPolling();
+    } catch (e: any) {
+      if (e.message?.includes("batch already running")) startPolling();
+    }
+  };
+
+  const handleBatchCancel = async () => {
+    try { const res = await cancelBatchDeepRead(episodeId); setBatch(res); } catch {}
+  };
 
   const handleDeepRead = async (idx: number) => {
     if (deepReads[idx]?.content) { setDeepReads((p) => { const c = { ...p }; delete c[idx]; return c; }); return; }
@@ -448,6 +507,42 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
 
   return (
     <div className="space-y-4">
+      {/* Batch controls + progress */}
+      <div className="flex items-center gap-3 flex-wrap">
+        {!batchRunning && pendingCount > 0 && (
+          <button onClick={handleBatchStart} className="px-4 py-2 text-sm font-medium rounded-lg bg-purple-600 text-white hover:bg-purple-700 transition-colors">
+            📖 Deep Read All ({pendingCount} remaining)
+          </button>
+        )}
+        {batchRunning && (
+          <>
+            <div className="flex-1 min-w-[200px]">
+              <div className="flex items-center gap-3">
+                <div className="flex-1 h-2.5 bg-zinc-200 dark:bg-zinc-700 rounded-full overflow-hidden">
+                  <div className="h-full bg-purple-500 rounded-full transition-all duration-500" style={{ width: `${batch?.total ? ((batch.completed ?? 0) / batch.total) * 100 : 0}%` }} />
+                </div>
+                <span className="text-sm text-zinc-500 whitespace-nowrap">
+                  {batch?.completed ?? 0}/{batch?.total ?? 0}
+                  {(batch?.failed ?? 0) > 0 && <span className="text-red-400 ml-1">({batch?.failed} failed)</span>}
+                </span>
+              </div>
+              <div className="text-xs text-zinc-400 mt-1">
+                {batch?.status === "cancelling" ? "⏳ Cancelling..." : batch?.currentIdx != null ? `Processing chapter ${batch.currentIdx + 1}...` : "Starting..."}
+                {batch?.elapsedMs ? ` · ${Math.round(batch.elapsedMs / 1000)}s elapsed` : ""}
+              </div>
+            </div>
+            {batch?.status !== "cancelling" && (
+              <button onClick={handleBatchCancel} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors">
+                ✕ Cancel
+              </button>
+            )}
+          </>
+        )}
+        {batch?.status === "complete" && (
+          <span className="text-sm text-green-600 dark:text-green-400">✓ All done — {batch.completed} chapters processed{(batch.failed ?? 0) > 0 ? `, ${batch.failed} failed` : ""}</span>
+        )}
+      </div>
+
       {canSeek && (
         <div className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-4">
           <div className="relative h-8 bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
@@ -467,6 +562,7 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
         {episode.chapters.map((ch, i) => {
           const isActive = currentTime >= ch.startTime && currentTime < ch.endTime;
           const dr = deepReads[i];
+          const isBatchProcessing = batchRunning && batch?.currentIdx === i;
           return (
             <div key={i} className={`rounded-xl border transition-all ${isActive ? "bg-blue-50 dark:bg-blue-950/50 border-blue-300 dark:border-blue-800 shadow-sm" : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 hover:border-blue-300 dark:hover:border-blue-700"}`}>
               <button onClick={() => canSeek && seekTo(ch.startTime)} className={`w-full text-left p-4 ${canSeek ? "cursor-pointer" : "cursor-default"}`}>
@@ -480,11 +576,12 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
                     <p className="text-sm text-zinc-500 mt-1 line-clamp-2">{ch.summary}</p>
                   </div>
                   {ch.hasAds && <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">AD</span>}
+                  {isBatchProcessing && <span className="text-xs px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 animate-pulse">Generating...</span>}
                 </div>
               </button>
               <div className="px-4 pb-3 flex items-center gap-2">
-                <button onClick={() => handleDeepRead(i)} disabled={dr?.loading} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors disabled:opacity-50">
-                  {dr?.loading ? "⏳ Generating..." : dr?.content ? "📖 Hide Deep Read" : "📖 Deep Read"}
+                <button onClick={() => handleDeepRead(i)} disabled={dr?.loading || isBatchProcessing} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors disabled:opacity-50">
+                  {dr?.loading || isBatchProcessing ? "⏳ Generating..." : dr?.content ? "📖 Hide Deep Read" : "📖 Deep Read"}
                 </button>
               </div>
               {dr?.content && (
