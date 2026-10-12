@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { listEpisodes, formatDuration, getGoogleLoginUrl } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import type { Episode } from "@/lib/types";
 
 const platformIcons: Record<string, string> = {
@@ -74,6 +75,7 @@ function EpisodeCard({ episode }: { episode: Episode }) {
 }
 
 export default function Home() {
+  const { user, loading: authLoading, logout } = useAuth();
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -107,15 +109,54 @@ export default function Home() {
             >
               🔍 Search
             </Link>
-            <a
-              href={getGoogleLoginUrl()}
-              className="px-3 py-1.5 text-sm rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors"
-            >
-              Sign in
-            </a>
+            {authLoading ? null : user ? (
+              <div className="flex items-center gap-2">
+                {user.role === "admin" && (
+                  <Link
+                    href="/admin"
+                    className="px-3 py-1.5 text-sm rounded-lg bg-amber-100 dark:bg-amber-900/30 hover:bg-amber-200 dark:hover:bg-amber-900/50 text-amber-700 dark:text-amber-400 transition-colors"
+                  >
+                    ⚙️ Admin
+                  </Link>
+                )}
+                {user.avatar_url ? (
+                  <img
+                    src={user.avatar_url}
+                    alt={user.name || user.email}
+                    className="w-8 h-8 rounded-full"
+                    title={user.name || user.email}
+                  />
+                ) : (
+                  <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-white text-sm font-medium">
+                    {(user.name || user.email)[0].toUpperCase()}
+                  </div>
+                )}
+                <button
+                  onClick={logout}
+                  className="px-3 py-1.5 text-sm rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 transition-colors"
+                >
+                  Sign out
+                </button>
+              </div>
+            ) : (
+              <a
+                href={getGoogleLoginUrl()}
+                className="px-3 py-1.5 text-sm rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors"
+              >
+                Sign in
+              </a>
+            )}
           </div>
         </div>
       </header>
+
+      {user && !user.approved && (
+        <div className="bg-amber-50 dark:bg-amber-950 border-b border-amber-200 dark:border-amber-800">
+          <div className="max-w-5xl mx-auto px-4 py-3 text-sm text-amber-700 dark:text-amber-400 text-center">
+            ⏳ Your account is pending admin approval. You can browse but some features are restricted.
+          </div>
+        </div>
+      )}
 
       <main className="max-w-5xl mx-auto px-4 py-8">
         {loading && (

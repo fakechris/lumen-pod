@@ -301,26 +301,31 @@ pub async fn google_callback(
         }
     };
 
+    let secure = state.auth.google_redirect_uri.starts_with("https://");
     let cookie = format!(
-        "lumen_pod_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800",
-        jwt
+        "lumen_pod_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800{}",
+        jwt,
+        if secure { "; Secure" } else { "" },
     );
 
+    // Derive frontend base URL from the redirect URI (strip /auth/google/callback)
+    let frontend_url = state
+        .auth
+        .google_redirect_uri
+        .trim_end_matches("/auth/google/callback")
+        .to_string();
+    let redirect_to = if frontend_url.is_empty() {
+        "/".to_string()
+    } else {
+        frontend_url
+    };
+
     (
-        StatusCode::OK,
-        [(header::SET_COOKIE, cookie)],
-        Json(serde_json::json!({
-            "status": "ok",
-            "token": jwt,
-            "user": {
-                "id": user.id,
-                "email": user.email,
-                "name": user.name,
-                "avatar_url": user.avatar_url,
-                "role": role_str,
-                "approved": user.approved,
-            }
-        })),
+        StatusCode::FOUND,
+        [
+            (header::SET_COOKIE, cookie),
+            (header::LOCATION, redirect_to),
+        ],
     )
         .into_response()
 }
