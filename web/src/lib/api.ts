@@ -9,10 +9,18 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (!res.ok) {
+    if (res.status === 401 && typeof window !== "undefined") {
+      window.location.href = getGoogleLoginUrl();
+      return new Promise(() => {}); // never resolves, page is navigating
+    }
     const body = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(body.error || `API error: ${res.status}`);
   }
   return res.json();
+}
+
+export function getExportUrl(id: string, format: string): string {
+  return `${API_BASE}/api/episodes/${id}/export/${format}`;
 }
 
 export async function getMe(): Promise<User> {

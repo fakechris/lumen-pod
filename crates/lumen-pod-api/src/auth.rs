@@ -27,6 +27,7 @@ pub struct AuthConfig {
     pub google_redirect_uri: String,
     pub jwt_secret: String,
     pub admin_emails: Vec<String>,
+    pub api_tokens: Vec<String>,
 }
 
 impl AuthConfig {
@@ -38,14 +39,37 @@ impl AuthConfig {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let api_tokens: Vec<String> = std::env::var("LUMEN_POD_API_TOKEN")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let jwt_secret = std::env::var("JWT_SECRET")
+            .unwrap_or_else(|_| "dev-secret-change-in-production".into());
+
         Self {
             google_client_id: std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
             google_client_secret: std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
             google_redirect_uri: std::env::var("GOOGLE_REDIRECT_URI")
                 .unwrap_or_else(|_| "http://localhost:3210/auth/google/callback".into()),
-            jwt_secret: std::env::var("JWT_SECRET")
-                .unwrap_or_else(|_| "dev-secret-change-in-production".into()),
+            jwt_secret,
             admin_emails,
+            api_tokens,
+        }
+    }
+
+    pub fn validate(&self) {
+        const DEFAULTS: &[&str] = &[
+            "dev-secret-change-in-production",
+            "change-me-in-production",
+        ];
+        if DEFAULTS.contains(&self.jwt_secret.as_str()) || self.jwt_secret.len() < 32 {
+            panic!(
+                "FATAL: JWT_SECRET is insecure (default or < 32 chars). \
+                 Set a strong random value: openssl rand -hex 32"
+            );
         }
     }
 }
@@ -150,6 +174,40 @@ pub fn require_admin(headers: &HeaderMap, jwt_secret: &str) -> Result<Claims, ax
             .into_response());
     }
     Ok(claims)
+}
+
+// ---- Auth middleware (axum layer) ----
+
+/// Middleware: require either a valid API token (Bearer) or an approved cookie session.
+/// Attach to all /api/* routes except /api/me.
+pub async fn require_auth(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, axum::response::Response> {
+    let headers = req.headers();
+
+    // 1. Check Bearer API token (for agents / curl)
+    if let Some(auth_header) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if let Some(token) = auth_header.strip_prefix("Bearer ") {
+            if state.auth.api_tokens.iter().any(|t| constant_time_eq(t.as_bytes(), token.as_bytes())) {
+                return Ok(next.run(req).await);
+            }
+        }
+    }
+
+    // 2. Check cookie session (for browser)
+    match require_approved(headers, &state.auth.jwt_secret) {
+        Ok(_) => Ok(next.run(req).await),
+        Err(e) => Err(e),
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ---- Google OAuth Handlers ----

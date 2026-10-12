@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import Link from "next/link";
-import { getEpisode, formatTimestamp, formatDuration } from "@/lib/api";
+import { getEpisode, formatTimestamp, formatDuration, getExportUrl } from "@/lib/api";
 import type { Episode } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -144,6 +144,21 @@ function MarkmapView({ markdown }: { markdown: string }) {
 // Tabs
 // ---------------------------------------------------------------------------
 
+const SPEAKER_COLORS = [
+  "text-blue-600 dark:text-blue-400",
+  "text-emerald-600 dark:text-emerald-400",
+  "text-amber-600 dark:text-amber-400",
+  "text-rose-600 dark:text-rose-400",
+  "text-purple-600 dark:text-purple-400",
+  "text-cyan-600 dark:text-cyan-400",
+];
+
+function speakerColor(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
+  return SPEAKER_COLORS[Math.abs(hash) % SPEAKER_COLORS.length];
+}
+
 const TABS = ["Summary", "Chapters", "Mindmap", "Transcript", "Keywords", "Highlights", "Q&A"] as const;
 type TabName = (typeof TABS)[number];
 
@@ -200,6 +215,10 @@ export default function EpisodeDetail({ id }: { id: string }) {
             <a href={episode.source.url} target="_blank" rel="noopener" className="text-blue-500 hover:underline ml-1">
               Source ↗
             </a>
+            <span className="text-zinc-300 dark:text-zinc-600">|</span>
+            <a href={getExportUrl(id, "markdown")} className="text-blue-500 hover:underline text-xs">📝 MD</a>
+            <a href={getExportUrl(id, "srt")} className="text-blue-500 hover:underline text-xs">📄 SRT</a>
+            <a href={getExportUrl(id, "json")} className="text-blue-500 hover:underline text-xs">📦 JSON</a>
           </div>
         </div>
       </header>
@@ -496,8 +515,10 @@ function TranscriptTab({
               }`}
             >
               <span className="font-mono text-xs text-blue-500 mr-2">{formatTimestamp(startTime)}</span>
-              {para.speaker && <span className="text-xs font-semibold text-purple-600 dark:text-purple-400 mr-1.5">[{para.speaker}]</span>}
-              {para.sentences.map((s) => s.text).join(" ")}
+              {para.speaker && <span className={`text-xs font-semibold mr-1.5 ${speakerColor(para.speaker)}`}>[{para.speaker}]</span>}
+              {para.sentences.map((s, si) => (
+                <span key={s.id || si} className="sentence-span">{si > 0 ? " " : ""}{s.text}</span>
+              ))}
             </div>
           );
         })}

@@ -68,6 +68,11 @@ async fn run_server(database_url: &str) {
 
     let auth_config = auth::AuthConfig::from_env();
 
+    // Validate JWT secret is not default in production
+    if std::env::var("RUST_ENV").unwrap_or_default() != "test" {
+        auth_config.validate();
+    }
+
     // Seed built-in admin(s)
     for email in &auth_config.admin_emails {
         if let Err(e) = store.seed_admin(email).await {
@@ -99,13 +104,15 @@ async fn run_server(database_url: &str) {
             .allow_headers(tower_http::cors::Any),
     };
 
-    let app = Router::new()
-        // Public
+    // Public routes (no auth required)
+    let public = Router::new()
         .route("/healthz", get(healthz))
         .route("/auth/google", get(auth::google_login))
         .route("/auth/google/callback", get(auth::google_callback))
-        // Authenticated
-        .route("/api/me", get(auth::me))
+        .route("/api/me", get(auth::me));
+
+    // Protected routes (require cookie session or API token)
+    let protected = Router::new()
         .route("/api/episodes", get(list_episodes).post(create_episode))
         .route("/api/episodes/submit-url", axum::routing::post(submit_url))
         .route(
@@ -133,6 +140,13 @@ async fn run_server(database_url: &str) {
             "/api/admin/users/{id}",
             axum::routing::patch(auth::update_user).delete(auth::delete_user),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
+    let app = public
+        .merge(protected)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);

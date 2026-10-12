@@ -147,15 +147,40 @@ impl Store {
     ) -> PodResult<Episode> {
         let mut ep = self.get_episode(id).await?;
 
-        if let Some(v) = updates.get("is_read") {
-            ep.is_read = v.as_bool().unwrap_or(false);
+        // Helper: try both camelCase and snake_case keys
+        macro_rules! patch {
+            ($field:ident, $key1:expr, $key2:expr) => {
+                if let Some(v) = updates.get($key1).or_else(|| updates.get($key2)) {
+                    if let Ok(val) = serde_json::from_value(v.clone()) {
+                        ep.$field = val;
+                    }
+                }
+            };
         }
-        if let Some(v) = updates.get("tags") {
-            if let Ok(tags) = serde_json::from_value(v.clone()) {
-                ep.tags = tags;
+
+        // Source & processing (new)
+        if let Some(v) = updates.get("source") {
+            if let Ok(s) = serde_json::from_value(v.clone()) {
+                ep.source = s;
             }
         }
-        if let Some(v) = updates.get("collection_id") {
+        if let Some(v) = updates.get("processing") {
+            if let Ok(p) = serde_json::from_value(v.clone()) {
+                ep.processing = p;
+            }
+        }
+        if let Some(v) = updates.get("transcript") {
+            if let Ok(t) = serde_json::from_value(v.clone()) {
+                ep.transcript = Some(t);
+            }
+        }
+
+        // Existing fields
+        if let Some(v) = updates.get("isRead").or_else(|| updates.get("is_read")) {
+            ep.is_read = v.as_bool().unwrap_or(false);
+        }
+        patch!(tags, "tags", "tags");
+        if let Some(v) = updates.get("collectionId").or_else(|| updates.get("collection_id")) {
             ep.collection_id = v.as_str().map(String::from);
         }
         if let Some(v) = updates.get("summary") {
@@ -163,26 +188,11 @@ impl Store {
                 ep.summary = Some(s);
             }
         }
-        if let Some(v) = updates.get("keywords") {
-            if let Ok(k) = serde_json::from_value(v.clone()) {
-                ep.keywords = k;
-            }
-        }
-        if let Some(v) = updates.get("qas") {
-            if let Ok(q) = serde_json::from_value(v.clone()) {
-                ep.qas = q;
-            }
-        }
-        if let Some(v) = updates.get("clips") {
-            if let Ok(c) = serde_json::from_value(v.clone()) {
-                ep.clips = c;
-            }
-        }
-        if let Some(v) = updates.get("highlights") {
-            if let Ok(h) = serde_json::from_value(v.clone()) {
-                ep.highlights = h;
-            }
-        }
+        patch!(keywords, "keywords", "keywords");
+        patch!(qas, "qas", "qas");
+        patch!(clips, "clips", "clips");
+        patch!(highlights, "highlights", "highlights");
+        patch!(chapters, "chapters", "chapters");
         if let Some(v) = updates.get("article") {
             if let Ok(a) = serde_json::from_value(v.clone()) {
                 ep.article = Some(a);
@@ -196,24 +206,28 @@ impl Store {
                 ep.mindmap = Some(m);
             }
         }
-        if let Some(v) = updates.get("chapters") {
-            if let Ok(c) = serde_json::from_value(v.clone()) {
-                ep.chapters = c;
-            }
-        }
 
         ep.updated_at = Utc::now();
         let search_text = Self::build_search_text(&ep);
 
         sqlx::query(
             "UPDATE episodes SET
-                summary = $1, chapters = $2, mindmap = $3,
-                keywords = $4, highlights = $5, qas = $6,
-                clips = $7, article = $8, shownotes = $9,
-                is_read = $10, tags = $11, collection_id = $12,
-                search_vector = to_tsvector('english', $13),
-                updated_at = $14
-             WHERE id = $15",
+                source = $1, processing = $2, transcript = $3,
+                summary = $4, chapters = $5, mindmap = $6,
+                keywords = $7, highlights = $8, qas = $9,
+                clips = $10, article = $11, shownotes = $12,
+                is_read = $13, tags = $14, collection_id = $15,
+                search_vector = to_tsvector('english', $16),
+                updated_at = $17
+             WHERE id = $18",
+        )
+        .bind(serde_json::to_value(&ep.source)?)
+        .bind(serde_json::to_value(&ep.processing)?)
+        .bind(
+            ep.transcript
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
         )
         .bind(
             ep.summary
