@@ -133,8 +133,9 @@ function MarkmapView({ markdown }: { markdown: string }) {
   }, [markdown]);
 
   return (
-    <div className="w-full bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 overflow-hidden" style={{ height: "min(70vh, 600px)" }}>
+    <div className="w-full rounded-xl border border-zinc-200 dark:border-zinc-800 overflow-hidden markmap-wrap" style={{ height: "min(70vh, 600px)", background: "#fff" }}>
       <svg ref={svgRef} className="w-full h-full" />
+      <style>{`.markmap-wrap .markmap-node text, .markmap-wrap .markmap-foreign div { color: #1a1a2e !important; } .markmap-wrap .markmap-link { opacity: 0.7; }`}</style>
     </div>
   );
 }
@@ -490,7 +491,7 @@ function TranscriptTab({
               onClick={() => seekTo(startTime)}
               className={`px-3 py-2 rounded-lg cursor-pointer transition-all text-sm leading-relaxed ${
                 isActive
-                  ? "bg-blue-50 dark:bg-blue-950/60 border-l-3 border-blue-500 text-zinc-900 dark:text-zinc-100"
+                  ? "bg-blue-50 dark:bg-blue-950/60 border-l-[3px] border-blue-500 text-zinc-900 dark:text-zinc-100"
                   : "hover:bg-zinc-100 dark:hover:bg-zinc-800/50 text-zinc-600 dark:text-zinc-400"
               }`}
             >
