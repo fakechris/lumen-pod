@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { listEpisodes, formatDuration, getGoogleLoginUrl } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -12,11 +12,20 @@ const platformIcons: Record<string, string> = {
   spotify: "🎵",
   apple: "🍎",
   twitter: "𝕏",
+  xiaoyuzhou: "🎧",
   default: "🎙️",
+};
+
+const statusColors: Record<string, string> = {
+  pending: "bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400",
+  processing: "bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400",
+  done: "bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400",
+  error: "bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400",
 };
 
 function EpisodeCard({ episode }: { episode: Episode }) {
   const icon = platformIcons[episode.source.platform] || platformIcons.default;
+  const isPending = episode.processing.status === "pending";
 
   return (
     <Link
@@ -31,8 +40,8 @@ function EpisodeCard({ episode }: { episode: Episode }) {
             className="w-28 h-20 rounded-lg object-cover shrink-0"
           />
         ) : (
-          <div className="w-28 h-20 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-3xl shrink-0">
-            {icon}
+          <div className={`w-28 h-20 rounded-lg flex items-center justify-center text-3xl shrink-0 ${isPending ? "bg-gradient-to-br from-amber-400 to-orange-500" : "bg-gradient-to-br from-blue-500 to-purple-600"}`}>
+            {isPending ? "⏳" : icon}
           </div>
         )}
         <div className="flex-1 min-w-0">
@@ -45,15 +54,27 @@ function EpisodeCard({ episode }: { episode: Episode }) {
             )}
           </div>
           <div className="flex items-center gap-2 mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-            <span>{episode.source.author}</span>
-            <span>·</span>
+            {episode.source.author && <span>{episode.source.author}</span>}
+            {episode.source.author && <span>·</span>}
             <span>{icon} {episode.source.platform}</span>
-            <span>·</span>
-            <span>{formatDuration(episode.source.duration)}</span>
+            {episode.source.duration > 0 && (
+              <>
+                <span>·</span>
+                <span>{formatDuration(episode.source.duration)}</span>
+              </>
+            )}
+            <span className={`px-1.5 py-0.5 text-xs rounded-full ${statusColors[episode.processing.status] || statusColors.pending}`}>
+              {episode.processing.status}
+            </span>
           </div>
           {episode.summary && (
             <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400 line-clamp-2">
               {episode.summary.oneLiner}
+            </p>
+          )}
+          {isPending && (
+            <p className="mt-2 text-sm text-amber-600 dark:text-amber-400">
+              Awaiting agent processing — use MCP or skill to process this episode
             </p>
           )}
           {episode.tags.length > 0 && (
@@ -74,6 +95,75 @@ function EpisodeCard({ episode }: { episode: Episode }) {
   );
 }
 
+function SubmitUrlForm({ onSubmitted }: { onSubmitted: () => void }) {
+  const [url, setUrl] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  const handleSubmit = async () => {
+    const trimmed = url.trim();
+    if (!trimmed) return;
+
+    setSubmitting(true);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const res = await fetch("/api/episodes/submit-url", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: trimmed }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setSuccess(`✓ Submitted! Episode ID: ${data.id}`);
+        setUrl("");
+        onSubmitted();
+      } else {
+        setError(data.error || "Failed to submit");
+      }
+    } catch {
+      setError("Network error");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex gap-2">
+        <input
+          type="url"
+          placeholder="Paste a podcast or video URL (YouTube, Bilibili, Spotify, Apple...)"
+          value={url}
+          onChange={(e) => { setUrl(e.target.value); setError(null); setSuccess(null); }}
+          onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
+          disabled={submitting}
+          className="flex-1 px-4 py-2.5 rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-50 placeholder:text-zinc-400"
+        />
+        <button
+          onClick={handleSubmit}
+          disabled={submitting || !url.trim()}
+          className="px-5 py-2.5 text-sm font-medium rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-zinc-300 dark:disabled:bg-zinc-700 text-white transition-colors whitespace-nowrap"
+        >
+          {submitting ? "Submitting..." : "➕ Add Episode"}
+        </button>
+      </div>
+      {error && (
+        <p className="text-sm text-red-500">{error}</p>
+      )}
+      {success && (
+        <p className="text-sm text-green-600 dark:text-green-400">{success}</p>
+      )}
+      <p className="text-xs text-zinc-400">
+        Supported: YouTube, Bilibili, Spotify, Apple Podcasts, Twitter/X, 小宇宙, and 1000+ more via yt-dlp
+      </p>
+    </div>
+  );
+}
+
 export default function Home() {
   const { user, loading: authLoading, logout } = useAuth();
   const [episodes, setEpisodes] = useState<Episode[]>([]);
@@ -81,7 +171,7 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const fetchEpisodes = useCallback(() => {
     listEpisodes(50, 0)
       .then((data) => {
         setEpisodes(data.episodes);
@@ -90,6 +180,10 @@ export default function Home() {
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    fetchEpisodes();
+  }, [fetchEpisodes]);
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -159,6 +253,16 @@ export default function Home() {
       )}
 
       <main className="max-w-5xl mx-auto px-4 py-8">
+        {/* URL Submit Box — shown to logged-in approved users */}
+        {user && user.approved && (
+          <div className="mb-8 p-5 rounded-2xl bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 shadow-sm">
+            <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100 mb-3">
+              Add a Podcast or Video
+            </h2>
+            <SubmitUrlForm onSubmitted={fetchEpisodes} />
+          </div>
+        )}
+
         {loading && (
           <div className="text-center py-20 text-zinc-400">Loading...</div>
         )}
@@ -167,10 +271,17 @@ export default function Home() {
         )}
         {!loading && !error && episodes.length === 0 && (
           <div className="text-center py-20">
+            <p className="text-4xl mb-4">🎙️</p>
             <p className="text-zinc-400 text-lg">No episodes yet</p>
-            <p className="text-zinc-500 text-sm mt-2">
-              Use the MCP tools or agent skills to process your first podcast.
-            </p>
+            {user ? (
+              <p className="text-zinc-500 text-sm mt-2">
+                Paste a URL above, or use the MCP agent to process your first podcast.
+              </p>
+            ) : (
+              <p className="text-zinc-500 text-sm mt-2">
+                Sign in to add your first podcast.
+              </p>
+            )}
           </div>
         )}
         <div className="space-y-3">

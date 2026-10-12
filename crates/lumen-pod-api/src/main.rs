@@ -107,6 +107,7 @@ async fn run_server(database_url: &str) {
         // Authenticated
         .route("/api/me", get(auth::me))
         .route("/api/episodes", get(list_episodes).post(create_episode))
+        .route("/api/episodes/submit-url", axum::routing::post(submit_url))
         .route(
             "/api/episodes/{id}",
             get(get_episode).patch(update_episode).delete(delete_episode),
@@ -225,6 +226,120 @@ async fn delete_episode(
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response(),
         Ok(false) => err_404(),
         Err(e) => err_500(e),
+    }
+}
+
+// ---- Submit URL ----
+
+#[derive(Deserialize)]
+struct SubmitUrlRequest {
+    url: String,
+    title: Option<String>,
+}
+
+async fn submit_url(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<SubmitUrlRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = auth::require_approved(&headers, &state.auth.jwt_secret) {
+        return e;
+    }
+
+    let url = req.url.trim().to_string();
+    if url.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "url is required"})),
+        )
+            .into_response();
+    }
+
+    // Check duplicate
+    if let Ok(true) = state.store.episode_exists_by_url(&url).await {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "episode with this URL already exists"})),
+        )
+            .into_response();
+    }
+
+    // Detect platform from URL
+    let platform = detect_platform(&url);
+    let title = req.title.unwrap_or_else(|| format!("Pending: {}", &url));
+
+    let episode = lumen_pod_core::episode::Episode {
+        id: uuid::Uuid::new_v4().to_string(),
+        source: lumen_pod_core::episode::Source {
+            url: url.clone(),
+            platform,
+            title,
+            author: String::new(),
+            published_at: None,
+            thumbnail_url: None,
+            duration: 0.0,
+            feed_url: None,
+            description: None,
+            podcast_name: None,
+            episode_cover_url: None,
+            language: None,
+            audio_path: None,
+        },
+        processing: lumen_pod_core::episode::Processing {
+            status: lumen_pod_core::episode::ProcessingStatus::Pending,
+            asr_engine: None,
+            llm_model: None,
+            processed_at: None,
+            agent_id: None,
+            error: None,
+        },
+        summary: None,
+        chapters: vec![],
+        mindmap: None,
+        transcript: None,
+        keywords: vec![],
+        highlights: vec![],
+        qas: vec![],
+        clips: vec![],
+        article: None,
+        shownotes: None,
+        is_read: false,
+        tags: vec!["pending".to_string()],
+        collection_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    match state.store.insert_episode(&episode).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "id": episode.id,
+                "url": url,
+                "status": "pending",
+                "message": "Episode submitted. Use MCP agent or skill to process it."
+            })),
+        )
+            .into_response(),
+        Err(e) => err_500(e),
+    }
+}
+
+fn detect_platform(url: &str) -> String {
+    if url.contains("youtube.com") || url.contains("youtu.be") {
+        "youtube".into()
+    } else if url.contains("bilibili.com") || url.contains("b23.tv") {
+        "bilibili".into()
+    } else if url.contains("spotify.com") {
+        "spotify".into()
+    } else if url.contains("apple.com/podcast") || url.contains("podcasts.apple.com") {
+        "apple".into()
+    } else if url.contains("twitter.com") || url.contains("x.com") {
+        "twitter".into()
+    } else if url.contains("xiaoyuzhou") || url.contains("xyzfm") {
+        "xiaoyuzhou".into()
+    } else {
+        "other".into()
     }
 }
 
