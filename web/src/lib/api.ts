@@ -1,6 +1,11 @@
 import type { Episode, User } from "./types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3210";
+// Client-side: use relative URLs — Caddy (prod) or Next.js rewrites (dev) proxy to API
+// Server-side: use env var for SSR fetch if needed
+const API_BASE =
+  typeof window !== "undefined"
+    ? ""
+    : (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3210");
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -20,7 +25,8 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function getExportUrl(id: string, format: string): string {
-  return `${API_BASE}/api/episodes/${id}/export/${format}`;
+  const base = typeof window !== "undefined" ? "" : API_BASE;
+  return `${base}/api/episodes/${id}/export/${format}`;
 }
 
 export async function getMe(): Promise<User> {
@@ -141,5 +147,7 @@ export function formatTimestamp(seconds: number): string {
 }
 
 export function getGoogleLoginUrl(): string {
+  // In browser, use relative URL so Caddy proxies to the API
+  if (typeof window !== "undefined") return "/auth/google";
   return `${API_BASE}/auth/google`;
 }
