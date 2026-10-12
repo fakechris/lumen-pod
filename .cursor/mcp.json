@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "lumen-pod": {
+      "command": "ssh",
+      "args": [
+        "oracle_5",
+        "docker exec -i pod-api-1 lumen-pod-server mcp"
+      ]
+    }
+  }
+}
