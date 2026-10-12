@@ -219,7 +219,7 @@ async fn call_llm_anthropic(
         .header("content-type", "application/json")
         .json(&serde_json::json!({
             "model": config.model,
-            "max_tokens": 2048,
+            "max_tokens": 8192,
             "system": system,
             "messages": messages,
         }))
