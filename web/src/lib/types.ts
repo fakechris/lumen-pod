@@ -68,6 +68,7 @@ export interface Chapter {
   endTime: number;
   summary: string;
   hasAds: boolean;
+  deepRead?: string;
 }
 
 export interface Mindmap {

@@ -712,6 +712,11 @@ async fn chapter_deep_read(
 
     let chapter = &ep.chapters[idx];
 
+    // Return cached deep read if already generated
+    if let Some(cached) = &chapter.deep_read {
+        return (StatusCode::OK, Json(serde_json::json!({"content": cached, "cached": true}))).into_response();
+    }
+
     let transcript_excerpt = if let Some(t) = &ep.transcript {
         let mut text = String::new();
         for para in &t.paragraphs {
@@ -750,7 +755,19 @@ async fn chapter_deep_read(
     let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
     let content = call_llm_anthropic(&state.llm, system, &messages).await;
 
-    (StatusCode::OK, Json(serde_json::json!({"content": content}))).into_response()
+    // Persist deep read into the chapter
+    let mut chapters_val = serde_json::to_value(&ep.chapters).unwrap_or_default();
+    if let Some(arr) = chapters_val.as_array_mut() {
+        if let Some(ch) = arr.get_mut(idx) {
+            ch["deepRead"] = serde_json::Value::String(content.clone());
+        }
+    }
+    let updates = serde_json::json!({"chapters": chapters_val});
+    if let Err(e) = state.store.update_episode(&id, &updates).await {
+        tracing::warn!(%id, idx, error = %e, "failed to persist deep read");
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"content": content, "cached": false}))).into_response()
 }
 
 // ---- Export ----

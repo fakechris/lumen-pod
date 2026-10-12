@@ -141,6 +141,9 @@ pub struct Chapter {
     /// Whether this chapter segment is detected as an ad (Podwise feature).
     #[serde(default)]
     pub has_ads: bool,
+    /// AI-generated deep-read analysis, persisted once generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep_read: Option<String>,
 }
 
 // ---- Mind map ----

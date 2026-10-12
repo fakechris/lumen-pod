@@ -262,7 +262,15 @@ export default function EpisodeDetail({ id }: { id: string }) {
 
   useEffect(() => {
     if (!id) return;
-    getEpisode(id).then(setEpisode).catch((e) => setError(e.message)).finally(() => setLoading(false));
+    getEpisode(id).then((ep) => {
+      setEpisode(ep);
+      // Restore persisted deep reads from chapter data
+      const restored: DeepReadState = {};
+      ep.chapters.forEach((ch, i) => {
+        if (ch.deepRead) restored[i] = { loading: false, content: ch.deepRead };
+      });
+      if (Object.keys(restored).length > 0) setDeepReads(restored);
+    }).catch((e) => setError(e.message)).finally(() => setLoading(false));
   }, [id]);
 
   const seekTo = useCallback((time: number) => {
