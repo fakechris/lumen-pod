@@ -27,7 +27,7 @@ const platformIcons: Record<string, string> = {
 };
 
 // ---------------------------------------------------------------------------
-// YouTube Player with IFrame API
+// YouTube Player — thumbnail-first, click to activate (avoids bot detection)
 // ---------------------------------------------------------------------------
 
 interface PlayerHandle {
@@ -37,30 +37,44 @@ interface PlayerHandle {
 
 function YouTubePlayer({
   videoId,
+  thumbnailUrl,
   onReady,
   onTimeUpdate,
 }: {
   videoId: string;
+  thumbnailUrl?: string | null;
   onReady?: (h: PlayerHandle) => void;
   onTimeUpdate?: (t: number) => void;
 }) {
+  const [activated, setActivated] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<any>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  const thumb = thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+
+  // Load YT IFrame API only after user clicks play
   useEffect(() => {
+    if (!activated) return;
     let cancelled = false;
 
     function init() {
       if (cancelled || !containerRef.current) return;
       const div = document.createElement("div");
-      div.id = `yt-player-${videoId}`;
+      div.id = `yt-player-${videoId}-${Date.now()}`;
       containerRef.current.innerHTML = "";
       containerRef.current.appendChild(div);
 
       playerRef.current = new (window as any).YT.Player(div.id, {
         videoId,
-        playerVars: { rel: 0, modestbranding: 1, cc_load_policy: 0 },
+        host: "https://www.youtube-nocookie.com",
+        playerVars: {
+          autoplay: 1,
+          rel: 0,
+          modestbranding: 1,
+          cc_load_policy: 0,
+          origin: typeof window !== "undefined" ? window.location.origin : "",
+        },
         events: {
           onReady: () => {
             const handle: PlayerHandle = {
@@ -92,7 +106,35 @@ function YouTubePlayer({
       if (intervalRef.current) clearInterval(intervalRef.current);
       playerRef.current?.destroy?.();
     };
-  }, [videoId]);
+  }, [activated, videoId]);
+
+  if (!activated) {
+    return (
+      <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-black group cursor-pointer" onClick={() => setActivated(true)}>
+        <img src={thumb} alt="Video thumbnail" className="w-full h-full object-cover" />
+        {/* Play button overlay */}
+        <div className="absolute inset-0 flex items-center justify-center bg-black/20 group-hover:bg-black/30 transition-colors">
+          <div className="w-16 h-16 rounded-full bg-red-600 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+            <svg viewBox="0 0 24 24" fill="white" className="w-8 h-8 ml-1"><path d="M8 5v14l11-7z"/></svg>
+          </div>
+        </div>
+        {/* YouTube branding */}
+        <div className="absolute bottom-3 left-3 flex items-center gap-2 text-white text-xs bg-black/60 rounded-lg px-2 py-1">
+          <svg viewBox="0 0 90 20" fill="white" className="h-3.5"><path d="M27.973 18.076V1.922h3.736v16.154h-3.736zm7.467 0V6.885h3.542v1.56h.077c.695-1.214 1.737-1.83 3.139-1.83.733 0 1.389.154 1.968.461.579.308 1.023.799 1.33 1.476h.039c.386-.638.888-1.12 1.506-1.445a4.103 4.103 0 012.006-.492c1.156 0 2.064.392 2.72 1.176.657.784.986 1.887.986 3.312v7.973h-3.543v-7.127c0-.715-.154-1.261-.461-1.637-.307-.377-.753-.565-1.33-.565-.656 0-1.156.238-1.505.715-.35.477-.527 1.118-.527 1.922v6.692h-3.543v-7.127c0-.715-.154-1.261-.461-1.637-.307-.377-.745-.565-1.314-.565-.656 0-1.164.238-1.521.715-.358.477-.535 1.118-.535 1.922v6.692h-3.543z"/></svg>
+        </div>
+        {/* Fallback link */}
+        <a
+          href={`https://www.youtube.com/watch?v=${videoId}`}
+          target="_blank"
+          rel="noopener"
+          onClick={(e) => e.stopPropagation()}
+          className="absolute bottom-3 right-3 text-white text-xs bg-black/60 hover:bg-black/80 rounded-lg px-2 py-1 transition-colors"
+        >
+          Watch on YouTube ↗
+        </a>
+      </div>
+    );
+  }
 
   return <div ref={containerRef} className="w-full aspect-video rounded-xl overflow-hidden bg-black" />;
 }
@@ -233,6 +275,7 @@ export default function EpisodeDetail({ id }: { id: string }) {
               {youtubeId && (
                 <YouTubePlayer
                   videoId={youtubeId}
+                  thumbnailUrl={episode.source.thumbnailUrl}
                   onReady={(h) => { playerHandleRef.current = h; }}
                   onTimeUpdate={setCurrentTime}
                 />
