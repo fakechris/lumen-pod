@@ -27,7 +27,7 @@ services:
     ports:
       - "${API_PORT:-3210}:3210"
     environment:
-      DATABASE_URL: postgres://lumenpod:${DB_PASSWORD:-lumenpod}@db:5432/lumenpod
+      DATABASE_URL: postgres://lumenpod:${DB_PASSWORD:-lumenpod}@db:5432/lumenpod?sslmode=disable
       PORT: "3210"
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
