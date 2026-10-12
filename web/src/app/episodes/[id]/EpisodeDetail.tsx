@@ -2,6 +2,8 @@
 
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import Link from "next/link";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { getEpisode, formatTimestamp, formatDuration, getExportUrl, sendChatMessage, requestChapterDeepRead, type ChatMsg } from "@/lib/api";
 import type { Episode } from "@/lib/types";
 
@@ -479,7 +481,9 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
               </div>
               {dr?.content && (
                 <div className="px-4 pb-4 border-t border-zinc-100 dark:border-zinc-800 pt-3">
-                  <div className="prose dark:prose-invert max-w-none text-sm"><div className="whitespace-pre-wrap text-zinc-700 dark:text-zinc-300 leading-relaxed">{dr.content}</div></div>
+                  <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-li:my-0.5 prose-blockquote:my-2 prose-table:my-3 prose-pre:my-2 prose-hr:my-4">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{dr.content}</ReactMarkdown>
+                  </div>
                 </div>
               )}
               {dr?.error && <div className="px-4 pb-4"><p className="text-sm text-red-500">{dr.error}</p></div>}
@@ -656,7 +660,13 @@ function ChatTab({ episodeId, episode }: { episodeId: string; episode: Episode }
           </div>
         ) : messages.map((msg) => (
           <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-            <div className={`max-w-[80%] px-4 py-3 rounded-2xl text-sm whitespace-pre-wrap ${msg.role === "user" ? "bg-blue-600 text-white rounded-br-md" : "bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700 rounded-bl-md"}`}>{msg.content}</div>
+            <div className={`max-w-[80%] px-4 py-3 rounded-2xl text-sm ${msg.role === "user" ? "bg-blue-600 text-white rounded-br-md whitespace-pre-wrap" : "bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700 rounded-bl-md"}`}>
+              {msg.role === "assistant" ? (
+                <div className="prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-li:my-0.5 prose-headings:mt-3 prose-headings:mb-1">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                </div>
+              ) : msg.content}
+            </div>
           </div>
         ))}
         {sending && <div className="flex justify-start"><div className="px-4 py-3 rounded-2xl rounded-bl-md bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700"><div className="flex gap-1"><span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" /><span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: "150ms" }} /><span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: "300ms" }} /></div></div></div>}
