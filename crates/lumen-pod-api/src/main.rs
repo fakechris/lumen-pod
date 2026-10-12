@@ -117,9 +117,11 @@ async fn run_server(database_url: &str) {
         .route("/auth/google/callback", get(auth::google_callback))
         .route("/api/me", get(auth::me));
 
-    // Serve audio files statically
+    // Serve audio files with Range support, MIME detection, streaming via ServeDir.
+    // Public: filenames are UUID-based (unguessable). Authenticated access would
+    // require signed URLs or token injection into <audio src>, not worth the complexity.
     let audio_serve = Router::new()
-        .route("/audio/{*path}", get(serve_audio));
+        .nest_service("/audio", tower_http::services::ServeDir::new(&state.audio_dir));
 
     let protected = Router::new()
         .route("/api/episodes", get(list_episodes).post(create_episode))
@@ -130,7 +132,8 @@ async fn run_server(database_url: &str) {
         )
         .route(
             "/api/episodes/{id}/audio",
-            axum::routing::post(upload_audio),
+            axum::routing::post(upload_audio)
+                .layer(axum::extract::DefaultBodyLimit::max(200 * 1024 * 1024)),
         )
         .route(
             "/api/episodes/{id}/chat",
@@ -354,15 +357,27 @@ async fn upload_audio(
         Err(e) => return err_500(e),
     };
 
-    let filename = format!("{}.mp3", id);
+    let ext = detect_audio_ext(&body);
+    let filename = format!("{}.{}", id, ext);
     let filepath = std::path::Path::new(&state.audio_dir).join(&filename);
+
+    // Remove any previous audio for this episode (may have different extension)
+    if let Ok(mut entries) = tokio::fs::read_dir(&state.audio_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(&format!("{}.", id)) && *name_str != filename {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
 
     if let Err(e) = tokio::fs::write(&filepath, &body).await {
         return err_500(format!("failed to write audio: {e}"));
     }
 
     let audio_url = format!("/audio/{}", filename);
-    tracing::info!(%id, bytes = body.len(), path = %filepath.display(), "audio uploaded");
+    tracing::info!(%id, bytes = body.len(), ext, path = %filepath.display(), "audio uploaded");
 
     // Update source.audioPath
     let mut source_val = serde_json::to_value(&ep.source).unwrap_or_default();
@@ -377,34 +392,33 @@ async fn upload_audio(
         Json(serde_json::json!({
             "status": "ok",
             "audioPath": audio_url,
+            "format": ext,
             "sizeBytes": body.len()
         })),
     )
         .into_response()
 }
 
-async fn serve_audio(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-) -> impl IntoResponse {
-    let filepath = std::path::Path::new(&state.audio_dir).join(&path);
-
-    if !filepath.exists() {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
+fn detect_audio_ext(bytes: &[u8]) -> &'static str {
+    if bytes.len() < 12 {
+        return "mp3";
     }
-
-    match tokio::fs::read(&filepath).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, "audio/mpeg"),
-                (header::CACHE_CONTROL, "public, max-age=31536000"),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Err(e) => err_500(e),
+    if bytes.starts_with(b"fLaC") {
+        return "flac";
     }
+    if bytes.starts_with(b"OggS") {
+        return "ogg";
+    }
+    if bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return "wav";
+    }
+    if bytes.starts_with(b"ID3") || (bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0) {
+        return "mp3";
+    }
+    if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" {
+        return "m4a";
+    }
+    "mp3"
 }
 
 // ---- Submit URL ----
