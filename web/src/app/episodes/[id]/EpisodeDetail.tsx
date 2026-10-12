@@ -341,37 +341,73 @@ export default function EpisodeDetail({ id }: { id: string }) {
 
       {/* Single-column layout — player on top, content below */}
       <div className="max-w-5xl mx-auto px-4 py-6 space-y-6">
-        {/* Player section */}
-        {hasPlayer && (
-          <div className="space-y-3">
-            {hasAudio && <AudioPlayer src={episode.source.audioPath!} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
-            {!hasAudio && youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} autoActivate={ytAutoActivate} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
-            {!hasAudio && bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
-            {!hasAudio && tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
-
-            {hasAudio && (youtubeId || bilibiliId || tweetId) && (
-              <details className="text-sm">
-                <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">Show original embed</summary>
-                <div className="mt-2">
-                  {youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} />}
-                  {bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
-                  {tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
+        {/* When on Chapters/Transcript with audio: player + tab bar sticky together */}
+        {(() => {
+          const stickyPlayer = hasAudio && (activeTab === "Chapters" || activeTab === "Transcript");
+          return (
+            <>
+              {/* Sticky player + tab combo for Chapters/Transcript */}
+              {stickyPlayer && (
+                <div className="sticky top-0 z-20 bg-zinc-50 dark:bg-zinc-950 -mx-4 px-4 pt-2 pb-1 space-y-2 shadow-sm">
+                  <AudioPlayer src={episode.source.audioPath!} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />
+                  <div className="flex gap-1 overflow-x-auto bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-1">
+                    {TABS.map((tab) => (
+                      <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 text-sm font-medium rounded-lg whitespace-nowrap transition-colors ${activeTab === tab ? "bg-blue-600 text-white shadow-sm" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}>
+                        {tab}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              </details>
-            )}
-          </div>
-        )}
+              )}
 
-        {/* Tab Bar — sticky */}
-        <div className="sticky top-0 z-10 bg-zinc-50 dark:bg-zinc-950 pb-1 -mx-4 px-4">
-          <div className="flex gap-1 overflow-x-auto bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-1">
-            {TABS.map((tab) => (
-              <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 text-sm font-medium rounded-lg whitespace-nowrap transition-colors ${activeTab === tab ? "bg-blue-600 text-white shadow-sm" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}>
-                {tab}
-              </button>
-            ))}
-          </div>
-        </div>
+              {/* Normal player section (non-sticky, or for non-audio tabs) */}
+              {!stickyPlayer && hasPlayer && (
+                <div className="space-y-3">
+                  {hasAudio && <AudioPlayer src={episode.source.audioPath!} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
+                  {!hasAudio && youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} autoActivate={ytAutoActivate} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
+                  {!hasAudio && bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
+                  {!hasAudio && tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
+
+                  {hasAudio && (youtubeId || bilibiliId || tweetId) && (
+                    <details className="text-sm">
+                      <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">Show original embed</summary>
+                      <div className="mt-2">
+                        {youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} />}
+                        {bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
+                        {tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
+                      </div>
+                    </details>
+                  )}
+                </div>
+              )}
+
+              {/* Tab bar — standalone sticky when player is NOT sticky */}
+              {!stickyPlayer && (
+                <div className="sticky top-0 z-10 bg-zinc-50 dark:bg-zinc-950 pb-1 -mx-4 px-4">
+                  <div className="flex gap-1 overflow-x-auto bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-1">
+                    {TABS.map((tab) => (
+                      <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 text-sm font-medium rounded-lg whitespace-nowrap transition-colors ${activeTab === tab ? "bg-blue-600 text-white shadow-sm" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}>
+                        {tab}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Embed shown below sticky player when on audio+Chapters/Transcript */}
+              {stickyPlayer && (youtubeId || bilibiliId || tweetId) && (
+                <details className="text-sm">
+                  <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">Show original embed</summary>
+                  <div className="mt-2">
+                    {youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} />}
+                    {bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
+                    {tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
+                  </div>
+                </details>
+              )}
+            </>
+          );
+        })()}
 
         {/* Tab Content */}
         <div>
@@ -755,10 +791,30 @@ function TranscriptTab({ episode, translationLangs, currentTime, seekTo, canSeek
             <div key={para.id} ref={isActive ? activeRef : undefined} onClick={() => canSeek && seekTo(startTime)} className={`px-3 py-2 rounded-lg transition-all text-sm leading-relaxed ${canSeek ? "cursor-pointer" : ""} ${isActive ? "bg-blue-50 dark:bg-blue-950/60 border-l-[3px] border-blue-500 text-zinc-900 dark:text-zinc-100" : "hover:bg-zinc-100 dark:hover:bg-zinc-800/50 text-zinc-600 dark:text-zinc-400"}`}>
               <span className="font-mono text-xs text-blue-500 mr-2">{formatTimestamp(startTime)}</span>
               {para.speaker && <span className={`text-xs font-semibold mr-1.5 ${speakerColor(para.speaker)}`}>[{para.speaker}]</span>}
-              {para.sentences.map((s, si) => <span key={s.id || si} className="sentence-span">{si > 0 ? " " : ""}{highlight(s.text)}</span>)}
+              {para.sentences.map((s, si) => {
+                const sStart = s.words[0]?.start ?? 0;
+                const sEnd = s.words.at(-1)?.end ?? 0;
+                const isSentenceActive = isActive && currentTime >= sStart && currentTime <= sEnd;
+                return (
+                  <span
+                    key={s.id || si}
+                    onClick={(e) => { if (canSeek) { e.stopPropagation(); seekTo(sStart); } }}
+                    className={`sentence-span transition-colors duration-200 ${isSentenceActive ? "bg-blue-200/80 dark:bg-blue-700/50 text-blue-900 dark:text-blue-100 font-medium rounded px-0.5 py-px" : ""}`}
+                  >
+                    {si > 0 ? " " : ""}{highlight(s.text)}
+                  </span>
+                );
+              })}
               {langTranslations && (
                 <div className="mt-1 pl-12 text-xs text-zinc-400 dark:text-zinc-500 italic">
-                  {para.sentences.map((s) => { const tr = langTranslations[s.id]; return tr ? <span key={s.id}>{tr.text} </span> : null; })}
+                  {para.sentences.map((s) => {
+                    const tr = langTranslations[s.id];
+                    if (!tr) return null;
+                    const sStart = s.words[0]?.start ?? 0;
+                    const sEnd = s.words.at(-1)?.end ?? 0;
+                    const isSentenceActive = isActive && currentTime >= sStart && currentTime <= sEnd;
+                    return <span key={s.id} className={isSentenceActive ? "text-blue-400 dark:text-blue-300 font-medium" : ""}>{tr.text} </span>;
+                  })}
                 </div>
               )}
             </div>
