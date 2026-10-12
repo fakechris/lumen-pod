@@ -216,6 +216,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 pub struct AppState {
     pub store: Arc<Store>,
     pub auth: AuthConfig,
+    pub llm: crate::LlmConfig,
 }
 
 pub async fn google_login(State(state): State<AppState>) -> impl IntoResponse {

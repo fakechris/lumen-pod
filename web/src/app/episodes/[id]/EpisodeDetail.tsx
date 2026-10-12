@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import Link from "next/link";
-import { getEpisode, formatTimestamp, formatDuration, getExportUrl } from "@/lib/api";
+import { getEpisode, formatTimestamp, formatDuration, getExportUrl, sendChatMessage, requestChapterDeepRead, type ChatMsg } from "@/lib/api";
 import type { Episode } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -27,13 +27,158 @@ const platformIcons: Record<string, string> = {
 };
 
 // ---------------------------------------------------------------------------
-// YouTube Player — thumbnail-first, click to activate (avoids bot detection)
+// Audio Player — self-hosted HTML5 audio with custom controls
 // ---------------------------------------------------------------------------
 
 interface PlayerHandle {
   seekTo: (t: number) => void;
   getCurrentTime: () => number;
 }
+
+function AudioPlayer({
+  src,
+  onReady,
+  onTimeUpdate,
+}: {
+  src: string;
+  onReady?: (h: PlayerHandle) => void;
+  onTimeUpdate?: (t: number) => void;
+}) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [speed, setSpeed] = useState(1);
+  const [volume, setVolume] = useState(1);
+  const progressRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    const handle: PlayerHandle = {
+      seekTo: (t) => { audio.currentTime = t; },
+      getCurrentTime: () => audio.currentTime,
+    };
+
+    const onLoaded = () => {
+      setDuration(audio.duration);
+      onReady?.(handle);
+    };
+    const onTime = () => {
+      setCurrentTime(audio.currentTime);
+      onTimeUpdate?.(audio.currentTime);
+    };
+    const onPlay = () => setPlaying(true);
+    const onPause = () => setPlaying(false);
+    const onEnded = () => setPlaying(false);
+
+    audio.addEventListener("loadedmetadata", onLoaded);
+    audio.addEventListener("timeupdate", onTime);
+    audio.addEventListener("play", onPlay);
+    audio.addEventListener("pause", onPause);
+    audio.addEventListener("ended", onEnded);
+
+    return () => {
+      audio.removeEventListener("loadedmetadata", onLoaded);
+      audio.removeEventListener("timeupdate", onTime);
+      audio.removeEventListener("play", onPlay);
+      audio.removeEventListener("pause", onPause);
+      audio.removeEventListener("ended", onEnded);
+    };
+  }, [src]);
+
+  const togglePlay = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    playing ? audio.pause() : audio.play();
+  };
+
+  const handleProgressClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    const rect = progressRef.current?.getBoundingClientRect();
+    if (!rect || !audioRef.current) return;
+    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    audioRef.current.currentTime = ratio * duration;
+  };
+
+  const changeSpeed = () => {
+    const speeds = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+    const next = speeds[(speeds.indexOf(speed) + 1) % speeds.length];
+    setSpeed(next);
+    if (audioRef.current) audioRef.current.playbackRate = next;
+  };
+
+  const skip = (delta: number) => {
+    if (audioRef.current) audioRef.current.currentTime += delta;
+  };
+
+  return (
+    <div className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-4">
+      <audio ref={audioRef} src={src} preload="metadata" />
+      <div className="flex items-center gap-3">
+        {/* Skip back */}
+        <button onClick={() => skip(-15)} className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors" title="Back 15s">
+          <svg viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5"><path d="M11.99 5V1l-5 5 5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6h-2c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/><text x="12" y="16" textAnchor="middle" fontSize="7" fill="currentColor">15</text></svg>
+        </button>
+
+        {/* Play/Pause */}
+        <button onClick={togglePlay} className="w-10 h-10 rounded-full bg-blue-600 hover:bg-blue-700 text-white flex items-center justify-center transition-colors shadow-sm">
+          {playing ? (
+            <svg viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+          ) : (
+            <svg viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 ml-0.5"><path d="M8 5v14l11-7z"/></svg>
+          )}
+        </button>
+
+        {/* Skip forward */}
+        <button onClick={() => skip(30)} className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors" title="Forward 30s">
+          <svg viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5"><path d="M12.01 5V1l5 5-5 5V7c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6h2c0 4.42-3.58 8-8 8s-8-3.58-8-8 3.58-8 8-8z"/><text x="12" y="16" textAnchor="middle" fontSize="7" fill="currentColor">30</text></svg>
+        </button>
+
+        {/* Time */}
+        <span className="text-xs font-mono text-zinc-500 shrink-0 w-24 text-center">
+          {formatTimestamp(currentTime)} / {formatTimestamp(duration)}
+        </span>
+
+        {/* Progress */}
+        <div ref={progressRef} onClick={handleProgressClick} className="flex-1 h-2 bg-zinc-200 dark:bg-zinc-700 rounded-full cursor-pointer group relative">
+          <div className="h-full bg-blue-600 rounded-full transition-all relative" style={{ width: duration ? `${(currentTime / duration) * 100}%` : "0%" }}>
+            <div className="absolute right-0 top-1/2 -translate-y-1/2 w-3.5 h-3.5 bg-blue-600 rounded-full shadow-md opacity-0 group-hover:opacity-100 transition-opacity" />
+          </div>
+        </div>
+
+        {/* Speed */}
+        <button onClick={changeSpeed} className="px-2 py-1 text-xs font-mono rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors" title="Playback speed">
+          {speed}x
+        </button>
+
+        {/* Volume */}
+        <div className="flex items-center gap-1">
+          <button onClick={() => { const v = volume > 0 ? 0 : 1; setVolume(v); if (audioRef.current) audioRef.current.volume = v; }} className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300">
+            {volume === 0 ? (
+              <svg viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.796 8.796 0 0021 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.99 8.99 0 003.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
+            ) : (
+              <svg viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+            )}
+          </button>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.05}
+            value={volume}
+            onChange={(e) => { const v = parseFloat(e.target.value); setVolume(v); if (audioRef.current) audioRef.current.volume = v; }}
+            className="w-16 h-1 accent-blue-600"
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// YouTube Player — thumbnail-first, click to activate (avoids bot detection)
+// ---------------------------------------------------------------------------
 
 function YouTubePlayer({
   videoId,
@@ -53,7 +198,6 @@ function YouTubePlayer({
 
   const thumb = thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
-  // Load YT IFrame API only after user clicks play
   useEffect(() => {
     if (!activated) return;
     let cancelled = false;
@@ -69,10 +213,7 @@ function YouTubePlayer({
         videoId,
         host: "https://www.youtube-nocookie.com",
         playerVars: {
-          autoplay: 1,
-          rel: 0,
-          modestbranding: 1,
-          cc_load_policy: 0,
+          autoplay: 1, rel: 0, modestbranding: 1, cc_load_policy: 0,
           origin: typeof window !== "undefined" ? window.location.origin : "",
         },
         events: {
@@ -112,17 +253,11 @@ function YouTubePlayer({
     return (
       <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-black group cursor-pointer" onClick={() => setActivated(true)}>
         <img src={thumb} alt="Video thumbnail" className="w-full h-full object-cover" />
-        {/* Play button overlay */}
         <div className="absolute inset-0 flex items-center justify-center bg-black/20 group-hover:bg-black/30 transition-colors">
           <div className="w-16 h-16 rounded-full bg-red-600 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
             <svg viewBox="0 0 24 24" fill="white" className="w-8 h-8 ml-1"><path d="M8 5v14l11-7z"/></svg>
           </div>
         </div>
-        {/* YouTube branding */}
-        <div className="absolute bottom-3 left-3 flex items-center gap-2 text-white text-xs bg-black/60 rounded-lg px-2 py-1">
-          <svg viewBox="0 0 90 20" fill="white" className="h-3.5"><path d="M27.973 18.076V1.922h3.736v16.154h-3.736zm7.467 0V6.885h3.542v1.56h.077c.695-1.214 1.737-1.83 3.139-1.83.733 0 1.389.154 1.968.461.579.308 1.023.799 1.33 1.476h.039c.386-.638.888-1.12 1.506-1.445a4.103 4.103 0 012.006-.492c1.156 0 2.064.392 2.72 1.176.657.784.986 1.887.986 3.312v7.973h-3.543v-7.127c0-.715-.154-1.261-.461-1.637-.307-.377-.753-.565-1.33-.565-.656 0-1.156.238-1.505.715-.35.477-.527 1.118-.527 1.922v6.692h-3.543v-7.127c0-.715-.154-1.261-.461-1.637-.307-.377-.745-.565-1.314-.565-.656 0-1.164.238-1.521.715-.358.477-.535 1.118-.535 1.922v6.692h-3.543z"/></svg>
-        </div>
-        {/* Fallback link */}
         <a
           href={`https://www.youtube.com/watch?v=${videoId}`}
           target="_blank"
@@ -183,7 +318,7 @@ function MarkmapView({ markdown }: { markdown: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// Tabs
+// Speaker color palette
 // ---------------------------------------------------------------------------
 
 const SPEAKER_COLORS = [
@@ -201,7 +336,11 @@ function speakerColor(name: string): string {
   return SPEAKER_COLORS[Math.abs(hash) % SPEAKER_COLORS.length];
 }
 
-const TABS = ["Summary", "Chapters", "Mindmap", "Transcript", "Keywords", "Highlights", "Q&A"] as const;
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+
+const TABS = ["Summary", "Chapters", "Mindmap", "Transcript", "Keywords", "Highlights", "Q&A", "Chat"] as const;
 type TabName = (typeof TABS)[number];
 
 // ---------------------------------------------------------------------------
@@ -231,7 +370,15 @@ export default function EpisodeDetail({ id }: { id: string }) {
 
   const youtubeId = useMemo(() => episode ? extractYouTubeId(episode.source.url) : null, [episode]);
   const bilibiliId = useMemo(() => episode ? extractBilibiliId(episode.source.url) : null, [episode]);
+  const hasAudio = !!episode?.source.audioPath;
   const hasVideo = !!(youtubeId || bilibiliId);
+  const hasPlayer = hasAudio || hasVideo;
+
+  // Available translation languages
+  const translationLangs = useMemo(() => {
+    if (!episode?.transcript?.translations) return [];
+    return Object.keys(episode.transcript.translations);
+  }, [episode]);
 
   if (loading) return <div className="min-h-screen flex items-center justify-center text-zinc-400">Loading...</div>;
   if (error) return <div className="min-h-screen flex items-center justify-center text-red-500">{error}</div>;
@@ -250,29 +397,40 @@ export default function EpisodeDetail({ id }: { id: string }) {
             <span>{icon} {episode.source.platform}</span>
             {episode.source.author && <><span>·</span><span>{episode.source.author}</span></>}
             <span>·</span><span>{formatDuration(episode.source.duration)}</span>
+            {episode.source.language && <><span>·</span><span>🌐 {episode.source.language.toUpperCase()}</span></>}
             {episode.processing.llmModel && <><span>·</span><span>🤖 {episode.processing.llmModel}</span></>}
             {episode.tags.length > 0 && episode.tags.map((t) => (
               <span key={t} className="px-2 py-0.5 text-xs rounded-full bg-zinc-100 dark:bg-zinc-800">{t}</span>
             ))}
-            <a href={episode.source.url} target="_blank" rel="noopener" className="text-blue-500 hover:underline ml-1">
-              Source ↗
-            </a>
+            <a href={episode.source.url} target="_blank" rel="noopener" className="text-blue-500 hover:underline ml-1">Source ↗</a>
             <span className="text-zinc-300 dark:text-zinc-600">|</span>
             <a href={getExportUrl(id, "markdown")} className="text-blue-500 hover:underline text-xs">📝 MD</a>
             <a href={getExportUrl(id, "srt")} className="text-blue-500 hover:underline text-xs">📄 SRT</a>
             <a href={getExportUrl(id, "json")} className="text-blue-500 hover:underline text-xs">📦 JSON</a>
+            <a href={getExportUrl(id, "notion")} className="text-blue-500 hover:underline text-xs">📓 Notion</a>
+            <a href={getExportUrl(id, "obsidian")} className="text-blue-500 hover:underline text-xs">🗄️ Obsidian</a>
           </div>
         </div>
       </header>
 
       {/* Two-column layout */}
       <div className="max-w-7xl mx-auto px-4 py-6">
-        <div className={hasVideo ? "flex flex-col lg:flex-row gap-6" : ""}>
+        <div className={hasPlayer ? "flex flex-col lg:flex-row gap-6" : ""}>
 
-          {/* Left Column: Video + Chapters */}
-          {hasVideo && (
+          {/* Left Column: Player + Chapters */}
+          {hasPlayer && (
             <div className="lg:w-[480px] xl:w-[560px] shrink-0 space-y-4 lg:sticky lg:top-4 lg:self-start">
-              {youtubeId && (
+              {/* Self-hosted audio player (priority) */}
+              {hasAudio && (
+                <AudioPlayer
+                  src={episode.source.audioPath!}
+                  onReady={(h) => { playerHandleRef.current = h; }}
+                  onTimeUpdate={setCurrentTime}
+                />
+              )}
+
+              {/* Video embed (fallback if no audio) */}
+              {!hasAudio && youtubeId && (
                 <YouTubePlayer
                   videoId={youtubeId}
                   thumbnailUrl={episode.source.thumbnailUrl}
@@ -280,9 +438,22 @@ export default function EpisodeDetail({ id }: { id: string }) {
                   onTimeUpdate={setCurrentTime}
                 />
               )}
-              {bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
+              {!hasAudio && bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
 
-              {/* Mini chapters under video */}
+              {/* If we have audio AND video, show small video preview */}
+              {hasAudio && youtubeId && (
+                <details className="text-sm">
+                  <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">Show Video</summary>
+                  <div className="mt-2">
+                    <YouTubePlayer
+                      videoId={youtubeId}
+                      thumbnailUrl={episode.source.thumbnailUrl}
+                    />
+                  </div>
+                </details>
+              )}
+
+              {/* Mini chapters under player */}
               {episode.chapters.length > 0 && (
                 <div className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-3 max-h-64 overflow-y-auto">
                   <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Chapters</h3>
@@ -332,12 +503,13 @@ export default function EpisodeDetail({ id }: { id: string }) {
             {/* Tab Content */}
             <div className="mt-4">
               {activeTab === "Summary" && <SummaryTab episode={episode} />}
-              {activeTab === "Chapters" && <ChaptersTab episode={episode} currentTime={currentTime} seekTo={seekTo} />}
+              {activeTab === "Chapters" && <ChaptersTab episode={episode} episodeId={id} currentTime={currentTime} seekTo={seekTo} />}
               {activeTab === "Mindmap" && <MindmapTab episode={episode} />}
-              {activeTab === "Transcript" && <TranscriptTab episode={episode} currentTime={currentTime} seekTo={seekTo} />}
+              {activeTab === "Transcript" && <TranscriptTab episode={episode} translationLangs={translationLangs} currentTime={currentTime} seekTo={seekTo} />}
               {activeTab === "Keywords" && <KeywordsTab episode={episode} />}
               {activeTab === "Highlights" && <HighlightsTab episode={episode} seekTo={seekTo} />}
               {activeTab === "Q&A" && <QATab episode={episode} />}
+              {activeTab === "Chat" && <ChatTab episodeId={id} episode={episode} />}
             </div>
           </div>
         </div>
@@ -355,17 +527,14 @@ function SummaryTab({ episode }: { episode: Episode }) {
   const s = episode.summary;
   return (
     <div className="space-y-6">
-      {/* One-liner hero */}
       <div className="p-5 rounded-xl bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-950/50 dark:to-indigo-950/50 border border-blue-100 dark:border-blue-900">
         <p className="text-lg font-semibold text-blue-900 dark:text-blue-100">{s.oneLiner}</p>
       </div>
 
-      {/* Abstract */}
       <div className="prose dark:prose-invert max-w-none">
         <p className="text-zinc-700 dark:text-zinc-300 leading-relaxed whitespace-pre-wrap">{s.abstract}</p>
       </div>
 
-      {/* Key Takeaways */}
       {s.keyTakeaways.length > 0 && (
         <section className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-5">
           <h3 className="font-semibold text-zinc-900 dark:text-zinc-100 mb-3 flex items-center gap-2">
@@ -383,7 +552,6 @@ function SummaryTab({ episode }: { episode: Episode }) {
         </section>
       )}
 
-      {/* Thinking Questions */}
       {s.thinkingQuestions.length > 0 && (
         <section className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-5">
           <h3 className="font-semibold text-zinc-900 dark:text-zinc-100 mb-3 flex items-center gap-2">
@@ -392,15 +560,12 @@ function SummaryTab({ episode }: { episode: Episode }) {
           </h3>
           <ul className="space-y-2">
             {s.thinkingQuestions.map((q, i) => (
-              <li key={i} className="p-3 rounded-lg bg-purple-50 dark:bg-purple-950/30 text-zinc-700 dark:text-zinc-300 text-sm">
-                {q}
-              </li>
+              <li key={i} className="p-3 rounded-lg bg-purple-50 dark:bg-purple-950/30 text-zinc-700 dark:text-zinc-300 text-sm">{q}</li>
             ))}
           </ul>
         </section>
       )}
 
-      {/* Glossary */}
       {s.glossary.length > 0 && (
         <section className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-5">
           <h3 className="font-semibold text-zinc-900 dark:text-zinc-100 mb-3 flex items-center gap-2">
@@ -421,17 +586,44 @@ function SummaryTab({ episode }: { episode: Episode }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Chapters with Deep Read
+// ---------------------------------------------------------------------------
+
 function ChaptersTab({
   episode,
+  episodeId,
   currentTime,
   seekTo,
 }: {
   episode: Episode;
+  episodeId: string;
   currentTime: number;
   seekTo: (t: number) => void;
 }) {
+  const [deepReads, setDeepReads] = useState<Record<number, { loading: boolean; content?: string; error?: string }>>({});
+
   if (episode.chapters.length === 0) return <EmptyState text="No chapters available" />;
   const totalDuration = episode.source.duration || episode.chapters.at(-1)?.endTime || 1;
+
+  const handleDeepRead = async (chapterIdx: number) => {
+    if (deepReads[chapterIdx]?.content) {
+      setDeepReads((prev) => {
+        const copy = { ...prev };
+        delete copy[chapterIdx];
+        return copy;
+      });
+      return;
+    }
+
+    setDeepReads((prev) => ({ ...prev, [chapterIdx]: { loading: true } }));
+    try {
+      const result = await requestChapterDeepRead(episodeId, chapterIdx);
+      setDeepReads((prev) => ({ ...prev, [chapterIdx]: { loading: false, content: result.content } }));
+    } catch (e: any) {
+      setDeepReads((prev) => ({ ...prev, [chapterIdx]: { loading: false, error: e.message } }));
+    }
+  };
 
   return (
     <div className="space-y-4">
@@ -453,42 +645,65 @@ function ChaptersTab({
               />
             );
           })}
-          {/* Playhead */}
-          <div
-            className="absolute top-0 w-0.5 h-full bg-red-500 z-20 pointer-events-none"
-            style={{ left: `${(currentTime / totalDuration) * 100}%` }}
-          />
+          <div className="absolute top-0 w-0.5 h-full bg-red-500 z-20 pointer-events-none" style={{ left: `${(currentTime / totalDuration) * 100}%` }} />
         </div>
       </div>
 
-      {/* Chapter cards */}
+      {/* Chapter cards with deep read */}
       <div className="space-y-3">
         {episode.chapters.map((ch, i) => {
           const isActive = currentTime >= ch.startTime && currentTime < ch.endTime;
+          const dr = deepReads[i];
           return (
-            <button
-              key={i}
-              onClick={() => seekTo(ch.startTime)}
-              className={`w-full text-left p-4 rounded-xl border transition-all ${
-                isActive
-                  ? "bg-blue-50 dark:bg-blue-950/50 border-blue-300 dark:border-blue-800 shadow-sm"
-                  : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 hover:border-blue-300 dark:hover:border-blue-700"
-              }`}
-            >
-              <div className="flex items-start gap-3">
-                <div className="shrink-0 w-16 text-center">
-                  <span className="font-mono text-sm text-blue-600 dark:text-blue-400">{formatTimestamp(ch.startTime)}</span>
-                  <div className="text-xs text-zinc-400 mt-0.5">{formatDuration(ch.endTime - ch.startTime)}</div>
+            <div key={i} className={`rounded-xl border transition-all ${
+              isActive
+                ? "bg-blue-50 dark:bg-blue-950/50 border-blue-300 dark:border-blue-800 shadow-sm"
+                : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 hover:border-blue-300 dark:hover:border-blue-700"
+            }`}>
+              <button
+                onClick={() => seekTo(ch.startTime)}
+                className="w-full text-left p-4"
+              >
+                <div className="flex items-start gap-3">
+                  <div className="shrink-0 w-16 text-center">
+                    <span className="font-mono text-sm text-blue-600 dark:text-blue-400">{formatTimestamp(ch.startTime)}</span>
+                    <div className="text-xs text-zinc-400 mt-0.5">{formatDuration(ch.endTime - ch.startTime)}</div>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <h3 className={`font-semibold ${isActive ? "text-blue-700 dark:text-blue-300" : "text-zinc-900 dark:text-zinc-100"}`}>
+                      {ch.title}
+                    </h3>
+                    <p className="text-sm text-zinc-500 mt-1 line-clamp-2">{ch.summary}</p>
+                  </div>
+                  {ch.hasAds && <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">AD</span>}
                 </div>
-                <div className="flex-1 min-w-0">
-                  <h3 className={`font-semibold ${isActive ? "text-blue-700 dark:text-blue-300" : "text-zinc-900 dark:text-zinc-100"}`}>
-                    {ch.title}
-                  </h3>
-                  <p className="text-sm text-zinc-500 mt-1 line-clamp-2">{ch.summary}</p>
-                </div>
-                {ch.hasAds && <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">AD</span>}
+              </button>
+
+              {/* Deep Read button */}
+              <div className="px-4 pb-3 flex items-center gap-2">
+                <button
+                  onClick={(e) => { e.stopPropagation(); handleDeepRead(i); }}
+                  disabled={dr?.loading}
+                  className="px-3 py-1.5 text-xs font-medium rounded-lg bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors disabled:opacity-50"
+                >
+                  {dr?.loading ? "⏳ Generating..." : dr?.content ? "📖 Hide Deep Read" : "📖 Deep Read"}
+                </button>
               </div>
-            </button>
+
+              {/* Deep read content */}
+              {dr?.content && (
+                <div className="px-4 pb-4 border-t border-zinc-100 dark:border-zinc-800 pt-3">
+                  <div className="prose dark:prose-invert max-w-none text-sm">
+                    <div className="whitespace-pre-wrap text-zinc-700 dark:text-zinc-300 leading-relaxed">{dr.content}</div>
+                  </div>
+                </div>
+              )}
+              {dr?.error && (
+                <div className="px-4 pb-4">
+                  <p className="text-sm text-red-500">{dr.error}</p>
+                </div>
+              )}
+            </div>
           );
         })}
       </div>
@@ -511,18 +726,26 @@ function MindmapTab({ episode }: { episode: Episode }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Transcript with Search + Language Toggle
+// ---------------------------------------------------------------------------
+
 function TranscriptTab({
   episode,
+  translationLangs,
   currentTime,
   seekTo,
 }: {
   episode: Episode;
+  translationLangs: string[];
   currentTime: number;
   seekTo: (t: number) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedLang, setSelectedLang] = useState<string | "">("");
 
   useEffect(() => {
     if (autoScroll && activeRef.current) {
@@ -532,17 +755,83 @@ function TranscriptTab({
 
   if (!episode.transcript) return <EmptyState text="No transcript available" />;
 
+  const translations = episode.transcript.translations;
+  const langTranslations = selectedLang ? translations[selectedLang] : undefined;
+
+  const filteredParagraphs = searchQuery.trim()
+    ? episode.transcript.paragraphs.filter((para) =>
+        para.sentences.some((s) =>
+          s.text.toLowerCase().includes(searchQuery.toLowerCase())
+        )
+      )
+    : episode.transcript.paragraphs;
+
+  const highlightText = (text: string) => {
+    if (!searchQuery.trim()) return text;
+    const regex = new RegExp(`(${searchQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi");
+    const parts = text.split(regex);
+    return parts.map((part, i) =>
+      regex.test(part) ? (
+        <mark key={i} className="bg-yellow-200 dark:bg-yellow-800 rounded px-0.5">{part}</mark>
+      ) : (
+        part
+      )
+    );
+  };
+
+  const langNames: Record<string, string> = {
+    zh: "中文", en: "English", ja: "日本語", ko: "한국어", es: "Español",
+    fr: "Français", de: "Deutsch", pt: "Português", ru: "Русский", ar: "العربية",
+  };
+
   return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-sm text-zinc-400">{episode.transcript.paragraphs.length} paragraphs</span>
+    <div className="space-y-3">
+      {/* Controls */}
+      <div className="flex items-center gap-3 flex-wrap">
+        {/* Search */}
+        <div className="relative flex-1 min-w-[200px]">
+          <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><circle cx={11} cy={11} r={8}/><path d="M21 21l-4.35-4.35"/></svg>
+          <input
+            type="text"
+            placeholder="Search transcript..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full pl-9 pr-3 py-2 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-blue-500 outline-none placeholder:text-zinc-400"
+          />
+          {searchQuery && (
+            <button onClick={() => setSearchQuery("")} className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600">
+              <svg viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+            </button>
+          )}
+        </div>
+
+        {/* Language toggle */}
+        {translationLangs.length > 0 && (
+          <select
+            value={selectedLang}
+            onChange={(e) => setSelectedLang(e.target.value)}
+            className="px-3 py-2 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-blue-500 outline-none"
+          >
+            <option value="">Original</option>
+            {translationLangs.map((lang) => (
+              <option key={lang} value={lang}>{langNames[lang] || lang}</option>
+            ))}
+          </select>
+        )}
+
+        {/* Stats + auto-scroll */}
+        <span className="text-sm text-zinc-400">
+          {searchQuery ? `${filteredParagraphs.length} / ` : ""}{episode.transcript.paragraphs.length} paragraphs
+        </span>
         <label className="flex items-center gap-2 text-sm text-zinc-500 cursor-pointer">
           <input type="checkbox" checked={autoScroll} onChange={(e) => setAutoScroll(e.target.checked)} className="rounded" />
           Auto-scroll
         </label>
       </div>
+
+      {/* Transcript content */}
       <div ref={containerRef} className="space-y-1">
-        {episode.transcript.paragraphs.map((para) => {
+        {filteredParagraphs.map((para) => {
           const startTime = para.sentences[0]?.words[0]?.start ?? 0;
           const endTime = para.sentences.at(-1)?.words.at(-1)?.end ?? 0;
           const isActive = currentTime >= startTime && currentTime <= endTime;
@@ -560,8 +849,17 @@ function TranscriptTab({
               <span className="font-mono text-xs text-blue-500 mr-2">{formatTimestamp(startTime)}</span>
               {para.speaker && <span className={`text-xs font-semibold mr-1.5 ${speakerColor(para.speaker)}`}>[{para.speaker}]</span>}
               {para.sentences.map((s, si) => (
-                <span key={s.id || si} className="sentence-span">{si > 0 ? " " : ""}{s.text}</span>
+                <span key={s.id || si} className="sentence-span">{si > 0 ? " " : ""}{highlightText(s.text)}</span>
               ))}
+              {/* Translation */}
+              {langTranslations && (
+                <div className="mt-1 pl-12 text-xs text-zinc-400 dark:text-zinc-500 italic">
+                  {para.sentences.map((s) => {
+                    const trans = langTranslations[s.id];
+                    return trans ? <span key={s.id}>{trans.text} </span> : null;
+                  })}
+                </div>
+              )}
             </div>
           );
         })}
@@ -600,7 +898,7 @@ function HighlightsTab({ episode, seekTo }: { episode: Episode; seekTo: (t: numb
             </span>
           </div>
           <div>
-            <p className="text-zinc-800 dark:text-zinc-200 font-medium">🌟 {h.content}</p>
+            <p className="text-zinc-800 dark:text-zinc-200 font-medium">{h.content}</p>
             {h.note && <p className="mt-1 text-sm text-zinc-500 italic">{h.note}</p>}
           </div>
         </div>
@@ -638,6 +936,140 @@ function QATab({ episode }: { episode: Episode }) {
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// AI Chat Tab
+// ---------------------------------------------------------------------------
+
+function ChatTab({ episodeId, episode }: { episodeId: string; episode: Episode }) {
+  const [messages, setMessages] = useState<ChatMsg[]>([]);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [loadingHistory, setLoadingHistory] = useState(true);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3210"}/api/episodes/${episodeId}/chat`, {
+      credentials: "include",
+    })
+      .then((r) => r.json())
+      .then((data) => setMessages(data.messages || []))
+      .catch(() => {})
+      .finally(() => setLoadingHistory(false));
+  }, [episodeId]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleSend = async () => {
+    const text = input.trim();
+    if (!text || sending) return;
+
+    const userMsg: ChatMsg = { id: `temp-${Date.now()}`, episodeId, role: "user", content: text, createdAt: new Date().toISOString() };
+    setMessages((prev) => [...prev, userMsg]);
+    setInput("");
+    setSending(true);
+
+    try {
+      const response = await sendChatMessage(episodeId, text);
+      setMessages((prev) => {
+        const updated = prev.filter((m) => m.id !== userMsg.id);
+        return [...updated, response.userMessage, response.assistantMessage];
+      });
+    } catch (e: any) {
+      setMessages((prev) => [
+        ...prev,
+        { id: `err-${Date.now()}`, episodeId, role: "assistant", content: `Error: ${e.message}`, createdAt: new Date().toISOString() },
+      ]);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const suggestedQuestions = [
+    `What is the main argument in "${episode.source.title}"?`,
+    "Summarize the key points in 3 bullets",
+    "What are the controversial claims made?",
+    "What questions remain unanswered?",
+  ];
+
+  return (
+    <div className="flex flex-col h-[600px]">
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto space-y-3 mb-4">
+        {loadingHistory ? (
+          <div className="text-center py-8 text-zinc-400">Loading chat history...</div>
+        ) : messages.length === 0 ? (
+          <div className="space-y-4">
+            <div className="text-center py-8">
+              <p className="text-zinc-400 mb-4">Ask AI about this episode</p>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {suggestedQuestions.map((q, i) => (
+                <button
+                  key={i}
+                  onClick={() => setInput(q)}
+                  className="text-left p-3 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 hover:border-blue-400 dark:hover:border-blue-600 text-zinc-600 dark:text-zinc-400 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          messages.map((msg) => (
+            <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+              <div className={`max-w-[80%] px-4 py-3 rounded-2xl text-sm whitespace-pre-wrap ${
+                msg.role === "user"
+                  ? "bg-blue-600 text-white rounded-br-md"
+                  : "bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700 rounded-bl-md"
+              }`}>
+                {msg.content}
+              </div>
+            </div>
+          ))
+        )}
+        {sending && (
+          <div className="flex justify-start">
+            <div className="px-4 py-3 rounded-2xl rounded-bl-md bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700">
+              <div className="flex gap-1">
+                <span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: "0ms" }} />
+                <span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: "150ms" }} />
+                <span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: "300ms" }} />
+              </div>
+            </div>
+          </div>
+        )}
+        <div ref={chatEndRef} />
+      </div>
+
+      {/* Input */}
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}
+          placeholder="Ask about this episode..."
+          disabled={sending}
+          className="flex-1 px-4 py-3 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 text-sm focus:ring-2 focus:ring-blue-500 outline-none disabled:opacity-50 placeholder:text-zinc-400"
+        />
+        <button
+          onClick={handleSend}
+          disabled={!input.trim() || sending}
+          className="px-4 py-3 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-zinc-300 dark:disabled:bg-zinc-700 text-white text-sm font-medium transition-colors"
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Empty state
+// ---------------------------------------------------------------------------
 
 function EmptyState({ text }: { text: string }) {
   return <div className="text-center py-16 text-zinc-400"><p>{text}</p></div>;

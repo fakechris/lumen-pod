@@ -68,12 +68,10 @@ async fn run_server(database_url: &str) {
 
     let auth_config = auth::AuthConfig::from_env();
 
-    // Validate JWT secret is not default in production
     if std::env::var("RUST_ENV").unwrap_or_default() != "test" {
         auth_config.validate();
     }
 
-    // Seed built-in admin(s)
     for email in &auth_config.admin_emails {
         if let Err(e) = store.seed_admin(email).await {
             tracing::warn!(%email, error = %e, "failed to seed admin");
@@ -82,9 +80,15 @@ async fn run_server(database_url: &str) {
         }
     }
 
+    let llm_config = LlmConfig::from_env();
+    if llm_config.api_key.is_some() {
+        tracing::info!(model = %llm_config.model, "LLM integration enabled");
+    }
+
     let state = AppState {
         store: Arc::new(store),
         auth: auth_config,
+        llm: llm_config,
     };
 
     use axum::http::Method;
@@ -104,14 +108,12 @@ async fn run_server(database_url: &str) {
             .allow_headers(tower_http::cors::Any),
     };
 
-    // Public routes (no auth required)
     let public = Router::new()
         .route("/healthz", get(healthz))
         .route("/auth/google", get(auth::google_login))
         .route("/auth/google/callback", get(auth::google_callback))
         .route("/api/me", get(auth::me));
 
-    // Protected routes (require cookie session or API token)
     let protected = Router::new()
         .route("/api/episodes", get(list_episodes).post(create_episode))
         .route("/api/episodes/submit-url", axum::routing::post(submit_url))
@@ -121,7 +123,11 @@ async fn run_server(database_url: &str) {
         )
         .route(
             "/api/episodes/{id}/chat",
-            get(list_chat).post(create_chat),
+            get(list_chat).post(create_chat_with_ai),
+        )
+        .route(
+            "/api/episodes/{id}/chapters/{idx}/deep-read",
+            axum::routing::post(chapter_deep_read),
         )
         .route("/api/episodes/{id}/export/{format}", get(export_episode))
         .route("/api/search", get(search_episodes))
@@ -130,7 +136,6 @@ async fn run_server(database_url: &str) {
             "/api/collections",
             get(list_collections).post(create_collection),
         )
-        // Admin
         .route(
             "/api/invites",
             get(auth::list_invites).post(auth::create_invite),
@@ -160,6 +165,25 @@ async fn run_server(database_url: &str) {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+// ---- LLM Config ----
+
+#[derive(Clone)]
+pub struct LlmConfig {
+    pub api_key: Option<String>,
+    pub base_url: String,
+    pub model: String,
+}
+
+impl LlmConfig {
+    fn from_env() -> Self {
+        Self {
+            api_key: std::env::var("LLM_API_KEY").ok().or_else(|| std::env::var("OPENAI_API_KEY").ok()),
+            base_url: std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
+        }
+    }
 }
 
 // ---- Episode Handlers ----
@@ -269,7 +293,6 @@ async fn submit_url(
             .into_response();
     }
 
-    // Check duplicate
     if let Ok(true) = state.store.episode_exists_by_url(&url).await {
         return (
             StatusCode::CONFLICT,
@@ -278,7 +301,6 @@ async fn submit_url(
             .into_response();
     }
 
-    // Detect platform from URL
     let platform = detect_platform(&url);
     let title = req.title.unwrap_or_else(|| format!("Pending: {}", &url));
 
@@ -388,7 +410,7 @@ async fn search_episodes(
     }
 }
 
-// ---- Chat ----
+// ---- Chat with AI ----
 
 #[derive(Deserialize)]
 struct ChatRequest {
@@ -406,15 +428,258 @@ async fn list_chat(
     }
 }
 
-async fn create_chat(
+async fn create_chat_with_ai(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    match state.store.add_chat_message(&id, &req.role, &req.content).await {
-        Ok(msg) => (StatusCode::CREATED, Json(serde_json::to_value(msg).unwrap())).into_response(),
-        Err(e) => err_500(e),
+    let user_msg = match state.store.add_chat_message(&id, "user", &req.content).await {
+        Ok(msg) => msg,
+        Err(e) => return err_500(e),
+    };
+
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(_) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "userMessage": serde_json::to_value(&user_msg).unwrap(),
+                    "assistantMessage": {
+                        "id": uuid::Uuid::new_v4().to_string(),
+                        "episodeId": id,
+                        "role": "assistant",
+                        "content": "Episode not found.",
+                        "createdAt": chrono::Utc::now()
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let history = state.store.list_chat_messages(&id).await.unwrap_or_default();
+
+    let assistant_content = if let Some(api_key) = &state.llm.api_key {
+        call_llm(api_key, &state.llm.base_url, &state.llm.model, &ep, &history, &req.content).await
+    } else {
+        "AI chat is not configured. Set LLM_API_KEY env variable to enable.".to_string()
+    };
+
+    let assistant_msg = match state.store.add_chat_message(&id, "assistant", &assistant_content).await {
+        Ok(msg) => msg,
+        Err(e) => return err_500(e),
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "userMessage": serde_json::to_value(&user_msg).unwrap(),
+            "assistantMessage": serde_json::to_value(&assistant_msg).unwrap()
+        })),
+    )
+        .into_response()
+}
+
+async fn call_llm(
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    ep: &lumen_pod_core::episode::Episode,
+    history: &[lumen_pod_core::episode::ChatMessage],
+    user_question: &str,
+) -> String {
+    let mut context = format!("Episode: {}\nAuthor: {}\n", ep.source.title, ep.source.author);
+
+    if let Some(s) = &ep.summary {
+        context.push_str(&format!("\nSummary: {}\n{}\n", s.one_liner, s.r#abstract));
+        if !s.key_takeaways.is_empty() {
+            context.push_str("Key Takeaways:\n");
+            for t in &s.key_takeaways {
+                context.push_str(&format!("- {t}\n"));
+            }
+        }
     }
+
+    if !ep.chapters.is_empty() {
+        context.push_str("\nChapters:\n");
+        for ch in &ep.chapters {
+            context.push_str(&format!("- [{}] {} — {}\n", fmt_dur(ch.start_time), ch.title, ch.summary));
+        }
+    }
+
+    if let Some(t) = &ep.transcript {
+        context.push_str("\nTranscript excerpt (first 3000 chars):\n");
+        let mut transcript_text = String::new();
+        for para in &t.paragraphs {
+            if let Some(speaker) = &para.speaker {
+                transcript_text.push_str(&format!("[{speaker}] "));
+            }
+            for sent in &para.sentences {
+                transcript_text.push_str(&sent.text);
+                transcript_text.push(' ');
+            }
+            transcript_text.push('\n');
+            if transcript_text.len() > 3000 { break; }
+        }
+        context.push_str(&transcript_text);
+    }
+
+    let system_prompt = format!(
+        "You are an AI assistant helping users understand a podcast/video episode. \
+         Answer questions based on the episode content below. Be concise but thorough. \
+         If the answer isn't in the content, say so.\n\n---\n{context}"
+    );
+
+    let mut messages = vec![serde_json::json!({"role": "system", "content": system_prompt})];
+
+    for msg in history.iter().rev().take(20).collect::<Vec<_>>().into_iter().rev() {
+        let role = match msg.role {
+            lumen_pod_core::episode::ChatRole::User => "user",
+            lumen_pod_core::episode::ChatRole::Assistant => "assistant",
+        };
+        messages.push(serde_json::json!({"role": role, "content": msg.content}));
+    }
+
+    messages.push(serde_json::json!({"role": "user", "content": user_question}));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base_url}/chat/completions"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "max_tokens": 1024,
+            "temperature": 0.7,
+        }))
+        .send()
+        .await;
+
+    match response {
+        Ok(res) => {
+            if !res.status().is_success() {
+                let status = res.status();
+                let body = res.text().await.unwrap_or_default();
+                tracing::error!(%status, %body, "LLM API error");
+                return format!("LLM API error: {status}");
+            }
+            match res.json::<serde_json::Value>().await {
+                Ok(json) => json["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or("No response from AI")
+                    .to_string(),
+                Err(e) => format!("Failed to parse LLM response: {e}"),
+            }
+        }
+        Err(e) => format!("Failed to call LLM: {e}"),
+    }
+}
+
+// ---- Chapter Deep Read ----
+
+async fn chapter_deep_read(
+    State(state): State<AppState>,
+    Path((id, idx)): Path<(String, usize)>,
+) -> impl IntoResponse {
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+
+    if idx >= ep.chapters.len() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "chapter index out of range"})),
+        )
+            .into_response();
+    }
+
+    let chapter = &ep.chapters[idx];
+
+    let transcript_excerpt = if let Some(t) = &ep.transcript {
+        let mut text = String::new();
+        for para in &t.paragraphs {
+            let para_start = para.sentences.first().and_then(|s| s.words.first().map(|w| w.start)).unwrap_or(0.0);
+            let para_end = para.sentences.last().and_then(|s| s.words.last().map(|w| w.end)).unwrap_or(0.0);
+
+            if para_end >= chapter.start_time && para_start <= chapter.end_time {
+                if let Some(speaker) = &para.speaker {
+                    text.push_str(&format!("[{speaker}] "));
+                }
+                for sent in &para.sentences {
+                    text.push_str(&sent.text);
+                    text.push(' ');
+                }
+                text.push('\n');
+            }
+        }
+        text
+    } else {
+        String::new()
+    };
+
+    let api_key = match &state.llm.api_key {
+        Some(k) => k.clone(),
+        None => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "content": format!(
+                        "## {}\n\n{}\n\n*AI deep read is not configured. Set LLM_API_KEY to enable AI-powered chapter analysis.*",
+                        chapter.title, chapter.summary
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let prompt = format!(
+        "You are an expert content analyst. Given a chapter from a podcast/video, \
+         write a detailed, polished deep-read article about this chapter. \
+         Include key insights, context, and analysis. Write in a clear, engaging style.\n\n\
+         Chapter: {}\nTime: {} — {}\nOriginal Summary: {}\n\n\
+         Transcript:\n{}",
+        chapter.title,
+        fmt_dur(chapter.start_time),
+        fmt_dur(chapter.end_time),
+        chapter.summary,
+        &transcript_excerpt[..transcript_excerpt.len().min(4000)]
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/chat/completions", state.llm.base_url))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": state.llm.model,
+            "messages": [
+                {"role": "system", "content": "You are an expert content analyst. Write insightful deep-read articles."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 2048,
+            "temperature": 0.7,
+        }))
+        .send()
+        .await;
+
+    let content = match response {
+        Ok(res) if res.status().is_success() => {
+            match res.json::<serde_json::Value>().await {
+                Ok(json) => json["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or("Failed to generate deep read")
+                    .to_string(),
+                Err(e) => format!("Failed to parse response: {e}"),
+            }
+        }
+        Ok(res) => format!("LLM API error: {}", res.status()),
+        Err(e) => format!("Failed to call LLM: {e}"),
+    };
+
+    (StatusCode::OK, Json(serde_json::json!({"content": content}))).into_response()
 }
 
 // ---- Export ----
@@ -436,10 +701,7 @@ async fn export_episode(
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        &format!("attachment; filename=\"{}.md\"", sanitize_filename(&ep.source.title)),
-                    ),
+                    (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}.md\"", sanitize_filename(&ep.source.title))),
                 ],
                 md,
             )
@@ -451,10 +713,7 @@ async fn export_episode(
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "application/x-subrip; charset=utf-8"),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        &format!("attachment; filename=\"{}.srt\"", sanitize_filename(&ep.source.title)),
-                    ),
+                    (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}.srt\"", sanitize_filename(&ep.source.title))),
                 ],
                 srt,
             )
@@ -466,18 +725,39 @@ async fn export_episode(
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "application/json; charset=utf-8"),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        &format!("attachment; filename=\"{}.json\"", sanitize_filename(&ep.source.title)),
-                    ),
+                    (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}.json\"", sanitize_filename(&ep.source.title))),
                 ],
                 json,
             )
                 .into_response()
         }
+        "notion" => {
+            let md = build_notion_export(&ep);
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
+                    (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{} (Notion).md\"", sanitize_filename(&ep.source.title))),
+                ],
+                md,
+            )
+                .into_response()
+        }
+        "obsidian" => {
+            let md = build_obsidian_export(&ep);
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
+                    (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}.md\"", sanitize_filename(&ep.source.title))),
+                ],
+                md,
+            )
+                .into_response()
+        }
         _ => (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "unsupported format. use: markdown, srt, json"})),
+            Json(serde_json::json!({"error": "unsupported format. use: markdown, srt, json, notion, obsidian"})),
         )
             .into_response(),
     }
@@ -514,14 +794,7 @@ fn build_markdown(ep: &lumen_pod_core::episode::Episode) -> String {
     if !ep.chapters.is_empty() {
         writeln!(md, "## Chapters\n").ok();
         for ch in &ep.chapters {
-            writeln!(
-                md,
-                "- **[{}]** {} — {}",
-                crate::fmt_dur(ch.start_time),
-                ch.title,
-                ch.summary
-            )
-            .ok();
+            writeln!(md, "- **[{}]** {} — {}", crate::fmt_dur(ch.start_time), ch.title, ch.summary).ok();
         }
         writeln!(md).ok();
     }
@@ -568,9 +841,7 @@ fn build_srt(ep: &lumen_pod_core::episode::Episode) -> String {
     if let Some(t) = &ep.transcript {
         for para in &t.paragraphs {
             for sent in &para.sentences {
-                if sent.words.is_empty() {
-                    continue;
-                }
+                if sent.words.is_empty() { continue; }
                 let start = sent.words.first().map(|w| w.start).unwrap_or(0.0);
                 let end = sent.words.last().map(|w| w.end).unwrap_or(0.0);
                 writeln!(srt, "{idx}").ok();
@@ -586,6 +857,188 @@ fn build_srt(ep: &lumen_pod_core::episode::Episode) -> String {
         }
     }
     srt
+}
+
+fn build_notion_export(ep: &lumen_pod_core::episode::Episode) -> String {
+    use std::fmt::Write;
+    let mut md = String::new();
+
+    writeln!(md, "# {}\n", ep.source.title).ok();
+    writeln!(md, "| Property | Value |").ok();
+    writeln!(md, "|---|---|").ok();
+    writeln!(md, "| Source | [{}]({}) |", ep.source.platform, ep.source.url).ok();
+    writeln!(md, "| Author | {} |", ep.source.author).ok();
+    writeln!(md, "| Duration | {} |", fmt_dur(ep.source.duration)).ok();
+    if let Some(lang) = &ep.source.language {
+        writeln!(md, "| Language | {} |", lang).ok();
+    }
+    if let Some(pub_at) = &ep.source.published_at {
+        writeln!(md, "| Published | {} |", pub_at.format("%Y-%m-%d")).ok();
+    }
+    writeln!(md, "| Tags | {} |", ep.tags.join(", ")).ok();
+    writeln!(md).ok();
+
+    if let Some(s) = &ep.summary {
+        writeln!(md, "## TL;DR\n").ok();
+        writeln!(md, "> {}\n", s.one_liner).ok();
+        writeln!(md, "{}\n", s.r#abstract).ok();
+
+        if !s.key_takeaways.is_empty() {
+            writeln!(md, "## Key Takeaways\n").ok();
+            for (i, t) in s.key_takeaways.iter().enumerate() {
+                writeln!(md, "{}. {t}", i + 1).ok();
+            }
+            writeln!(md).ok();
+        }
+    }
+
+    if !ep.chapters.is_empty() {
+        writeln!(md, "## Chapters\n").ok();
+        for ch in &ep.chapters {
+            writeln!(md, "### {} ({})\n", ch.title, fmt_dur(ch.start_time)).ok();
+            writeln!(md, "{}\n", ch.summary).ok();
+        }
+    }
+
+    if let Some(mm) = &ep.mindmap {
+        writeln!(md, "## Mind Map\n").ok();
+        writeln!(md, "```\n{}\n```\n", mm.markdown).ok();
+    }
+
+    if !ep.highlights.is_empty() {
+        writeln!(md, "## Highlights\n").ok();
+        for h in &ep.highlights {
+            writeln!(md, "- **[{}]** {}", fmt_dur(h.time), h.content).ok();
+        }
+        writeln!(md).ok();
+    }
+
+    if !ep.keywords.is_empty() {
+        writeln!(md, "## Keywords\n").ok();
+        for kw in &ep.keywords {
+            if let Some(desc) = &kw.desc {
+                writeln!(md, "- **{}** — {desc}", kw.key).ok();
+            } else {
+                writeln!(md, "- {}", kw.key).ok();
+            }
+        }
+        writeln!(md).ok();
+    }
+
+    if !ep.qas.is_empty() {
+        writeln!(md, "## Q&A\n").ok();
+        for qa in &ep.qas {
+            writeln!(md, "<details><summary>{}</summary>\n", qa.question).ok();
+            writeln!(md, "{}\n", qa.answer).ok();
+            writeln!(md, "</details>\n").ok();
+        }
+    }
+
+    md
+}
+
+fn build_obsidian_export(ep: &lumen_pod_core::episode::Episode) -> String {
+    use std::fmt::Write;
+    let mut md = String::new();
+
+    writeln!(md, "---").ok();
+    writeln!(md, "title: \"{}\"", ep.source.title.replace('"', "'")).ok();
+    writeln!(md, "source: {}", ep.source.url).ok();
+    writeln!(md, "platform: {}", ep.source.platform).ok();
+    writeln!(md, "author: \"{}\"", ep.source.author.replace('"', "'")).ok();
+    writeln!(md, "duration: {}", fmt_dur(ep.source.duration)).ok();
+    if let Some(lang) = &ep.source.language {
+        writeln!(md, "language: {lang}").ok();
+    }
+    if let Some(pub_at) = &ep.source.published_at {
+        writeln!(md, "published: {}", pub_at.format("%Y-%m-%d")).ok();
+    }
+    if !ep.tags.is_empty() {
+        writeln!(md, "tags:").ok();
+        for tag in &ep.tags {
+            writeln!(md, "  - {tag}").ok();
+        }
+    }
+    writeln!(md, "created: {}", ep.created_at.format("%Y-%m-%dT%H:%M:%S")).ok();
+    writeln!(md, "---\n").ok();
+
+    writeln!(md, "# {}\n", ep.source.title).ok();
+
+    if let Some(s) = &ep.summary {
+        writeln!(md, "## Summary\n").ok();
+        writeln!(md, "> [!tip] TL;DR\n> {}\n", s.one_liner).ok();
+        writeln!(md, "{}\n", s.r#abstract).ok();
+
+        if !s.key_takeaways.is_empty() {
+            writeln!(md, "### Key Takeaways\n").ok();
+            for t in &s.key_takeaways {
+                writeln!(md, "- {t}").ok();
+            }
+            writeln!(md).ok();
+        }
+
+        if !s.glossary.is_empty() {
+            writeln!(md, "### Glossary\n").ok();
+            for g in &s.glossary {
+                writeln!(md, "- **{}**:: {}", g.term, g.definition).ok();
+            }
+            writeln!(md).ok();
+        }
+
+        if !s.thinking_questions.is_empty() {
+            writeln!(md, "### Thinking Questions\n").ok();
+            for q in &s.thinking_questions {
+                writeln!(md, "- [ ] {q}").ok();
+            }
+            writeln!(md).ok();
+        }
+    }
+
+    if !ep.chapters.is_empty() {
+        writeln!(md, "## Chapters\n").ok();
+        for ch in &ep.chapters {
+            writeln!(md, "### {} `{}`\n", ch.title, fmt_dur(ch.start_time)).ok();
+            writeln!(md, "{}\n", ch.summary).ok();
+        }
+    }
+
+    if let Some(mm) = &ep.mindmap {
+        writeln!(md, "## Mind Map\n").ok();
+        writeln!(md, "```markmap\n{}\n```\n", mm.markdown).ok();
+    }
+
+    if !ep.highlights.is_empty() {
+        writeln!(md, "## Highlights\n").ok();
+        for h in &ep.highlights {
+            writeln!(md, "- =={} ({})== {}", h.content, fmt_dur(h.time), h.note.as_deref().unwrap_or("")).ok();
+        }
+        writeln!(md).ok();
+    }
+
+    if !ep.keywords.is_empty() {
+        writeln!(md, "## Keywords\n").ok();
+        writeln!(md, "{}\n", ep.keywords.iter().map(|k| format!("[[{}]]", k.key)).collect::<Vec<_>>().join(" · ")).ok();
+    }
+
+    if !ep.qas.is_empty() {
+        writeln!(md, "## Q&A\n").ok();
+        for qa in &ep.qas {
+            writeln!(md, "> [!question] {}\n> {}\n", qa.question, qa.answer).ok();
+        }
+    }
+
+    if let Some(t) = &ep.transcript {
+        writeln!(md, "## Transcript\n").ok();
+        for para in &t.paragraphs {
+            if let Some(speaker) = &para.speaker {
+                write!(md, "**{speaker}:** ").ok();
+            }
+            let text: String = para.sentences.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+            writeln!(md, "{text}\n").ok();
+        }
+    }
+
+    md
 }
 
 fn srt_time(seconds: f64) -> String {

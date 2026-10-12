@@ -36,6 +36,9 @@ services:
       LUMEN_POD_API_TOKEN: ${LUMEN_POD_API_TOKEN:-}
       ADMIN_EMAILS: ${ADMIN_EMAILS:-fakechris@gmail.com}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
       RUST_LOG: lumen_pod_api=info,tower_http=info
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:3210/healthz || exit 1"]
