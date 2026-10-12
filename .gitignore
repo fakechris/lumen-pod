@@ -5,3 +5,9 @@
 .env
 .env.local
 research/
+
+# Web & Extension
+web/node_modules/
+web/.next/
+extension/node_modules/
+extension/dist/

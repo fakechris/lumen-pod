@@ -304,6 +304,23 @@ impl Store {
         Ok(row.get::<bool, _>("exists"))
     }
 
+    pub async fn find_episode_by_url(&self, url: &str) -> PodResult<Option<Episode>> {
+        let row = sqlx::query("SELECT id, data, source_url, created_at, updated_at FROM episodes WHERE source_url = $1 LIMIT 1")
+            .bind(url)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(r) => {
+                let data: serde_json::Value = r.get("data");
+                let mut ep: Episode = serde_json::from_value(data)
+                    .map_err(|e| crate::error::PodError::InvalidInput(e.to_string()))?;
+                ep.id = r.get("id");
+                Ok(Some(ep))
+            }
+            None => Ok(None),
+        }
+    }
+
     // ---- User / Auth ----
 
     pub async fn upsert_user(&self, user: &User) -> PodResult<()> {

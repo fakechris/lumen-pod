@@ -154,6 +154,7 @@ async fn run_server(database_url: &str) {
         )
         .route("/api/episodes/{id}/export/{format}", get(export_episode))
         .route("/api/search", get(search_episodes))
+        .route("/api/episodes/lookup", get(lookup_episode_by_url))
         .route("/api/stats", get(stats))
         .route(
             "/api/collections",
@@ -578,6 +579,67 @@ fn detect_platform(url: &str) -> String {
     } else {
         "other".into()
     }
+}
+
+// ---- Lookup by URL ----
+
+#[derive(Deserialize)]
+struct LookupParams {
+    url: String,
+}
+
+async fn lookup_episode_by_url(
+    State(state): State<AppState>,
+    Query(params): Query<LookupParams>,
+) -> impl IntoResponse {
+    let url = params.url.trim().to_string();
+    if url.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "url parameter required"}))).into_response();
+    }
+
+    // Try exact URL match first
+    match state.store.find_episode_by_url(&url).await {
+        Ok(Some(ep)) => (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response(),
+        Ok(None) => {
+            // For YouTube, also try alternate URL forms
+            if let Some(video_id) = extract_youtube_video_id(&url) {
+                let alt_urls = [
+                    format!("https://www.youtube.com/watch?v={video_id}"),
+                    format!("https://youtube.com/watch?v={video_id}"),
+                    format!("https://youtu.be/{video_id}"),
+                ];
+                for alt in &alt_urls {
+                    if alt == &url { continue; }
+                    if let Ok(Some(ep)) = state.store.find_episode_by_url(alt).await {
+                        return (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response();
+                    }
+                }
+            }
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response()
+        }
+        Err(e) => err_500(e),
+    }
+}
+
+fn extract_youtube_video_id(url: &str) -> Option<String> {
+    if url.contains("youtu.be/") {
+        let after = url.split("youtu.be/").nth(1)?;
+        let id = after.split(['?', '&', '#']).next()?;
+        if !id.is_empty() { return Some(id.to_string()); }
+    }
+    if url.contains("youtube.com/watch") || url.contains("youtube.com/embed/") {
+        if url.contains("v=") {
+            let after = url.split("v=").nth(1)?;
+            let id = after.split(['&', '#']).next()?;
+            if !id.is_empty() { return Some(id.to_string()); }
+        }
+        if url.contains("/embed/") {
+            let after = url.split("/embed/").nth(1)?;
+            let id = after.split(['?', '&', '#']).next()?;
+            if !id.is_empty() { return Some(id.to_string()); }
+        }
+    }
+    None
 }
 
 // ---- Search ----
