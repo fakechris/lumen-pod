@@ -739,9 +739,37 @@ fn build_chat_system_prompt(ep: &lumen_pod_core::episode::Episode) -> String {
 
 // ---- Chapter Deep Read ----
 
+#[derive(Deserialize)]
+struct DeepReadParams {
+    lang: Option<String>,
+    regenerate: Option<bool>,
+}
+
+fn deep_read_system_prompt(lang: &str) -> String {
+    let lang_instruction = match lang {
+        "zh" => "You MUST write the entire response in Chinese (简体中文). All headings, analysis, and text must be in Chinese.",
+        "en" => "Write the entire response in English.",
+        "ja" => "日本語で書いてください。見出し、分析、テキストのすべてを日本語で記述してください。",
+        "ko" => "전체 응답을 한국어로 작성하세요.",
+        "es" => "Escribe toda la respuesta en español.",
+        "fr" => "Rédigez l'intégralité de la réponse en français.",
+        "de" => "Schreiben Sie die gesamte Antwort auf Deutsch.",
+        other => return format!(
+            "You are an expert content analyst. Write detailed, polished deep-read articles about podcast/video chapters. \
+             Include key insights, context, and analysis. Write in a clear, engaging style. \
+             You MUST write the entire response in {other}."
+        ),
+    };
+    format!(
+        "You are an expert content analyst. Write detailed, polished deep-read articles about podcast/video chapters. \
+         Include key insights, context, and analysis. Write in a clear, engaging style.\n\n{lang_instruction}"
+    )
+}
+
 async fn chapter_deep_read(
     State(state): State<AppState>,
     Path((id, idx)): Path<(String, usize)>,
+    Query(params): Query<DeepReadParams>,
 ) -> impl IntoResponse {
     let ep = match state.store.get_episode(&id).await {
         Ok(ep) => ep,
@@ -758,35 +786,18 @@ async fn chapter_deep_read(
     }
 
     let chapter = &ep.chapters[idx];
+    let regenerate = params.regenerate.unwrap_or(false);
 
-    // Return cached deep read if already generated
-    if let Some(cached) = &chapter.deep_read {
-        return (StatusCode::OK, Json(serde_json::json!({"content": cached, "cached": true}))).into_response();
+    // Return cached deep read if exists and not regenerating
+    if !regenerate {
+        if let Some(cached) = &chapter.deep_read {
+            return (StatusCode::OK, Json(serde_json::json!({"content": cached, "cached": true}))).into_response();
+        }
     }
 
-    let transcript_excerpt = if let Some(t) = &ep.transcript {
-        let mut text = String::new();
-        for para in &t.paragraphs {
-            let para_start = para.sentences.first().and_then(|s| s.words.first().map(|w| w.start)).unwrap_or(0.0);
-            let para_end = para.sentences.last().and_then(|s| s.words.last().map(|w| w.end)).unwrap_or(0.0);
-
-            if para_end >= chapter.start_time && para_start <= chapter.end_time {
-                if let Some(speaker) = &para.speaker {
-                    text.push_str(&format!("[{speaker}] "));
-                }
-                for sent in &para.sentences {
-                    text.push_str(&sent.text);
-                    text.push(' ');
-                }
-                text.push('\n');
-            }
-        }
-        text
-    } else {
-        String::new()
-    };
-
-    let system = "You are an expert content analyst. Write detailed, polished deep-read articles about podcast/video chapters. Include key insights, context, and analysis. Write in a clear, engaging style.";
+    let lang = params.lang.as_deref().unwrap_or("zh");
+    let transcript_excerpt = build_chapter_transcript(&ep, chapter);
+    let system = deep_read_system_prompt(lang);
 
     let prompt = format!(
         "Write a deep-read analysis of this chapter:\n\n\
@@ -800,7 +811,7 @@ async fn chapter_deep_read(
     );
 
     let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-    let content = call_llm_anthropic(&state.llm, system, &messages).await;
+    let content = call_llm_anthropic(&state.llm, &system, &messages).await;
 
     // Persist deep read into the chapter
     let mut chapters_val = serde_json::to_value(&ep.chapters).unwrap_or_default();
@@ -819,10 +830,17 @@ async fn chapter_deep_read(
 
 // ---- Batch Deep Read ----
 
+#[derive(Deserialize)]
+struct BatchDeepReadParams {
+    lang: Option<String>,
+}
+
 async fn batch_deep_read_start(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<BatchDeepReadParams>,
 ) -> impl IntoResponse {
+    let lang = params.lang.unwrap_or_else(|| "zh".into());
     let ep = match state.store.get_episode(&id).await {
         Ok(ep) => ep,
         Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
@@ -878,9 +896,10 @@ async fn batch_deep_read_start(
     let task_state = state.clone();
     let task_id = id.clone();
     let task_pending = pending.clone();
+    let task_lang = lang.clone();
 
     tokio::spawn(async move {
-        batch_deep_read_worker(task_state, task_id, task_pending).await;
+        batch_deep_read_worker(task_state, task_id, task_pending, &task_lang).await;
     });
 
     (StatusCode::ACCEPTED, Json(serde_json::json!({
@@ -890,7 +909,8 @@ async fn batch_deep_read_start(
     }))).into_response()
 }
 
-async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Vec<usize>) {
+async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Vec<usize>, lang: &str) {
+    let system = deep_read_system_prompt(lang);
     for &idx in &pending {
         // Check cancellation
         let cancelled = {
@@ -927,7 +947,6 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
         let chapter = &ep.chapters[idx];
         let transcript_excerpt = build_chapter_transcript(&ep, chapter);
 
-        let system = "You are an expert content analyst. Write detailed, polished deep-read articles about podcast/video chapters. Include key insights, context, and analysis. Write in a clear, engaging style.";
         let prompt = format!(
             "Write a deep-read analysis of this chapter:\n\n\
              Chapter: {}\nTime: {} — {}\nOriginal Summary: {}\n\n\
@@ -944,7 +963,7 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
         // Timeout: 3 minutes per chapter
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(180),
-            call_llm_anthropic(&state.llm, system, &messages),
+            call_llm_anthropic(&state.llm, &system, &messages),
         ).await;
 
         let is_ok = match result {

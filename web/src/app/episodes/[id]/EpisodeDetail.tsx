@@ -428,6 +428,16 @@ function SummaryTab({ episode }: { episode: Episode }) {
 // Chapters — deep read state comes from parent
 // ---------------------------------------------------------------------------
 
+const DEEP_READ_LANGS = [
+  { code: "zh", label: "中文" },
+  { code: "en", label: "English" },
+  { code: "ja", label: "日本語" },
+  { code: "ko", label: "한국어" },
+  { code: "es", label: "Español" },
+  { code: "fr", label: "Français" },
+  { code: "de", label: "Deutsch" },
+];
+
 function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepReads, setDeepReads }: {
   episode: Episode; episodeId: string; currentTime: number; seekTo: (t: number) => void; canSeek: boolean;
   deepReads: DeepReadState; setDeepReads: React.Dispatch<React.SetStateAction<DeepReadState>>;
@@ -435,6 +445,7 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
   const [batch, setBatch] = useState<BatchStatus | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastCompletedRef = useRef(0);
+  const [deepReadLang, setDeepReadLang] = useState("zh");
 
   // Poll batch status
   const startPolling = useCallback(() => {
@@ -482,7 +493,7 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
 
   const handleBatchStart = async () => {
     try {
-      const res = await startBatchDeepRead(episodeId);
+      const res = await startBatchDeepRead(episodeId, deepReadLang);
       setBatch(res);
       if (res.status === "started") startPolling();
     } catch (e: any) {
@@ -494,11 +505,11 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
     try { const res = await cancelBatchDeepRead(episodeId); setBatch(res); } catch {}
   };
 
-  const handleDeepRead = async (idx: number) => {
-    if (deepReads[idx]?.content) { setDeepReads((p) => { const c = { ...p }; delete c[idx]; return c; }); return; }
+  const handleDeepRead = async (idx: number, regenerate = false) => {
+    if (!regenerate && deepReads[idx]?.content) { setDeepReads((p) => { const c = { ...p }; delete c[idx]; return c; }); return; }
     setDeepReads((p) => ({ ...p, [idx]: { loading: true } }));
     try {
-      const result = await requestChapterDeepRead(episodeId, idx);
+      const result = await requestChapterDeepRead(episodeId, idx, { lang: deepReadLang, regenerate });
       setDeepReads((p) => ({ ...p, [idx]: { loading: false, content: result.content } }));
     } catch (e: any) {
       setDeepReads((p) => ({ ...p, [idx]: { loading: false, error: e.message } }));
@@ -507,8 +518,11 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
 
   return (
     <div className="space-y-4">
-      {/* Batch controls + progress */}
+      {/* Language selector + Batch controls */}
       <div className="flex items-center gap-3 flex-wrap">
+        <select value={deepReadLang} onChange={(e) => setDeepReadLang(e.target.value)} className="px-3 py-2 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-purple-500 outline-none">
+          {DEEP_READ_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+        </select>
         {!batchRunning && pendingCount > 0 && (
           <button onClick={handleBatchStart} className="px-4 py-2 text-sm font-medium rounded-lg bg-purple-600 text-white hover:bg-purple-700 transition-colors">
             📖 Deep Read All ({pendingCount} remaining)
@@ -583,6 +597,11 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
                 <button onClick={() => handleDeepRead(i)} disabled={dr?.loading || isBatchProcessing} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors disabled:opacity-50">
                   {dr?.loading || isBatchProcessing ? "⏳ Generating..." : dr?.content ? "📖 Hide Deep Read" : "📖 Deep Read"}
                 </button>
+                {dr?.content && !dr.loading && !isBatchProcessing && (
+                  <button onClick={() => handleDeepRead(i, true)} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 hover:text-amber-700 dark:hover:text-amber-400 transition-colors">
+                    🔄 Regenerate
+                  </button>
+                )}
               </div>
               {dr?.content && (
                 <div className="px-4 pb-4 border-t border-zinc-100 dark:border-zinc-800 pt-3">

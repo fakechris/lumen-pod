@@ -87,9 +87,14 @@ export async function listChatMessages(episodeId: string): Promise<{ messages: C
 
 export async function requestChapterDeepRead(
   episodeId: string,
-  chapterIndex: number
-): Promise<{ content: string }> {
-  return apiFetch(`/api/episodes/${episodeId}/chapters/${chapterIndex}/deep-read`, {
+  chapterIndex: number,
+  opts?: { lang?: string; regenerate?: boolean }
+): Promise<{ content: string; cached?: boolean }> {
+  const params = new URLSearchParams();
+  if (opts?.lang) params.set("lang", opts.lang);
+  if (opts?.regenerate) params.set("regenerate", "true");
+  const qs = params.toString();
+  return apiFetch(`/api/episodes/${episodeId}/chapters/${chapterIndex}/deep-read${qs ? `?${qs}` : ""}`, {
     method: "POST",
   });
 }
@@ -106,8 +111,9 @@ export interface BatchStatus {
   pending?: number;
 }
 
-export async function startBatchDeepRead(episodeId: string): Promise<BatchStatus> {
-  return apiFetch(`/api/episodes/${episodeId}/deep-read-all`, { method: "POST" });
+export async function startBatchDeepRead(episodeId: string, lang?: string): Promise<BatchStatus> {
+  const qs = lang ? `?lang=${encodeURIComponent(lang)}` : "";
+  return apiFetch(`/api/episodes/${episodeId}/deep-read-all${qs}`, { method: "POST" });
 }
 
 export async function getBatchDeepReadStatus(episodeId: string): Promise<BatchStatus> {
