@@ -498,13 +498,13 @@ async fn call_llm_anthropic_with_tokens(
     }
 }
 
-/// Call LLM using default 16,384 token budget (for chat and chapter deep-read).
+/// Call LLM using default 24,576 token budget (for chat and chapter deep-read).
 async fn call_llm_anthropic(
     config: &LlmConfig,
     system: &str,
     messages: &[serde_json::Value],
 ) -> Result<String, String> {
-    call_llm_anthropic_with_tokens(config, system, messages, 16_384).await
+    call_llm_anthropic_with_tokens(config, system, messages, 24_576).await
 }
 
 // ---- Episode Handlers ----
@@ -1391,7 +1391,7 @@ async fn chapter_deep_read(
     let task_key_clone = task_key.clone();
     tokio::spawn(async move {
         let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-        match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 16_384).await {
+        match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 24_576).await {
             Ok(content) => {
                 if let Err(e) = state_clone
                     .store
@@ -2072,7 +2072,7 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
         // Timeout: 10 minutes per chapter
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(600),
-            call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 16_384),
+            call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 24_576),
         ).await;
 
         let is_ok = match result {
