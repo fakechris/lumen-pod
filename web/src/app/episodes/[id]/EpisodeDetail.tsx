@@ -311,6 +311,17 @@ function TimestampMarkdown({
         li: ({ children }) => <li>{renderNodesWithTimestamps(children, seekTo, canSeek)}</li>,
         em: ({ children }) => <em>{renderNodesWithTimestamps(children, seekTo, canSeek)}</em>,
         strong: ({ children }) => <strong>{renderNodesWithTimestamps(children, seekTo, canSeek)}</strong>,
+        code: ({ className, children, ...props }) => {
+          const text = typeof children === "string" ? children.trim() : "";
+          if (!className && TIMESTAMP_INNER_RE.test(text)) {
+            return <>{renderNodesWithTimestamps(text, seekTo, canSeek)}</>;
+          }
+          return (
+            <code className={className} {...props}>
+              {children}
+            </code>
+          );
+        },
       }}
     >
       {content}

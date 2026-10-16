@@ -265,18 +265,79 @@ impl LlmConfig {
     }
 }
 
-/// Call LLM using the Anthropic Messages API format
-async fn call_llm_anthropic(
+/// Parse an Anthropic Messages API JSON payload and extract the text response.
+/// Logs `stop_reason`, `input_tokens`, `output_tokens`, and `thinking_tokens`.
+/// Returns `Err` if no non-empty `type == "text"` block is present (e.g. when a
+/// reasoning model exhausts `max_tokens` during the `thinking` phase).
+fn extract_llm_text_from_response(json: &serde_json::Value) -> Result<String, String> {
+    let stop_reason = json["stop_reason"].as_str().unwrap_or("unknown");
+    let input_tokens = json["usage"]["input_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = json["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    let thinking_tokens = json["usage"]["output_tokens_details"]["thinking_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+
+    let text = json["content"]
+        .as_array()
+        .and_then(|arr| {
+            let joined: String = arr
+                .iter()
+                .filter(|c| c["type"] == "text")
+                .filter_map(|c| c["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        });
+
+    tracing::info!(
+        %stop_reason,
+        input_tokens,
+        output_tokens,
+        thinking_tokens,
+        has_text = text.is_some(),
+        "LLM response received"
+    );
+
+    match text {
+        Some(t) => Ok(t),
+        None => {
+            tracing::warn!(
+                %stop_reason,
+                input_tokens,
+                output_tokens,
+                thinking_tokens,
+                "LLM returned no text block (likely exhausted max_tokens during thinking)"
+            );
+            Err(format!(
+                "LLM returned empty text response (stop_reason={stop_reason}, output_tokens={output_tokens}, thinking_tokens={thinking_tokens})"
+            ))
+        }
+    }
+}
+
+/// Call LLM using the Anthropic Messages API format with an explicit `max_tokens` budget.
+async fn call_llm_anthropic_with_tokens(
     config: &LlmConfig,
     system: &str,
     messages: &[serde_json::Value],
-) -> String {
+    max_tokens: u32,
+) -> Result<String, String> {
     let api_key = match &config.api_key {
         Some(k) => k,
-        None => return "AI not configured. Set LLM_API_KEY to enable.".into(),
+        None => return Err("AI not configured. Set LLM_API_KEY to enable.".into()),
     };
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
     let response = client
         .post(format!("{}/v1/messages", config.base_url))
         .header("x-api-key", api_key.as_str())
@@ -284,7 +345,7 @@ async fn call_llm_anthropic(
         .header("content-type", "application/json")
         .json(&serde_json::json!({
             "model": config.model,
-            "max_tokens": 8192,
+            "max_tokens": max_tokens,
             "system": system,
             "messages": messages,
         }))
@@ -297,23 +358,24 @@ async fn call_llm_anthropic(
                 let status = res.status();
                 let body = res.text().await.unwrap_or_default();
                 tracing::error!(%status, %body, "LLM API error");
-                return format!("LLM API error: {status}. {body}");
+                return Err(format!("LLM API error: {status}. {body}"));
             }
             match res.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    // Anthropic response: {"content": [{"type": "text", "text": "..."}]}
-                    json["content"]
-                        .as_array()
-                        .and_then(|arr| arr.iter().find(|c| c["type"] == "text"))
-                        .and_then(|c| c["text"].as_str())
-                        .unwrap_or("No response from AI")
-                        .to_string()
-                }
-                Err(e) => format!("Failed to parse LLM response: {e}"),
+                Ok(json) => extract_llm_text_from_response(&json),
+                Err(e) => Err(format!("Failed to parse LLM response: {e}")),
             }
         }
-        Err(e) => format!("Failed to call LLM: {e}"),
+        Err(e) => Err(format!("Failed to call LLM: {e}")),
     }
+}
+
+/// Call LLM using default 16,384 token budget (for chat and chapter deep-read).
+async fn call_llm_anthropic(
+    config: &LlmConfig,
+    system: &str,
+    messages: &[serde_json::Value],
+) -> Result<String, String> {
+    call_llm_anthropic_with_tokens(config, system, messages, 16_384).await
 }
 
 // ---- Episode Handlers ----
@@ -957,7 +1019,16 @@ async fn create_chat_with_ai(
     }
     messages.push(serde_json::json!({"role": "user", "content": req.content}));
 
-    let assistant_content = call_llm_anthropic(&state.llm, &system, &messages).await;
+    let assistant_content = match call_llm_anthropic(&state.llm, &system, &messages).await {
+        Ok(text) => text,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response();
+        }
+    };
 
     let assistant_msg = match state
         .store
@@ -1065,11 +1136,11 @@ fn deep_read_system_prompt(lang: &str) -> String {
          2. **Reasoning over Assertions**: Do not just list conclusions. Reconstruct the speaker's chain of reasoning (Why & How) — how they move from observation/problem to conclusion.\n\
          3. **Preserve the Primary Case**: Keep the main example, experiment, or story in full narrative detail; never compress a concrete case study into a dry one-sentence bullet.\n\
          4. **Term Pinning & ASR Correction**: Cross-check proper nouns against the episode title/description to fix ASR homophone errors. When a key concept or technical term appears for the first time, include the original term in parentheses, e.g. `认知负荷（Cognitive Load）`.\n\
-         5. **Tri-part Notable Quotes**: Include 1-2 of the most impactful verbatim quotes formatted as a three-part blockquote:\n\
+         5. **Tri-part Notable Quotes**: Include 1-2 of the most impactful verbatim quotes formatted as a three-part blockquote (preserve the exact timestamp format from the transcript, whether `[MM:SS]` or `[H:MM:SS]` for episodes over an hour):\n\
             > 「Translated quote in target language」\n\
             > *\"Original verbatim quote\"*\n\
-            > —— Speaker Name `[MM:SS]`\n\
-         6. **High-Bar Visual Referrals**: Only if the speaker is demonstrating something that words cannot replace (e.g. live UI/code demo, physical experiment, complex chart), insert `🎬 [MM:SS 建议回看原片画面：reason]`. Otherwise, explain everything thoroughly in text.\n\n\
+            > —— Speaker Name `[MM:SS]` (or `[H:MM:SS]`)\n\
+         6. **High-Bar Visual Referrals**: Only if the speaker is demonstrating something that words cannot replace (e.g. live UI/code demo, physical experiment, complex chart), insert `🎬 [MM:SS 建议回看原片画面：reason]` (or `[H:MM:SS ...]`). Otherwise, explain everything thoroughly in text.\n\n\
          {lang_instruction}"
     )
 }
@@ -1104,10 +1175,13 @@ async fn chapter_deep_read(
     let chapter = &ep.chapters[idx];
     let regenerate = params.regenerate.unwrap_or(false);
 
-    // Return cached deep read if exists and not regenerating
+    // Return cached deep read if exists, is non-empty/valid, and not regenerating
     if !regenerate {
         if let Some(cached) = &chapter.deep_read {
-            return (StatusCode::OK, Json(serde_json::json!({"content": cached, "cached": true}))).into_response();
+            let trimmed = cached.trim();
+            if !trimmed.is_empty() && trimmed != "No response from AI" {
+                return (StatusCode::OK, Json(serde_json::json!({"content": cached, "cached": true}))).into_response();
+            }
         }
     }
 
@@ -1126,11 +1200,20 @@ async fn chapter_deep_read(
         fmt_dur(chapter.start_time),
         fmt_dur(chapter.end_time),
         chapter.summary,
-        truncate_utf8_chars(&transcript_excerpt, 16_000)
+        truncate_utf8_chars(&transcript_excerpt, 24_000)
     );
 
     let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-    let content = call_llm_anthropic(&state.llm, &system, &messages).await;
+    let content = match call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 16_384).await {
+        Ok(c) => c,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response();
+        }
+    };
 
     // Persist deep read into the chapter
     let mut chapters_val = serde_json::to_value(&ep.chapters).unwrap_or_default();
@@ -1185,13 +1268,13 @@ fn article_system_prompt(lang: &str, focus: Option<&str>) -> String {
             - Use the episode title, author, and description to correct ASR homophone typos in person names, company names, books, and technical terms.\n\
             - When a key concept or technical term first appears, attach the original term in parentheses: `中文译名（Original Term）`.\n\
          5. **Tri-part Notable Quotes (三段式高规格金句引用)**:\n\
-            - Weave 3–6 of the most powerful verbatim quotes into the article using this exact three-line blockquote format:\n\
+            - Weave 3–6 of the most powerful verbatim quotes into the article using this exact three-line blockquote format (preserve the exact timestamp from the transcript, whether `[MM:SS]` or `[H:MM:SS]` for episodes over an hour):\n\
               > 「精炼传神的中文译文（或目标语言译文）」\n\
               > *\"Exact original quote from the transcript\"*\n\
-              > —— Speaker Name `[MM:SS]`\n\
-            - If the source language and target language are the same, you may omit the duplicate line and keep the quote + `—— Speaker Name [MM:SS]`.\n\
+              > —— Speaker Name `[MM:SS]` (or `[H:MM:SS]`)\n\
+            - If the source language and target language are the same, you may omit the duplicate line and keep the quote + `—— Speaker Name [MM:SS]` (or `[H:MM:SS]`).\n\
          6. **High-Bar Visual Referrals (高门槛的「回看原片画面」指针)**:\n\
-            - Only when words genuinely cannot replace the visual (e.g. live code/UI demo, physical experiment, complex chart walkthrough), insert `🎬 [MM:SS 建议回看原片画面：具体原因]`.\n\
+            - Only when words genuinely cannot replace the visual (e.g. live code/UI demo, physical experiment, complex chart walkthrough), insert `🎬 [MM:SS 建议回看原片画面：具体原因]` (or `🎬 [H:MM:SS 建议回看原片画面：具体原因]` when over 1 hour).\n\
             - For all verbal arguments and stories, explain them completely in text.\n\
          7. **Structured Post-Article Curations (结构化尾注：要点 + 书影音清单 + 延伸探索)**:\n\
             At the end of the article, always include these three curated sections:\n\
@@ -1258,7 +1341,7 @@ fn build_episode_article_context(ep: &lumen_pod_core::episode::Episode) -> Strin
             }
             trans_buf.push('\n');
         }
-        ctx.push_str(truncate_utf8_chars(&trans_buf, 60_000));
+        ctx.push_str(truncate_utf8_chars(&trans_buf, 120_000));
     }
 
     ctx
@@ -1311,7 +1394,9 @@ async fn episode_article(
 
     if !regenerate && focus.is_none() {
         if let Some(existing) = &ep.article {
-            if !existing.content.trim().is_empty()
+            let trimmed = existing.content.trim();
+            if !trimmed.is_empty()
+                && trimmed != "No response from AI"
                 && existing.lang.as_deref().unwrap_or("zh") == lang
             {
                 return (
@@ -1330,23 +1415,22 @@ async fn episode_article(
     let context = build_episode_article_context(&ep);
     let user_prompt = format!(
         "Write a complete, standalone 'Read-and-Done' long-form article for the following episode.\n\
-         Ensure timestamps like `[MM:SS]` are preserved on quotes and visual referrals so readers can jump directly to the audio/video player.\n\n\
+         Ensure timestamps like `[MM:SS]` or `[H:MM:SS]` are preserved on quotes and visual referrals so readers can jump directly to the audio/video player.\n\n\
          {context}"
     );
 
     let messages = vec![serde_json::json!({"role": "user", "content": user_prompt})];
-    let raw_output = call_llm_anthropic(&state.llm, &system, &messages).await;
-
-    if raw_output.starts_with("LLM API error:")
-        || raw_output.starts_with("Failed to ")
-        || raw_output.starts_with("AI not configured")
-    {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": raw_output })),
-        )
-            .into_response();
-    }
+    // Use 32,768 max_tokens so reasoning models (e.g. MiniMax-M3.1) have ample budget for both thinking and long-form article output
+    let raw_output = match call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 32_768).await {
+        Ok(text) => text,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response();
+        }
+    };
 
     let (title, content) = extract_markdown_title(&raw_output, &ep.source.title);
     let article = lumen_pod_core::episode::Article {
@@ -1521,11 +1605,11 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
         // Timeout: 3 minutes per chapter
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(180),
-            call_llm_anthropic(&state.llm, &system, &messages),
+            call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 16_384),
         ).await;
 
         let is_ok = match result {
-            Ok(content) if !content.starts_with("LLM API error") && !content.starts_with("Failed to") => {
+            Ok(Ok(content)) => {
                 // Persist
                 let mut chapters_val = serde_json::to_value(&ep.chapters).unwrap_or_default();
                 if let Some(arr) = chapters_val.as_array_mut() {
@@ -1536,7 +1620,7 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
                 let updates = serde_json::json!({"chapters": chapters_val});
                 state.store.update_episode(&episode_id, &updates).await.is_ok()
             }
-            Ok(err_content) => {
+            Ok(Err(err_content)) => {
                 tracing::warn!(%episode_id, idx, %err_content, "batch deep read LLM error");
                 false
             }
@@ -2145,5 +2229,52 @@ mod tests {
         assert!(admin.can_edit_episodes() && admin.can_delete_episodes() && admin.can_publish_private_episodes());
         assert!(!user_a.can_edit_episodes() && !user_a.can_delete_episodes() && user_a.can_publish_private_episodes());
         assert!(user_b.can_edit_episodes() && !user_b.can_delete_episodes() && !user_b.can_publish_private_episodes());
+    }
+
+    #[test]
+    fn test_extract_llm_text_handles_thinking_only_exhaustion_and_valid_response() {
+        // Case 1: Reasoning model exhausted max_tokens during thinking (only thinking block, no text block)
+        let exhausted_json = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "Long internal chain of thought..."}
+            ],
+            "stop_reason": "max_tokens",
+            "usage": {
+                "input_tokens": 23622,
+                "output_tokens": 8192,
+                "output_tokens_details": {
+                    "thinking_tokens": 8192
+                }
+            }
+        });
+        let err = extract_llm_text_from_response(&exhausted_json).unwrap_err();
+        assert!(err.contains("stop_reason=max_tokens"));
+        assert!(err.contains("thinking_tokens=8192"));
+
+        // Case 2: Reasoning model finished thinking and emitted text block
+        let ok_json = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "Internal reasoning"},
+                {"type": "text", "text": "# 经验时代的黎明\n\n[1:02:15] 正文内容"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 23622,
+                "output_tokens": 6500,
+                "output_tokens_details": {
+                    "thinking_tokens": 2100
+                }
+            }
+        });
+        let text = extract_llm_text_from_response(&ok_json).unwrap();
+        assert_eq!(text, "# 经验时代的黎明\n\n[1:02:15] 正文内容");
+    }
+
+    #[test]
+    fn test_prompts_support_hour_plus_timestamps() {
+        let article_prompt = article_system_prompt("zh", None);
+        assert!(article_prompt.contains("[H:MM:SS]"));
+        let chapter_prompt = deep_read_system_prompt("zh");
+        assert!(chapter_prompt.contains("[H:MM:SS]"));
     }
 }

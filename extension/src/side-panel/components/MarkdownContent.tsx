@@ -100,11 +100,18 @@ export function MarkdownContent({ content, onSeek }: MarkdownContentProps) {
             {children}
           </blockquote>
         ),
-        code: ({ children }) => (
-          <code className="text-[10px] bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 rounded">
-            {children}
-          </code>
-        ),
+        em: ({ children }) => <em>{renderWithTimestamps(children, onSeek)}</em>,
+        code: ({ children }) => {
+          const text = typeof children === "string" ? children.trim() : "";
+          if (TIMESTAMP_INNER_RE.test(text)) {
+            return <>{renderWithTimestamps(text, onSeek)}</>;
+          }
+          return (
+            <code className="text-[10px] bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 rounded">
+              {children}
+            </code>
+          );
+        },
       }}
     >
       {content}

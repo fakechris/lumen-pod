@@ -309,7 +309,9 @@ impl Store {
             }
         }
         if let Some(v) = updates.get("summary") {
-            if let Ok(s) = serde_json::from_value(v.clone()) {
+            if v.is_null() {
+                ep.summary = None;
+            } else if let Ok(s) = serde_json::from_value(v.clone()) {
                 ep.summary = Some(s);
             }
         }
@@ -319,15 +321,23 @@ impl Store {
         patch!(highlights, "highlights", "highlights");
         patch!(chapters, "chapters", "chapters");
         if let Some(v) = updates.get("article") {
-            if let Ok(a) = serde_json::from_value(v.clone()) {
+            if v.is_null() {
+                ep.article = None;
+            } else if let Ok(a) = serde_json::from_value(v.clone()) {
                 ep.article = Some(a);
             }
         }
         if let Some(v) = updates.get("shownotes") {
-            ep.shownotes = v.as_str().map(String::from);
+            ep.shownotes = if v.is_null() {
+                None
+            } else {
+                v.as_str().map(String::from)
+            };
         }
         if let Some(v) = updates.get("mindmap") {
-            if let Ok(m) = serde_json::from_value(v.clone()) {
+            if v.is_null() {
+                ep.mindmap = None;
+            } else if let Ok(m) = serde_json::from_value(v.clone()) {
                 ep.mindmap = Some(m);
             }
         }
@@ -1262,5 +1272,33 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn patch_article_null_clears_article() {
+        let store = test_store().await;
+        let ep = sample_episode();
+        store.insert_episode(&ep).await.unwrap();
+
+        // Set an article
+        let set_updates = serde_json::json!({
+            "article": {
+                "title": "Test Article",
+                "content": "Some body content",
+                "lang": "zh"
+            }
+        });
+        let updated = store.update_episode(&ep.id, &set_updates).await.unwrap();
+        assert!(updated.article.is_some());
+        assert_eq!(updated.article.as_ref().unwrap().title, "Test Article");
+
+        // Clear article via {"article": null}
+        let clear_updates = serde_json::json!({
+            "article": null
+        });
+        let cleared = store.update_episode(&ep.id, &clear_updates).await.unwrap();
+        assert!(cleared.article.is_none());
+
+        store.delete_episode(&ep.id).await.unwrap();
     }
 }
