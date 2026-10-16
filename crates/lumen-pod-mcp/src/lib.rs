@@ -79,8 +79,9 @@ fn tools() -> Vec<Value> {
              - source: {url, platform, title, author, duration, description, podcastName, language, thumbnailUrl}\n\
              - processing: {status: \"done\", asrEngine, llmModel, agentId}\n\
              - summary: {oneLiner, abstract, keyTakeaways[], thinkingQuestions[], glossary[{term,definition}]}\n\
+             - article: {title, content, format: \"markdown\", lang, focus} (YouMind v54 style standalone 'Read-and-Done' long-form article with scene-first hook, reasoning chain, primary cases, pinned terms, tri-part quotes with [MM:SS], and mentioned books/tools)\n\
              - transcript: {paragraphs[{id, speaker, sentences[{id, text, words[{id, text, start, end}]}]}], translations: {}}\n\
-             - chapters: [{title, startTime, endTime, summary, hasAds}]\n\
+             - chapters: [{title, startTime, endTime, summary, hasAds, deepRead}]\n\
              - mindmap: {markdown} (markdown formatted mind map for Markmap rendering)\n\
              - keywords: [{key, desc}]\n\
              - highlights: [{time, content, cueId, note}]\n\

@@ -762,12 +762,13 @@ mod tests {
                     definition: "Large Language Model".into(),
                 }],
             }),
-            chapters: vec![Chapter {
+                chapters: vec![Chapter {
                 title: "Introduction".into(),
                 start_time: 0.0,
                 end_time: 120.0,
                 summary: "The host introduces the topic".into(),
                 has_ads: false,
+                deep_read: None,
             }],
             mindmap: Some(Mindmap {
                 markdown: "# AI\n## Local Models\n## Cloud".into(),

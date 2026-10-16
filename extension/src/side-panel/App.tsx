@@ -145,7 +145,9 @@ export function App() {
         {!loading && !error && !episode && (
           <EmptyState
             isYouTube={extractVideoId(currentUrl) !== null}
+            currentUrl={currentUrl}
             onOpenSettings={() => setView("settings")}
+            onSubmitted={() => void checkCurrentTab()}
           />
         )}
       </main>

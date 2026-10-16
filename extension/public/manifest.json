@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Lumen Pod",
-  "version": "0.1.0",
-  "description": "View AI-powered podcast & video summaries alongside YouTube videos",
+  "version": "0.2.0",
+  "description": "View AI-powered podcast & video summaries and Read-and-Done in-depth articles alongside YouTube videos",
 
   "permissions": [
     "storage",
@@ -14,7 +14,8 @@
 
   "host_permissions": [
     "*://www.youtube.com/*",
-    "*://youtube.com/*"
+    "*://youtube.com/*",
+    "*://pod.lumenopen.com/*"
   ],
 
   "background": {

@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { getEpisode, formatTimestamp, formatDuration, getExportUrl, sendChatMessage, requestChapterDeepRead, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, type ChatMsg, type BatchStatus } from "@/lib/api";
-import type { Episode } from "@/lib/types";
+import { getEpisode, formatTimestamp, formatDuration, getExportUrl, sendChatMessage, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, type ChatMsg, type BatchStatus } from "@/lib/api";
+import type { Article, Episode } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -237,8 +237,84 @@ function MarkmapView({ markdown }: { markdown: string }) {
 const SPEAKER_COLORS = ["text-blue-600 dark:text-blue-400", "text-emerald-600 dark:text-emerald-400", "text-amber-600 dark:text-amber-400", "text-rose-600 dark:text-rose-400", "text-purple-600 dark:text-purple-400", "text-cyan-600 dark:text-cyan-400"];
 function speakerColor(name: string): string { let h = 0; for (let i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0; return SPEAKER_COLORS[Math.abs(h) % SPEAKER_COLORS.length]; }
 
-const TABS = ["Summary", "Chapters", "Mindmap", "Transcript", "Keywords", "Highlights", "Q&A", "Chat"] as const;
+const TABS = ["Summary", "Article", "Chapters", "Mindmap", "Transcript", "Keywords", "Highlights", "Q&A", "Chat"] as const;
 type TabName = (typeof TABS)[number];
+
+// ---------------------------------------------------------------------------
+// Timestamp-aware Markdown Renderer (supports [MM:SS] & [HH:MM:SS] click-to-seek)
+// ---------------------------------------------------------------------------
+
+function parseTimestampToSeconds(ts: string): number | null {
+  const parts = ts.split(":").map(Number);
+  if (parts.some((n) => Number.isNaN(n))) return null;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return null;
+}
+
+const TIMESTAMP_TOKEN_RE = /(\[\d{1,2}:\d{2}(?::\d{2})?(?:[^\]]*)\])/g;
+const TIMESTAMP_INNER_RE = /^\[(\d{1,2}:\d{2}(?::\d{2})?)(?:\s+([^\]]+))?\]$/;
+
+function renderNodesWithTimestamps(
+  children: React.ReactNode,
+  seekTo?: (t: number) => void,
+  canSeek?: boolean,
+): React.ReactNode {
+  if (!canSeek || !seekTo) return children;
+  return React.Children.map(children, (child, idx) => {
+    if (typeof child === "string") {
+      const segments = child.split(TIMESTAMP_TOKEN_RE);
+      if (segments.length === 1) return child;
+      return segments.map((seg, i) => {
+        const m = seg.match(TIMESTAMP_INNER_RE);
+        if (!m) return seg;
+        const sec = parseTimestampToSeconds(m[1]);
+        if (sec === null) return seg;
+        const note = m[2];
+        return (
+          <button
+            key={`${idx}-${i}`}
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              seekTo(sec);
+            }}
+            className="inline-flex items-center gap-1 mx-0.5 px-1.5 py-0.5 text-xs font-mono rounded-md bg-blue-100/80 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 hover:bg-blue-200 dark:hover:bg-blue-800/60 transition-colors align-baseline cursor-pointer"
+            title={`Jump to ${m[1]}`}
+          >
+            <span>▶ {m[1]}</span>
+            {note && <span className="font-sans">{note}</span>}
+          </button>
+        );
+      });
+    }
+    return child;
+  });
+}
+
+function TimestampMarkdown({
+  content,
+  seekTo,
+  canSeek,
+}: {
+  content: string;
+  seekTo?: (t: number) => void;
+  canSeek?: boolean;
+}) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        p: ({ children }) => <p>{renderNodesWithTimestamps(children, seekTo, canSeek)}</p>,
+        li: ({ children }) => <li>{renderNodesWithTimestamps(children, seekTo, canSeek)}</li>,
+        em: ({ children }) => <em>{renderNodesWithTimestamps(children, seekTo, canSeek)}</em>,
+        strong: ({ children }) => <strong>{renderNodesWithTimestamps(children, seekTo, canSeek)}</strong>,
+      }}
+    >
+      {content}
+    </ReactMarkdown>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Main Component — single-column layout
@@ -341,9 +417,9 @@ export default function EpisodeDetail({ id }: { id: string }) {
 
       {/* Single-column layout — player on top, content below */}
       <div className="max-w-5xl mx-auto px-4 py-6 space-y-6">
-        {/* When on Chapters/Transcript with audio: player + tab bar sticky together */}
+        {/* When on Article/Chapters/Transcript with audio: player + tab bar sticky together */}
         {(() => {
-          const stickyPlayer = hasAudio && (activeTab === "Chapters" || activeTab === "Transcript");
+          const stickyPlayer = hasAudio && (activeTab === "Article" || activeTab === "Chapters" || activeTab === "Transcript");
           return (
             <>
               {/* Sticky player + tab combo for Chapters/Transcript */}
@@ -412,6 +488,15 @@ export default function EpisodeDetail({ id }: { id: string }) {
         {/* Tab Content */}
         <div>
           {activeTab === "Summary" && <SummaryTab episode={episode} />}
+          {activeTab === "Article" && (
+            <ArticleTab
+              episode={episode}
+              episodeId={id}
+              seekTo={seekTo}
+              canSeek={canSeek}
+              onArticleUpdated={(art) => setEpisode((prev) => (prev ? { ...prev, article: art } : prev))}
+            />
+          )}
           {activeTab === "Chapters" && <ChaptersTab episode={episode} episodeId={id} currentTime={currentTime} seekTo={seekTo} canSeek={canSeek} deepReads={deepReads} setDeepReads={setDeepReads} />}
           {activeTab === "Mindmap" && <MindmapTab episode={episode} />}
           {activeTab === "Transcript" && <TranscriptTab episode={episode} translationLangs={translationLangs} currentTime={currentTime} seekTo={seekTo} canSeek={canSeek} />}
@@ -455,6 +540,143 @@ function SummaryTab({ episode }: { episode: Episode }) {
           <h3 className="font-semibold text-zinc-900 dark:text-zinc-100 mb-3 flex items-center gap-2"><span className="w-7 h-7 rounded-lg bg-green-100 dark:bg-green-900/30 flex items-center justify-center text-sm">📖</span>Glossary</h3>
           <div className="grid gap-2 sm:grid-cols-2">{s.glossary.map((g) => (<div key={g.term} className="p-3 rounded-lg bg-zinc-50 dark:bg-zinc-800/50"><span className="font-semibold text-zinc-900 dark:text-zinc-100 text-sm">{g.term}</span><p className="text-zinc-500 text-sm mt-0.5">{g.definition}</p></div>))}</div>
         </section>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Article (YouMind v54 "Read-and-Done" Long-Form Article)
+// ---------------------------------------------------------------------------
+
+function ArticleTab({
+  episode,
+  episodeId,
+  seekTo,
+  canSeek,
+  onArticleUpdated,
+}: {
+  episode: Episode;
+  episodeId: string;
+  seekTo: (t: number) => void;
+  canSeek: boolean;
+  onArticleUpdated: (article: Article) => void;
+}) {
+  const [lang, setLang] = useState(episode.article?.lang || "zh");
+  const [focus, setFocus] = useState(episode.article?.focus || "");
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const article = episode.article;
+
+  const handleGenerate = async (regenerate = false) => {
+    setGenerating(true);
+    setError(null);
+    try {
+      const res = await requestEpisodeArticle(episodeId, {
+        lang,
+        focus: focus.trim() || undefined,
+        regenerate,
+      });
+      onArticleUpdated(res.article);
+    } catch (e: any) {
+      setError(e.message || "Failed to generate article");
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const handleCopy = async () => {
+    if (!article) return;
+    const md = `# ${article.title}\n\n${article.content}`;
+    try {
+      await navigator.clipboard.writeText(md);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {}
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Control bar */}
+      <div className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-4 flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+        <select
+          value={lang}
+          onChange={(e) => setLang(e.target.value)}
+          disabled={generating}
+          className="px-3 py-2 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-blue-500 outline-none"
+        >
+          {DEEP_READ_LANGS.map((l) => (
+            <option key={l.code} value={l.code}>
+              {l.label}
+            </option>
+          ))}
+        </select>
+
+        <input
+          type="text"
+          value={focus}
+          onChange={(e) => setFocus(e.target.value)}
+          disabled={generating}
+          placeholder="可选：输入文章侧重点（如：重点剖析 AI Agent 架构演进与工程案例）..."
+          className="flex-1 px-3 py-2 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/60 text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-blue-500 outline-none placeholder:text-zinc-400"
+        />
+
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={() => handleGenerate(!!article)}
+            disabled={generating}
+            className="px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors disabled:opacity-50"
+          >
+            {generating ? "⏳ 正在撰写深度长文..." : article ? "🔄 重新生成长文" : "✨ 生成「读完就够」深度长文"}
+          </button>
+          {article && (
+            <button
+              onClick={handleCopy}
+              className="px-3 py-2 text-xs font-medium rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
+            >
+              {copied ? "✓ 已复制" : "📋 复制 Markdown"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <div className="p-4 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-sm text-red-600 dark:text-red-400">
+          {error}
+        </div>
+      )}
+
+      {article ? (
+        <article className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-6 sm:p-8">
+          <header className="border-b border-zinc-100 dark:border-zinc-800 pb-4 mb-6">
+            <h2 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100 leading-snug">
+              {article.title}
+            </h2>
+            <div className="flex items-center gap-3 mt-2 text-xs text-zinc-400 flex-wrap">
+              <span>📖 独立深度长文（Read-and-Done）</span>
+              {article.focus && <span>· 🎯 侧重：{article.focus}</span>}
+              {canSeek && <span>· 💡 点击文中 `[MM:SS]` 时间戳可直接跳转音视频进度</span>}
+            </div>
+          </header>
+
+          <div className="prose prose-zinc dark:prose-invert max-w-none prose-headings:mt-6 prose-headings:mb-3 prose-p:my-3 prose-p:leading-relaxed prose-blockquote:border-blue-500 prose-blockquote:bg-blue-50/40 dark:prose-blockquote:bg-blue-950/20 prose-blockquote:py-1 prose-blockquote:px-4 prose-blockquote:rounded-r-lg">
+            <TimestampMarkdown content={article.content} seekTo={seekTo} canSeek={canSeek} />
+          </div>
+        </article>
+      ) : (
+        !generating && (
+          <div className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-10 text-center space-y-3">
+            <div className="text-3xl">✍️</div>
+            <h3 className="text-base font-semibold text-zinc-800 dark:text-zinc-200">
+              将本集转化为「读完就够」的独立深度长文
+            </h3>
+            <p className="text-sm text-zinc-500 max-w-xl mx-auto leading-relaxed">
+              遵循具体画面开场、还原讲者思考推理链、1:1 保留核心案例细节、术语原词锚定、三段式原话金句与书影音延伸清单。生成后点击文中时间戳即可直达对应原片位置。
+            </p>
+          </div>
+        )
       )}
     </div>
   );
@@ -709,7 +931,7 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
                 {isExpanded && (
                   <div className="px-4 pb-4 border-t border-zinc-100 dark:border-zinc-800 pt-3">
                     <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-li:my-0.5 prose-blockquote:my-2 prose-table:my-3 prose-pre:my-2 prose-hr:my-4">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{dr.content}</ReactMarkdown>
+                      <TimestampMarkdown content={dr.content!} seekTo={seekTo} canSeek={canSeek} />
                     </div>
                   </div>
                 )}
@@ -878,7 +1100,7 @@ function ChatTab({ episodeId, episode }: { episodeId: string; episode: Episode }
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3210"}/api/episodes/${episodeId}/chat`, { credentials: "include" })
+    fetch(`/api/episodes/${episodeId}/chat`, { credentials: "include" })
       .then((r) => r.json()).then((d) => setMessages(d.messages || [])).catch(() => {}).finally(() => setLoadingHistory(false));
   }, [episodeId]);
 

@@ -106,6 +106,9 @@ export interface Article {
   title: string;
   content: string;
   format?: string;
+  lang?: string;
+  focus?: string;
+  generatedAt?: string;
 }
 
 export interface Transcript {

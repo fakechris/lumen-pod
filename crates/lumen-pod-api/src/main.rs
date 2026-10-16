@@ -152,6 +152,10 @@ async fn run_server(database_url: &str) {
             axum::routing::post(chapter_deep_read),
         )
         .route(
+            "/api/episodes/{id}/article",
+            axum::routing::post(episode_article),
+        )
+        .route(
             "/api/episodes/{id}/deep-read-all",
             axum::routing::post(batch_deep_read_start)
                 .get(batch_deep_read_status)
@@ -805,6 +809,30 @@ fn build_chat_system_prompt(ep: &lumen_pod_core::episode::Episode) -> String {
     )
 }
 
+// ---- UTF-8 Safe Truncation & Prompt Helpers ----
+
+/// Safely truncate a UTF-8 string to at most `max_chars` Unicode scalar values (`char`s).
+/// Never panics on multi-byte characters (CJK, emoji, etc.).
+fn truncate_utf8_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
+fn lang_instruction_for(lang: &str) -> String {
+    match lang {
+        "zh" => "You MUST write the entire response in Simplified Chinese (简体中文). All headings, narrative, and analysis must be in Chinese (except original quotes and pinned foreign terms in parentheses).".into(),
+        "en" => "Write the entire response in English.".into(),
+        "ja" => "日本語で書いてください。見出し、分析、テキストのすべてを日本語で記述してください。".into(),
+        "ko" => "전체 응답을 한국어로 작성하세요.".into(),
+        "es" => "Escribe toda la respuesta en español.".into(),
+        "fr" => "Rédigez l'intégralité de la réponse en français.".into(),
+        "de" => "Schreiben Sie die gesamte Antwort auf Deutsch.".into(),
+        other => format!("You MUST write the entire response in {other}."),
+    }
+}
+
 // ---- Chapter Deep Read ----
 
 #[derive(Deserialize)]
@@ -814,23 +842,22 @@ struct DeepReadParams {
 }
 
 fn deep_read_system_prompt(lang: &str) -> String {
-    let lang_instruction = match lang {
-        "zh" => "You MUST write the entire response in Chinese (简体中文). All headings, analysis, and text must be in Chinese.",
-        "en" => "Write the entire response in English.",
-        "ja" => "日本語で書いてください。見出し、分析、テキストのすべてを日本語で記述してください。",
-        "ko" => "전체 응답을 한국어로 작성하세요.",
-        "es" => "Escribe toda la respuesta en español.",
-        "fr" => "Rédigez l'intégralité de la réponse en français.",
-        "de" => "Schreiben Sie die gesamte Antwort auf Deutsch.",
-        other => return format!(
-            "You are an expert content analyst. Write detailed, polished deep-read articles about podcast/video chapters. \
-             Include key insights, context, and analysis. Write in a clear, engaging style. \
-             You MUST write the entire response in {other}."
-        ),
-    };
+    let lang_instruction = lang_instruction_for(lang);
     format!(
-        "You are an expert content analyst. Write detailed, polished deep-read articles about podcast/video chapters. \
-         Include key insights, context, and analysis. Write in a clear, engaging style.\n\n{lang_instruction}"
+        "You are a master long-form writer and content analyst inspired by the YouMind v54 'Read-and-Done' philosophy.\n\
+         Your goal is to turn a podcast/video chapter into a self-contained, deeply insightful section that is so clear and complete \
+         that the reader does NOT need to watch/listen to the original segment unless there is irreplaceable visual content.\n\n\
+         Follow these strict writing constraints:\n\
+         1. **Scene-First Opening**: NEVER start with 'In this chapter...' or 'The speaker discusses...'. Open directly with a concrete scene, tension, counter-intuitive data point, or vivid question from the segment.\n\
+         2. **Reasoning over Assertions**: Do not just list conclusions. Reconstruct the speaker's chain of reasoning (Why & How) — how they move from observation/problem to conclusion.\n\
+         3. **Preserve the Primary Case**: Keep the main example, experiment, or story in full narrative detail; never compress a concrete case study into a dry one-sentence bullet.\n\
+         4. **Term Pinning & ASR Correction**: Cross-check proper nouns against the episode title/description to fix ASR homophone errors. When a key concept or technical term appears for the first time, include the original term in parentheses, e.g. `认知负荷（Cognitive Load）`.\n\
+         5. **Tri-part Notable Quotes**: Include 1-2 of the most impactful verbatim quotes formatted as a three-part blockquote:\n\
+            > 「Translated quote in target language」\n\
+            > *\"Original verbatim quote\"*\n\
+            > —— Speaker Name `[MM:SS]`\n\
+         6. **High-Bar Visual Referrals**: Only if the speaker is demonstrating something that words cannot replace (e.g. live UI/code demo, physical experiment, complex chart), insert `🎬 [MM:SS 建议回看原片画面：reason]`. Otherwise, explain everything thoroughly in text.\n\n\
+         {lang_instruction}"
     )
 }
 
@@ -868,14 +895,17 @@ async fn chapter_deep_read(
     let system = deep_read_system_prompt(lang);
 
     let prompt = format!(
-        "Write a deep-read analysis of this chapter:\n\n\
-         Chapter: {}\nTime: {} — {}\nOriginal Summary: {}\n\n\
-         Transcript:\n{}",
+        "Write a self-contained deep-read analysis of this chapter:\n\n\
+         Episode Title: {}\nAuthor / Channel: {}\n\
+         Chapter: {}\nTime: [{} — {}]\nOriginal Summary: {}\n\n\
+         Transcript (with timestamps):\n{}",
+        ep.source.title,
+        ep.source.author,
         chapter.title,
         fmt_dur(chapter.start_time),
         fmt_dur(chapter.end_time),
         chapter.summary,
-        &transcript_excerpt[..transcript_excerpt.len().min(4000)]
+        truncate_utf8_chars(&transcript_excerpt, 16_000)
     );
 
     let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
@@ -894,6 +924,226 @@ async fn chapter_deep_read(
     }
 
     (StatusCode::OK, Json(serde_json::json!({"content": content, "cached": false}))).into_response()
+}
+
+// ---- Episode Long-Form Article (YouMind v54 Read-and-Done Style) ----
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ArticleParams {
+    lang: Option<String>,
+    focus: Option<String>,
+    regenerate: Option<bool>,
+}
+
+fn article_system_prompt(lang: &str, focus: Option<&str>) -> String {
+    let lang_instruction = lang_instruction_for(lang);
+    let focus_instruction = match focus.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(f) => format!(
+            "\nUSER FOCUS DIRECTIVE:\nThe reader specifically wants to focus on: \"{f}\". \
+             Give extra depth, examples, and analytical weight to this angle while preserving the overall structure.\n"
+        ),
+        None => String::new(),
+    };
+
+    format!(
+        "You are an elite long-form writer and knowledge curator modelled after the YouMind v54 'YouTube Video to Article' skill.\n\
+         Your mission is to transform a video/podcast transcript into a standalone, 'Read-and-Done' (读完就够) in-depth article.\n\
+         After reading your article, a reader should fully grasp the speaker's framework, reasoning process, concrete cases, and memorable quotes \
+         WITHOUT needing to watch the original video.\n\n\
+         You MUST strictly follow all 8 golden writing constraints:\n\
+         1. **Scene-First Hook (具体画面开场)**:\n\
+            - NEVER start with 'This video talks about...', 'In this podcast...', or a dry abstract.\n\
+            - Open immediately with a concrete scene, striking conflict, counter-intuitive statistic, or specific anecdote from the episode so the reader can judge within 200 words why this piece is worth reading.\n\
+         2. **Reasoning over Assertions (讲清观点背后的思考过程)**:\n\
+            - Do not reduce the content to bullet-point conclusions. Walk the reader through HOW and WHY the speaker arrives at each insight: what conventional wisdom they challenge, what intermediate steps they take, and what trade-offs they weigh.\n\
+         3. **1:1 Framework + Primary Case Preservation (1:1 保留讲者框架与主案例细节)**:\n\
+            - Mirror the speaker's logical progression using clear `##` section headings.\n\
+            - Under every major section, you MUST preserve the primary example, experiment, story, or dataset in full narrative detail. Never compress a core story into a single summary sentence.\n\
+         4. **Term Pinning & ASR Verification (专有名词核对与原词锚定)**:\n\
+            - Use the episode title, author, and description to correct ASR homophone typos in person names, company names, books, and technical terms.\n\
+            - When a key concept or technical term first appears, attach the original term in parentheses: `中文译名（Original Term）`.\n\
+         5. **Tri-part Notable Quotes (三段式高规格金句引用)**:\n\
+            - Weave 3–6 of the most powerful verbatim quotes into the article using this exact three-line blockquote format:\n\
+              > 「精炼传神的中文译文（或目标语言译文）」\n\
+              > *\"Exact original quote from the transcript\"*\n\
+              > —— Speaker Name `[MM:SS]`\n\
+            - If the source language and target language are the same, you may omit the duplicate line and keep the quote + `—— Speaker Name [MM:SS]`.\n\
+         6. **High-Bar Visual Referrals (高门槛的「回看原片画面」指针)**:\n\
+            - Only when words genuinely cannot replace the visual (e.g. live code/UI demo, physical experiment, complex chart walkthrough), insert `🎬 [MM:SS 建议回看原片画面：具体原因]`.\n\
+            - For all verbal arguments and stories, explain them completely in text.\n\
+         7. **Structured Post-Article Curations (结构化尾注：要点 + 书影音清单 + 延伸探索)**:\n\
+            At the end of the article, always include these three curated sections:\n\
+            - `## 💡 值得记住的核心认知` (Key Points Worth Remembering): 3–5 sharp cognitive takeaways.\n\
+            - `## 📚 视频提及的书影音与工具` (Mentioned Books, Papers, Media & Tools): A structured list of books, papers, films, products, tools, or notable figures mentioned in the episode with their original names and context (if none were mentioned, state so briefly).\n\
+            - `## 🧭 延伸探索建议` (Further Exploration): 2–3 genuinely relevant follow-up topics, search queries, or questions for active learning.\n\
+         8. **Clean Title**:\n\
+            - Start the response with a single `# Title` line that is compelling and faithful to the core thesis (avoid clickbait), followed by the article body.\n\
+         {focus_instruction}\n\
+         {lang_instruction}"
+    )
+}
+
+fn build_episode_article_context(ep: &lumen_pod_core::episode::Episode) -> String {
+    let mut ctx = String::new();
+    ctx.push_str(&format!("Episode Title: {}\n", ep.source.title));
+    ctx.push_str(&format!("Author / Channel: {}\n", ep.source.author));
+    if let Some(pod) = &ep.source.podcast_name {
+        ctx.push_str(&format!("Podcast / Show: {pod}\n"));
+    }
+    ctx.push_str(&format!("Duration: {}\n", fmt_dur(ep.source.duration)));
+    if let Some(desc) = &ep.source.description {
+        if !desc.trim().is_empty() {
+            ctx.push_str(&format!(
+                "Original Description / Show Notes:\n{}\n\n",
+                truncate_utf8_chars(desc, 4_000)
+            ));
+        }
+    }
+    if let Some(s) = &ep.summary {
+        ctx.push_str(&format!("Executive One-liner: {}\nAbstract: {}\n\n", s.one_liner, s.r#abstract));
+    }
+    if !ep.chapters.is_empty() {
+        ctx.push_str("Chapters Outline:\n");
+        for (i, ch) in ep.chapters.iter().enumerate() {
+            ctx.push_str(&format!(
+                "{}. [{} — {}] {}: {}\n",
+                i + 1,
+                fmt_dur(ch.start_time),
+                fmt_dur(ch.end_time),
+                ch.title,
+                ch.summary
+            ));
+        }
+        ctx.push('\n');
+    }
+
+    if let Some(t) = &ep.transcript {
+        ctx.push_str("Full Timestamped Transcript:\n");
+        let mut trans_buf = String::new();
+        for para in &t.paragraphs {
+            let start_sec = para
+                .sentences
+                .first()
+                .and_then(|s| s.words.first().map(|w| w.start))
+                .unwrap_or(0.0);
+            trans_buf.push_str(&format!("[{}] ", fmt_dur(start_sec)));
+            if let Some(speaker) = &para.speaker {
+                trans_buf.push_str(&format!("{speaker}: "));
+            }
+            for sent in &para.sentences {
+                trans_buf.push_str(&sent.text);
+                trans_buf.push(' ');
+            }
+            trans_buf.push('\n');
+        }
+        ctx.push_str(truncate_utf8_chars(&trans_buf, 60_000));
+    }
+
+    ctx
+}
+
+fn extract_markdown_title(markdown: &str, fallback_title: &str) -> (String, String) {
+    let trimmed = markdown.trim();
+    if let Some(rest) = trimmed.strip_prefix("# ") {
+        if let Some((first_line, body)) = rest.split_once('\n') {
+            let title = first_line.trim().to_string();
+            if !title.is_empty() {
+                return (title, body.trim_start().to_string());
+            }
+        }
+    }
+    (fallback_title.to_string(), trimmed.to_string())
+}
+
+async fn episode_article(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query_params): Query<ArticleParams>,
+    body_params: Option<Json<ArticleParams>>,
+) -> impl IntoResponse {
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+
+    let body = body_params.map(|b| b.0).unwrap_or_default();
+    let lang = body
+        .lang
+        .or(query_params.lang)
+        .unwrap_or_else(|| "zh".to_string());
+    let focus = body
+        .focus
+        .or(query_params.focus)
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty());
+    let regenerate = body.regenerate.or(query_params.regenerate).unwrap_or(false);
+
+    if !regenerate && focus.is_none() {
+        if let Some(existing) = &ep.article {
+            if !existing.content.trim().is_empty()
+                && existing.lang.as_deref().unwrap_or("zh") == lang
+            {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "article": existing,
+                        "cached": true
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let system = article_system_prompt(&lang, focus.as_deref());
+    let context = build_episode_article_context(&ep);
+    let user_prompt = format!(
+        "Write a complete, standalone 'Read-and-Done' long-form article for the following episode.\n\
+         Ensure timestamps like `[MM:SS]` are preserved on quotes and visual referrals so readers can jump directly to the audio/video player.\n\n\
+         {context}"
+    );
+
+    let messages = vec![serde_json::json!({"role": "user", "content": user_prompt})];
+    let raw_output = call_llm_anthropic(&state.llm, &system, &messages).await;
+
+    if raw_output.starts_with("LLM API error:")
+        || raw_output.starts_with("Failed to ")
+        || raw_output.starts_with("AI not configured")
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": raw_output })),
+        )
+            .into_response();
+    }
+
+    let (title, content) = extract_markdown_title(&raw_output, &ep.source.title);
+    let article = lumen_pod_core::episode::Article {
+        title,
+        content,
+        format: Some("markdown".to_string()),
+        lang: Some(lang),
+        focus,
+        generated_at: Some(chrono::Utc::now().to_rfc3339()),
+    };
+
+    let updates = serde_json::json!({
+        "article": serde_json::to_value(&article).unwrap_or_default()
+    });
+    if let Err(e) = state.store.update_episode(&id, &updates).await {
+        tracing::warn!(%id, error = %e, "failed to persist generated article");
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "article": article,
+            "cached": false
+        })),
+    )
+        .into_response()
 }
 
 // ---- Batch Deep Read ----
@@ -1016,14 +1266,17 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
         let transcript_excerpt = build_chapter_transcript(&ep, chapter);
 
         let prompt = format!(
-            "Write a deep-read analysis of this chapter:\n\n\
-             Chapter: {}\nTime: {} — {}\nOriginal Summary: {}\n\n\
-             Transcript:\n{}",
+            "Write a self-contained deep-read analysis of this chapter:\n\n\
+             Episode Title: {}\nAuthor / Channel: {}\n\
+             Chapter: {}\nTime: [{} — {}]\nOriginal Summary: {}\n\n\
+             Transcript (with timestamps):\n{}",
+            ep.source.title,
+            ep.source.author,
             chapter.title,
             fmt_dur(chapter.start_time),
             fmt_dur(chapter.end_time),
             chapter.summary,
-            &transcript_excerpt[..transcript_excerpt.len().min(4000)]
+            truncate_utf8_chars(&transcript_excerpt, 16_000)
         );
 
         let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
@@ -1094,8 +1347,9 @@ fn build_chapter_transcript(ep: &lumen_pod_core::episode::Episode, chapter: &lum
         let para_start = para.sentences.first().and_then(|s| s.words.first().map(|w| w.start)).unwrap_or(0.0);
         let para_end = para.sentences.last().and_then(|s| s.words.last().map(|w| w.end)).unwrap_or(0.0);
         if para_end >= chapter.start_time && para_start <= chapter.end_time {
+            text.push_str(&format!("[{}] ", fmt_dur(para_start)));
             if let Some(speaker) = &para.speaker {
-                text.push_str(&format!("[{speaker}] "));
+                text.push_str(&format!("{speaker}: "));
             }
             for sent in &para.sentences {
                 text.push_str(&sent.text);
@@ -1213,8 +1467,21 @@ fn build_markdown(ep: &lumen_pod_core::episode::Episode) -> String {
 
     if !ep.chapters.is_empty() {
         writeln!(md, "## Chapters\n").ok();
-        for ch in &ep.chapters { writeln!(md, "- **[{}]** {} — {}", fmt_dur(ch.start_time), ch.title, ch.summary).ok(); }
+        for ch in &ep.chapters {
+            writeln!(md, "- **[{}]** {} — {}", fmt_dur(ch.start_time), ch.title, ch.summary).ok();
+            if let Some(dr) = &ch.deep_read {
+                if !dr.trim().is_empty() {
+                    writeln!(md, "\n{}\n", dr.trim()).ok();
+                }
+            }
+        }
         writeln!(md).ok();
+    }
+
+    if let Some(art) = &ep.article {
+        if !art.content.trim().is_empty() {
+            writeln!(md, "## Article: {}\n\n{}\n", art.title, art.content.trim()).ok();
+        }
     }
 
     if !ep.keywords.is_empty() {
@@ -1292,7 +1559,19 @@ fn build_notion_export(ep: &lumen_pod_core::episode::Episode) -> String {
     }
     if !ep.chapters.is_empty() {
         writeln!(md, "## Chapters\n").ok();
-        for ch in &ep.chapters { writeln!(md, "### {} ({})\n{}\n", ch.title, fmt_dur(ch.start_time), ch.summary).ok(); }
+        for ch in &ep.chapters {
+            writeln!(md, "### {} ({})\n{}\n", ch.title, fmt_dur(ch.start_time), ch.summary).ok();
+            if let Some(dr) = &ch.deep_read {
+                if !dr.trim().is_empty() {
+                    writeln!(md, "{}\n", dr.trim()).ok();
+                }
+            }
+        }
+    }
+    if let Some(art) = &ep.article {
+        if !art.content.trim().is_empty() {
+            writeln!(md, "## In-Depth Article: {}\n\n{}\n", art.title, art.content.trim()).ok();
+        }
     }
     if let Some(mm) = &ep.mindmap { writeln!(md, "## Mind Map\n```\n{}\n```\n", mm.markdown).ok(); }
     if !ep.highlights.is_empty() {
@@ -1348,7 +1627,19 @@ fn build_obsidian_export(ep: &lumen_pod_core::episode::Episode) -> String {
     }
     if !ep.chapters.is_empty() {
         writeln!(md, "## Chapters\n").ok();
-        for ch in &ep.chapters { writeln!(md, "### {} `{}`\n{}\n", ch.title, fmt_dur(ch.start_time), ch.summary).ok(); }
+        for ch in &ep.chapters {
+            writeln!(md, "### {} `{}`\n{}\n", ch.title, fmt_dur(ch.start_time), ch.summary).ok();
+            if let Some(dr) = &ch.deep_read {
+                if !dr.trim().is_empty() {
+                    writeln!(md, "{}\n", dr.trim()).ok();
+                }
+            }
+        }
+    }
+    if let Some(art) = &ep.article {
+        if !art.content.trim().is_empty() {
+            writeln!(md, "## Article: {}\n\n{}\n", art.title, art.content.trim()).ok();
+        }
     }
     if let Some(mm) = &ep.mindmap { writeln!(md, "## Mind Map\n```markmap\n{}\n```\n", mm.markdown).ok(); }
     if !ep.highlights.is_empty() {
@@ -1435,4 +1726,54 @@ fn err_404() -> axum::response::Response {
 
 fn err_500(e: impl std::fmt::Display) -> axum::response::Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_utf8_chars_handles_multibyte_and_emoji_safely() {
+        let s = "认知负荷（Cognitive Load）🎬测试文本";
+        // Truncating right in the middle of Chinese / emoji characters must never panic
+        for max in 0..=s.chars().count() + 5 {
+            let truncated = truncate_utf8_chars(s, max);
+            assert!(truncated.chars().count() <= max);
+            assert!(s.starts_with(truncated));
+        }
+        assert_eq!(truncate_utf8_chars(s, 4), "认知负荷");
+    }
+
+    #[test]
+    fn test_extract_markdown_title() {
+        let md = "# 为什么 90% 的播客摘要都漏掉了真正的推理链？\n\n正文第一段从具体画面开始。";
+        let (title, body) = extract_markdown_title(md, "Fallback");
+        assert_eq!(title, "为什么 90% 的播客摘要都漏掉了真正的推理链？");
+        assert_eq!(body, "正文第一段从具体画面开始。");
+
+        let no_heading = "直接开始正文内容";
+        let (title2, body2) = extract_markdown_title(no_heading, "Fallback Title");
+        assert_eq!(title2, "Fallback Title");
+        assert_eq!(body2, "直接开始正文内容");
+    }
+
+    #[test]
+    fn test_youmind_v54_prompts_include_8_constraints() {
+        let article_prompt = article_system_prompt("zh", Some("Agent 架构设计"));
+        assert!(article_prompt.contains("Scene-First Hook"));
+        assert!(article_prompt.contains("Reasoning over Assertions"));
+        assert!(article_prompt.contains("1:1 Framework + Primary Case Preservation"));
+        assert!(article_prompt.contains("Term Pinning"));
+        assert!(article_prompt.contains("Tri-part Notable Quotes"));
+        assert!(article_prompt.contains("🎬"));
+        assert!(article_prompt.contains("值得记住的核心认知"));
+        assert!(article_prompt.contains("视频提及的书影音与工具"));
+        assert!(article_prompt.contains("延伸探索建议"));
+        assert!(article_prompt.contains("Agent 架构设计"));
+
+        let chapter_prompt = deep_read_system_prompt("zh");
+        assert!(chapter_prompt.contains("Scene-First Opening"));
+        assert!(chapter_prompt.contains("Reasoning over Assertions"));
+        assert!(chapter_prompt.contains("Tri-part Notable Quotes"));
+    }
 }

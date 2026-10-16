@@ -1,7 +1,7 @@
 import { getApiConfig } from "../config";
-import type { Episode } from "../types/messages";
+import type { Article, Episode } from "../types/messages";
 
-async function apiFetch<T>(path: string): Promise<T> {
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const { baseUrl, token } = await getApiConfig();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -9,7 +9,10 @@ async function apiFetch<T>(path: string): Promise<T> {
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
   }
-  const res = await fetch(`${baseUrl}${path}`, { headers });
+  const res = await fetch(`${baseUrl}${path}`, {
+    ...init,
+    headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
+  });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(body.error || `API error: ${res.status}`);
@@ -31,6 +34,30 @@ export async function lookupEpisodeByUrl(
 
 export async function getEpisode(id: string): Promise<Episode> {
   return apiFetch<Episode>(`/api/episodes/${id}`);
+}
+
+export async function submitEpisodeUrl(
+  url: string,
+  title?: string
+): Promise<{ id: string; url: string; status: string; message: string }> {
+  return apiFetch(`/api/episodes/submit-url`, {
+    method: "POST",
+    body: JSON.stringify({ url, title }),
+  });
+}
+
+export async function requestEpisodeArticle(
+  episodeId: string,
+  opts?: { lang?: string; focus?: string; regenerate?: boolean }
+): Promise<{ article: Article; cached?: boolean }> {
+  return apiFetch(`/api/episodes/${episodeId}/article`, {
+    method: "POST",
+    body: JSON.stringify({
+      lang: opts?.lang ?? "zh",
+      focus: opts?.focus || undefined,
+      regenerate: opts?.regenerate ?? false,
+    }),
+  });
 }
 
 export function formatDuration(seconds: number): string {

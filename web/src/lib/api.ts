@@ -1,4 +1,4 @@
-import type { Episode, User } from "./types";
+import type { Article, Episode, User } from "./types";
 
 // Client-side: use relative URLs — Caddy (prod) or Next.js rewrites (dev) proxy to API
 // Server-side: use env var for SSR fetch if needed
@@ -106,6 +106,22 @@ export async function requestChapterDeepRead(
   const qs = params.toString();
   return apiFetch(`/api/episodes/${episodeId}/chapters/${chapterIndex}/deep-read${qs ? `?${qs}` : ""}`, {
     method: "POST",
+  });
+}
+
+// ---- Episode Article (YouMind v54 Read-and-Done Long-Form Article) ----
+
+export async function requestEpisodeArticle(
+  episodeId: string,
+  opts?: { lang?: string; focus?: string; regenerate?: boolean }
+): Promise<{ article: Article; cached?: boolean }> {
+  return apiFetch(`/api/episodes/${episodeId}/article`, {
+    method: "POST",
+    body: JSON.stringify({
+      lang: opts?.lang ?? "zh",
+      focus: opts?.focus || undefined,
+      regenerate: opts?.regenerate ?? false,
+    }),
   });
 }
 

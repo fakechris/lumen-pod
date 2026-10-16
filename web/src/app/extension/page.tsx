@@ -1,7 +1,5 @@
 "use client";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3210";
-
 export default function ExtensionPage() {
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -27,7 +25,7 @@ export default function ExtensionPage() {
             Lumen Pod Chrome Extension
           </h2>
           <p className="text-zinc-500 dark:text-zinc-400 max-w-md mx-auto">
-            在 YouTube 页面直接查看 AI 生成的播客/视频摘要、章节、字幕和深度解读
+            在 YouTube 页面直接查看「读完就够」深度长文、智能章节、实时字幕和深度解读
           </p>
         </div>
 
@@ -36,10 +34,10 @@ export default function ExtensionPage() {
           <div className="flex items-center justify-between mb-4">
             <div>
               <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">下载扩展</h3>
-              <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-0.5">当前版本 v0.1.0 · Chrome / Edge / Arc</p>
+              <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-0.5">当前版本 v0.2.0 · Chrome / Edge / Arc（含深度长文与一键提交）</p>
             </div>
             <a
-              href={`${API_BASE}/static/lumen-pod-extension-v0.1.0.zip`}
+              href="/static/lumen-pod-extension-v0.2.0.zip"
               download
               className="inline-flex items-center gap-2 px-5 py-2.5 bg-blue-500 hover:bg-blue-600 text-white font-medium rounded-lg transition-colors shadow-sm"
             >
@@ -98,12 +96,12 @@ export default function ExtensionPage() {
         <div className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-6">
           <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 mb-4">功能特性</h3>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <Feature icon="📝" title="AI 摘要" desc="一句话总结 + 核心要点 + 术语表" />
+            <Feature icon="✍️" title="「读完就够」深度长文" desc="具体画面开场、还原推理链、三段式金句与书影音延伸清单" />
+            <Feature icon="⏱️" title="内联时间戳跳转" desc="点击文章与精读中的 [MM:SS] 时间戳直接跳转视频对应画面" />
+            <Feature icon="📝" title="AI 摘要与一键提交" desc="未收录视频支持在侧边栏一键提交至 Lumen Pod 队列" />
             <Feature icon="📑" title="智能章节" desc="章节导航、摘要、深度解读展开阅读" />
             <Feature icon="💬" title="实时字幕" desc="逐句高亮跟踪、点击跳转、多说话人标识" />
-            <Feature icon="❓" title="问答" desc="AI 生成的常见问答" />
-            <Feature icon="🔄" title="YouTube 同步" desc="实时同步视频播放进度" />
-            <Feature icon="🌙" title="暗色模式" desc="跟随系统自动切换" />
+            <Feature icon="❓" title="问答与暗色模式" desc="AI 问答提炼，跟随系统自动切换明暗主题" />
           </div>
         </div>
       </main>

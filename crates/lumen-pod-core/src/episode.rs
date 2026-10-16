@@ -209,16 +209,25 @@ pub struct Highlight {
     pub created_at: DateTime<Utc>,
 }
 
-// ---- Article — generated long-form article (BibiGPT 图文改写) ----
+// ---- Article — generated long-form article (YouMind v54 Read-and-Done style / BibiGPT 图文改写) ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Article {
     pub title: String,
     pub content: String,
-    /// Article format: "blog", "newsletter", "xiaohongshu", "wechat".
+    /// Article format: "markdown", "blog", "newsletter", "xiaohongshu", "wechat".
     #[serde(default)]
     pub format: Option<String>,
+    /// Target language code used when generating the article (e.g. "zh", "en").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    /// Optional user-specified focus / angle for the article.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    /// ISO-8601 timestamp when the article was generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
 }
 
 // ---- Collections — group episodes by topic/playlist ----

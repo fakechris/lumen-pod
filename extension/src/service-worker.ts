@@ -1,5 +1,5 @@
 import { extractVideoId, isYouTubeVideoUrl, buildYouTubeUrl } from "./utils/youtube";
-import { lookupEpisodeByUrl } from "./utils/api";
+import { lookupEpisodeByUrl, getEpisode } from "./utils/api";
 import type { Episode } from "./types/messages";
 
 // Cache of looked-up episodes by videoId
@@ -30,6 +30,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ type: "ERROR", error: String(err) })
       );
     return true;
+  }
+
+  if (message.type === "OPEN_SIDE_PANEL") {
+    const tabId = sender.tab?.id;
+    if (tabId !== undefined) {
+      void chrome.sidePanel.open({ tabId });
+    }
+    return false;
   }
 
   if (message.type === "TAB_URL_CHANGED") {
