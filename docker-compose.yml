@@ -41,7 +41,7 @@ services:
       LLM_MODEL: ${LLM_MODEL:-MiniMax-M3.1-Flash-Preview}
       AUDIO_DIR: /data/audio
       STATIC_DIR: /data/static
-      RUST_LOG: lumen_pod_api=info,tower_http=info
+      RUST_LOG: lumen_pod_server=info,lumen_pod_api=info,tower_http=info
     volumes:
       - audiodata:/data/audio
       - staticdata:/data/static

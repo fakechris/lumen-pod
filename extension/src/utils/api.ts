@@ -71,7 +71,7 @@ export async function requestEpisodeArticle(
     return { article: startRes.article, cached: startRes.cached };
   }
 
-  const maxPolls = 600; // up to 30 minutes (3s interval) for 2-4 hour episodes
+  const maxPolls = 1800; // up to 90 minutes (3s interval) for 3-4 hour episodes
   let consecutiveNetErrors = 0;
   for (let i = 0; i < maxPolls; i++) {
     await new Promise((r) => setTimeout(r, 3000));

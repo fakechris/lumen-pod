@@ -128,10 +128,10 @@ Generate a complete, standalone long-form article so thorough that the reader do
 ```
 
 **8 Golden Constraints for `article.content`**:
-1. **Scene-First Hook (具体画面开场)**: Never open with "This video talks about..." or "In this podcast...". Start directly with a concrete scene, conflict, counter-intuitive statistic, or specific story from the episode so the reader can judge within 200 words why it is worth reading.
+1. **Scene-First Hook (具体画面开场)**: Never open with "This video talks about..." or "In this podcast...". Start directly with a concrete scene, conflict, counter-intuitive statistic, or specific story from the episode so the reader can judge within 200 words why it is worth reading. Stay 100% faithful to the exact facts and mechanics in the transcript (e.g. if a speaker plays a pre-recorded demo video during a live session for privacy reasons, never say they "stopped recording").
 2. **Reasoning over Assertions (重推理轻结论)**: Do not just list conclusions. Reconstruct HOW and WHY the speaker arrives at each insight — what conventional wisdom they challenge and how they deduce the conclusion.
 3. **1:1 Framework + Primary Case Preservation (1:1 保留讲者框架与主案例细节)**: Mirror the speaker's logical structure using `##` headings. Under every major branch, preserve the primary example, experiment, or dataset in full narrative detail — never compress a core story into one sentence.
-4. **Term Pinning & ASR Correction (专有名词核对与原词锚定)**: Fix ASR homophone errors using metadata. When a key concept or technical term first appears, include the original term in parentheses: `认知负荷（Cognitive Load）`.
+4. **Term Pinning & ASR Correction (专有名词核对与原词锚定)**: Fix ASR homophone errors using metadata. Keep product names, brand names, company names, and internal system names (e.g. `Cortex`, `Slite`, `Notion`, `Linear`, `dbt`, `GBrain`) in their original form directly — NEVER append literal dictionary translations in parentheses to product/brand names (e.g. write `Cortex` directly, NEVER `Cortex（皮层）`). Only attach `中文译名（Original Term）` for domain concepts, methodologies, or technical terms when they first appear: `认知负荷（Cognitive Load）`.
 5. **Tri-part Notable Quotes (三段式高规格金句引用)**: Include 3–6 verbatim quotes formatted as a three-line blockquote (use the exact sentence-level timestamp `[MM:SS]` or `[H:MM:SS]`, NOT the paragraph opening timestamp):
    > 「精炼传神的中文译文」
    > *"Exact original wording from the speaker"*

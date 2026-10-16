@@ -323,6 +323,7 @@ pub struct AppState {
     pub audio_dir: String,
     pub batch_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::BatchDeepReadTask>>>,
     pub article_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, ArticleGenStatus>>>,
+    pub chapter_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, ArticleGenStatus>>>,
 }
 
 pub async fn google_login(State(state): State<AppState>) -> impl IntoResponse {

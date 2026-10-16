@@ -40,7 +40,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "lumen_pod_api=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "lumen_pod_server=info,lumen_pod_api=info,tower_http=info".into()),
         )
         .init();
 
@@ -96,6 +96,7 @@ async fn run_server(database_url: &str) {
         audio_dir,
         batch_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         article_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        chapter_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     use axum::http::Method;
@@ -150,7 +151,7 @@ async fn run_server(database_url: &str) {
         )
         .route(
             "/api/episodes/{id}/chapters/{idx}/deep-read",
-            axum::routing::post(chapter_deep_read),
+            axum::routing::post(chapter_deep_read).get(chapter_deep_read_status),
         )
         .route(
             "/api/episodes/{id}/article",
@@ -225,8 +226,8 @@ impl BatchDeepReadTask {
     fn is_stale(&self) -> bool {
         let now = epoch_ms();
         let hb = self.last_heartbeat.load(Ordering::Relaxed);
-        // Stale if no heartbeat for 5 minutes
-        now.saturating_sub(hb) > 5 * 60 * 1000
+        // Stale if no heartbeat for 15 minutes
+        now.saturating_sub(hb) > 15 * 60 * 1000
     }
 
     fn is_done(&self) -> bool {
@@ -427,9 +428,10 @@ fn extract_llm_text_from_sse_or_json(body: &str) -> Result<String, String> {
     }
 }
 
-const ARTICLE_TASK_TIMEOUT_MS: u64 = 2_400_000; // 40 minutes for 2-4 hour long-form episodes
-const LLM_STREAM_TOTAL_TIMEOUT_SECS: u64 = 2_400; // 40 minutes wall-clock cap
-const LLM_STREAM_CHUNK_IDLE_TIMEOUT_SECS: u64 = 180; // 3 minutes max silence between SSE chunks
+const ARTICLE_TASK_TIMEOUT_MS: u64 = 5_400_000; // 90 minutes for 3-4 hour long-form episodes
+const CHAPTER_TASK_TIMEOUT_MS: u64 = 1_200_000; // 20 minutes per chapter deep-read
+const LLM_STREAM_TOTAL_TIMEOUT_SECS: u64 = 5_400; // 90 minutes wall-clock cap
+const LLM_STREAM_CHUNK_IDLE_TIMEOUT_SECS: u64 = 240; // 4 minutes max silence between SSE chunks
 
 /// Call LLM using the Anthropic Messages API format with `stream: true` and an explicit `max_tokens` budget.
 /// Uses per-chunk idle timeout (`LLM_STREAM_CHUNK_IDLE_TIMEOUT_SECS`) so 2-4 hour podcast generations
@@ -1246,10 +1248,13 @@ fn lang_instruction_for(lang: &str) -> String {
 
 // ---- Chapter Deep Read ----
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 struct DeepReadParams {
     lang: Option<String>,
     regenerate: Option<bool>,
+    #[serde(rename = "async")]
+    async_mode: Option<bool>,
 }
 
 fn deep_read_system_prompt(lang: &str) -> String {
@@ -1259,10 +1264,10 @@ fn deep_read_system_prompt(lang: &str) -> String {
          Your goal is to turn a podcast/video chapter into a self-contained, deeply insightful section that is so clear and complete \
          that the reader does NOT need to watch/listen to the original segment unless there is irreplaceable visual content.\n\n\
          Follow these strict writing constraints:\n\
-         1. **Scene-First Opening**: NEVER start with 'In this chapter...' or 'The speaker discusses...'. Open directly with a concrete scene, tension, counter-intuitive data point, or vivid question from the segment.\n\
+         1. **Scene-First Opening**: NEVER start with 'In this chapter...' or 'The speaker discusses...'. Open directly with a concrete scene, tension, counter-intuitive data point, or vivid question from the segment. Stay 100% faithful to the exact facts and mechanics in the transcript (e.g. if a speaker plays a pre-recorded demo video during a live session for privacy reasons, never say they 'stopped recording').\n\
          2. **Reasoning over Assertions**: Do not just list conclusions. Reconstruct the speaker's chain of reasoning (Why & How) — how they move from observation/problem to conclusion.\n\
          3. **Preserve the Primary Case**: Keep the main example, experiment, or story in full narrative detail; never compress a concrete case study into a dry one-sentence bullet.\n\
-         4. **Term Pinning & ASR Correction**: Cross-check proper nouns against the episode title/description to fix ASR homophone errors. When a key concept or technical term appears for the first time, include the original term in parentheses, e.g. `认知负荷（Cognitive Load）`.\n\
+         4. **Term Pinning & ASR Correction**: Cross-check proper nouns against the episode title/description to fix ASR homophone errors. Keep product names, brand names, company names, and internal system names (e.g. `Cortex`, `Slite`, `Notion`, `Linear`, `dbt`, `GBrain`) in their original form directly — NEVER append literal dictionary translations in parentheses to product/brand names (e.g. write `Cortex`, NEVER `Cortex（皮层）`). Only attach `中文译名（Original Term）` for domain concepts, methodologies, or technical terms when they first appear, e.g. `认知负荷（Cognitive Load）`.\n\
          5. **Tri-part Notable Quotes**: Include 1-2 of the most impactful verbatim quotes formatted as a three-part blockquote. Use the exact sentence-level timestamp placed immediately before that quote in the transcript:\n\
             > 「Translated quote in target language」\n\
             > *\"Original verbatim quote\"*\n\
@@ -1279,7 +1284,8 @@ async fn chapter_deep_read(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path((id, idx)): Path<(String, usize)>,
-    Query(params): Query<DeepReadParams>,
+    Query(query_params): Query<DeepReadParams>,
+    body_params: Option<Json<DeepReadParams>>,
 ) -> impl IntoResponse {
     let viewer = match auth::resolve_viewer(&state, &headers).await {
         Ok(v) => v,
@@ -1302,22 +1308,53 @@ async fn chapter_deep_read(
             .into_response();
     }
 
+    let body = body_params.map(|b| b.0).unwrap_or_default();
+    let lang = body
+        .lang
+        .or(query_params.lang)
+        .unwrap_or_else(|| "zh".to_string());
+    let regenerate = body.regenerate.or(query_params.regenerate).unwrap_or(false);
+    let async_mode = body.async_mode.or(query_params.async_mode).unwrap_or(false);
+
     let chapter = &ep.chapters[idx];
-    let regenerate = params.regenerate.unwrap_or(false);
 
     // Return cached deep read if exists, is non-empty/valid, and not regenerating
     if !regenerate {
         if let Some(cached) = &chapter.deep_read {
             let trimmed = cached.trim();
             if !trimmed.is_empty() && trimmed != "No response from AI" {
-                return (StatusCode::OK, Json(serde_json::json!({"content": cached, "cached": true}))).into_response();
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "complete",
+                        "content": cached,
+                        "cached": true
+                    })),
+                )
+                    .into_response();
             }
         }
     }
 
-    let lang = params.lang.as_deref().unwrap_or("zh");
+    let task_key = format!("{id}:{idx}");
+    {
+        let tasks = state.chapter_tasks.lock().unwrap();
+        if let Some(t) = tasks.get(&task_key) {
+            if t.status == "running" && epoch_ms().saturating_sub(t.started_at_ms) < CHAPTER_TASK_TIMEOUT_MS {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "running",
+                        "elapsedMs": epoch_ms().saturating_sub(t.started_at_ms)
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let transcript_excerpt = build_chapter_transcript(&ep, chapter);
-    let system = deep_read_system_prompt(lang);
+    let system = deep_read_system_prompt(&lang);
 
     let prompt = format!(
         "Write a self-contained deep-read analysis of this chapter:\n\n\
@@ -1333,31 +1370,170 @@ async fn chapter_deep_read(
         truncate_utf8_chars(&transcript_excerpt, 24_000)
     );
 
-    let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-    let content = match call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 16_384).await {
-        Ok(c) => c,
-        Err(err) => {
+    let now_ms = epoch_ms();
+    {
+        let mut tasks = state.chapter_tasks.lock().unwrap();
+        tasks.insert(
+            task_key.clone(),
+            auth::ArticleGenStatus {
+                status: "running".to_string(),
+                error: None,
+                started_at_ms: now_ms,
+            },
+        );
+    }
+
+    // Always run LLM + DB persistence in a detached task so Cloudflare/client disconnects
+    // (e.g. HTTP 524 at 125s) never cancel the generation or lose the persisted result.
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let state_clone = state.clone();
+    let id_clone = id.clone();
+    let task_key_clone = task_key.clone();
+    tokio::spawn(async move {
+        let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
+        match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 16_384).await {
+            Ok(content) => {
+                // Re-fetch latest episode before updating chapters so concurrent chapter updates never overwrite each other
+                if let Ok(latest_ep) = state_clone.store.get_episode(&id_clone).await {
+                    let mut chapters_val = serde_json::to_value(&latest_ep.chapters).unwrap_or_default();
+                    if let Some(arr) = chapters_val.as_array_mut() {
+                        if let Some(ch) = arr.get_mut(idx) {
+                            ch["deepRead"] = serde_json::Value::String(content.clone());
+                        }
+                    }
+                    let updates = serde_json::json!({"chapters": chapters_val});
+                    if let Err(e) = state_clone.store.update_episode(&id_clone, &updates).await {
+                        tracing::warn!(id = %id_clone, idx, error = %e, "failed to persist deep read");
+                    }
+                }
+                let mut tasks = state_clone.chapter_tasks.lock().unwrap();
+                tasks.remove(&task_key_clone);
+                let _ = tx.send(Ok(content));
+            }
+            Err(err) => {
+                tracing::error!(id = %id_clone, idx, error = %err, "chapter deep read generation failed");
+                let mut tasks = state_clone.chapter_tasks.lock().unwrap();
+                tasks.insert(
+                    task_key_clone,
+                    auth::ArticleGenStatus {
+                        status: "error".to_string(),
+                        error: Some(err.clone()),
+                        started_at_ms: now_ms,
+                    },
+                );
+                let _ = tx.send(Err(err));
+            }
+        }
+    });
+
+    if async_mode {
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "running",
+                "elapsedMs": 0
+            })),
+        )
+            .into_response();
+    }
+
+    match rx.await {
+        Ok(Ok(content)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "complete",
+                "content": content,
+                "cached": false
+            })),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "Chapter deep-read task cancelled unexpectedly" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn chapter_deep_read_status(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((id, idx)): Path<(String, usize)>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
+    if idx >= ep.chapters.len() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "chapter index out of range"})),
+        )
+            .into_response();
+    }
+
+    let task_key = format!("{id}:{idx}");
+    {
+        let tasks = state.chapter_tasks.lock().unwrap();
+        if let Some(t) = tasks.get(&task_key) {
+            if t.status == "running" && epoch_ms().saturating_sub(t.started_at_ms) < CHAPTER_TASK_TIMEOUT_MS {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "running",
+                        "elapsedMs": epoch_ms().saturating_sub(t.started_at_ms)
+                    })),
+                )
+                    .into_response();
+            }
+            if t.status == "error" {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "error": t.error
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Some(cached) = &ep.chapters[idx].deep_read {
+        let trimmed = cached.trim();
+        if !trimmed.is_empty() && trimmed != "No response from AI" {
             return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": err })),
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "complete",
+                    "content": cached,
+                    "cached": false
+                })),
             )
                 .into_response();
         }
-    };
-
-    // Persist deep read into the chapter
-    let mut chapters_val = serde_json::to_value(&ep.chapters).unwrap_or_default();
-    if let Some(arr) = chapters_val.as_array_mut() {
-        if let Some(ch) = arr.get_mut(idx) {
-            ch["deepRead"] = serde_json::Value::String(content.clone());
-        }
-    }
-    let updates = serde_json::json!({"chapters": chapters_val});
-    if let Err(e) = state.store.update_episode(&id, &updates).await {
-        tracing::warn!(%id, idx, error = %e, "failed to persist deep read");
     }
 
-    (StatusCode::OK, Json(serde_json::json!({"content": content, "cached": false}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "idle"
+        })),
+    )
+        .into_response()
 }
 
 // ---- Episode Long-Form Article (YouMind v54 Read-and-Done Style) ----
@@ -1391,6 +1567,7 @@ fn article_system_prompt(lang: &str, focus: Option<&str>) -> String {
          1. **Scene-First Hook (具体画面开场)**:\n\
             - NEVER start with 'This video talks about...', 'In this podcast...', or a dry abstract.\n\
             - Open immediately with a concrete scene, striking conflict, counter-intuitive statistic, or specific anecdote from the episode so the reader can judge within 200 words why this piece is worth reading.\n\
+            - Stay 100% faithful to the exact facts and mechanics in the transcript (e.g. if a speaker plays a pre-recorded demo video during a live session for privacy reasons, never say they 'stopped recording').\n\
          2. **Reasoning over Assertions (讲清观点背后的思考过程)**:\n\
             - Do not reduce the content to bullet-point conclusions. Walk the reader through HOW and WHY the speaker arrives at each insight: what conventional wisdom they challenge, what intermediate steps they take, and what trade-offs they weigh.\n\
          3. **1:1 Framework + Primary Case Preservation (1:1 保留讲者框架与主案例细节)**:\n\
@@ -1398,7 +1575,8 @@ fn article_system_prompt(lang: &str, focus: Option<&str>) -> String {
             - Under every major section, you MUST preserve the primary example, experiment, story, or dataset in full narrative detail. Never compress a core story into a single summary sentence.\n\
          4. **Term Pinning & ASR Verification (专有名词核对与原词锚定)**:\n\
             - Use the episode title, author, and description to correct ASR homophone typos in person names, company names, books, and technical terms.\n\
-            - When a key concept or technical term first appears, attach the original term in parentheses: `中文译名（Original Term）`.\n\
+            - Keep product names, brand names, company names, and internal system names (e.g. `Cortex`, `Slite`, `Notion`, `Linear`, `dbt`, `GBrain`) in their original form directly — **NEVER** append literal dictionary translations in parentheses to product/brand names (e.g. write `Cortex` directly, NEVER `Cortex（皮层）`).\n\
+            - Only attach `中文译名（Original Term）` for domain concepts, methodologies, or technical terms when they first appear, e.g. `上下文图谱（Context Graph）`.\n\
          5. **Tri-part Notable Quotes (三段式高规格金句引用)**:\n\
             - Weave 3–6 of the most powerful verbatim quotes into the article using this exact three-line blockquote format (use the exact sentence-level timestamp placed immediately before that quoted sentence in the transcript, NOT the paragraph-start timestamp):\n\
               > 「精炼传神的中文译文（或目标语言译文）」\n\
@@ -1594,61 +1772,65 @@ async fn episode_article(
          {context}"
     );
 
-    if async_mode {
-        let now_ms = epoch_ms();
-        {
-            let mut tasks = state.article_tasks.lock().unwrap();
-            tasks.insert(
-                id.clone(),
-                auth::ArticleGenStatus {
-                    status: "running".to_string(),
-                    error: None,
-                    started_at_ms: now_ms,
-                },
-            );
-        }
+    let now_ms = epoch_ms();
+    {
+        let mut tasks = state.article_tasks.lock().unwrap();
+        tasks.insert(
+            id.clone(),
+            auth::ArticleGenStatus {
+                status: "running".to_string(),
+                error: None,
+                started_at_ms: now_ms,
+            },
+        );
+    }
 
-        let state_clone = state.clone();
-        let id_clone = id.clone();
-        let fallback_title = ep.source.title.clone();
-        tokio::spawn(async move {
-            let messages = vec![serde_json::json!({"role": "user", "content": user_prompt})];
-            match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 64_000).await
-            {
-                Ok(raw_output) => {
-                    let (title, content) = extract_markdown_title(&raw_output, &fallback_title);
-                    let article = lumen_pod_core::episode::Article {
-                        title,
-                        content,
-                        format: Some("markdown".to_string()),
-                        lang: Some(lang),
-                        focus,
-                        generated_at: Some(chrono::Utc::now().to_rfc3339()),
-                    };
-                    let updates = serde_json::json!({
-                        "article": serde_json::to_value(&article).unwrap_or_default()
-                    });
-                    if let Err(e) = state_clone.store.update_episode(&id_clone, &updates).await {
-                        tracing::warn!(id = %id_clone, error = %e, "failed to persist generated article");
-                    }
-                    let mut tasks = state_clone.article_tasks.lock().unwrap();
-                    tasks.remove(&id_clone);
+    // Always run LLM + DB persistence in a detached task so Cloudflare/client disconnects
+    // never cancel the generation or lose the persisted article.
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<lumen_pod_core::episode::Article, String>>();
+    let state_clone = state.clone();
+    let id_clone = id.clone();
+    let fallback_title = ep.source.title.clone();
+    tokio::spawn(async move {
+        let messages = vec![serde_json::json!({"role": "user", "content": user_prompt})];
+        match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 40_960).await {
+            Ok(raw_output) => {
+                let (title, content) = extract_markdown_title(&raw_output, &fallback_title);
+                let article = lumen_pod_core::episode::Article {
+                    title,
+                    content,
+                    format: Some("markdown".to_string()),
+                    lang: Some(lang),
+                    focus,
+                    generated_at: Some(chrono::Utc::now().to_rfc3339()),
+                };
+                let updates = serde_json::json!({
+                    "article": serde_json::to_value(&article).unwrap_or_default()
+                });
+                if let Err(e) = state_clone.store.update_episode(&id_clone, &updates).await {
+                    tracing::warn!(id = %id_clone, error = %e, "failed to persist generated article");
                 }
-                Err(err) => {
-                    tracing::error!(id = %id_clone, error = %err, "async article generation failed");
-                    let mut tasks = state_clone.article_tasks.lock().unwrap();
-                    tasks.insert(
-                        id_clone,
-                        auth::ArticleGenStatus {
-                            status: "error".to_string(),
-                            error: Some(err),
-                            started_at_ms: now_ms,
-                        },
-                    );
-                }
+                let mut tasks = state_clone.article_tasks.lock().unwrap();
+                tasks.remove(&id_clone);
+                let _ = tx.send(Ok(article));
             }
-        });
+            Err(err) => {
+                tracing::error!(id = %id_clone, error = %err, "article generation failed");
+                let mut tasks = state_clone.article_tasks.lock().unwrap();
+                tasks.insert(
+                    id_clone,
+                    auth::ArticleGenStatus {
+                        status: "error".to_string(),
+                        error: Some(err.clone()),
+                        started_at_ms: now_ms,
+                    },
+                );
+                let _ = tx.send(Err(err));
+            }
+        }
+    });
 
+    if async_mode {
         return (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
@@ -1659,45 +1841,27 @@ async fn episode_article(
             .into_response();
     }
 
-    let messages = vec![serde_json::json!({"role": "user", "content": user_prompt})];
-    // Use 64,000 max_tokens so reasoning models (e.g. MiniMax-M3.1) have ample budget for both thinking and 2-4h long-form article output
-    let raw_output = match call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 64_000).await {
-        Ok(text) => text,
-        Err(err) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": err })),
-            )
-                .into_response();
-        }
-    };
-
-    let (title, content) = extract_markdown_title(&raw_output, &ep.source.title);
-    let article = lumen_pod_core::episode::Article {
-        title,
-        content,
-        format: Some("markdown".to_string()),
-        lang: Some(lang),
-        focus,
-        generated_at: Some(chrono::Utc::now().to_rfc3339()),
-    };
-
-    let updates = serde_json::json!({
-        "article": serde_json::to_value(&article).unwrap_or_default()
-    });
-    if let Err(e) = state.store.update_episode(&id, &updates).await {
-        tracing::warn!(%id, error = %e, "failed to persist generated article");
+    match rx.await {
+        Ok(Ok(article)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "complete",
+                "article": article,
+                "cached": false
+            })),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "Article generation task cancelled unexpectedly" })),
+        )
+            .into_response(),
     }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "complete",
-            "article": article,
-            "cached": false
-        })),
-    )
-        .into_response()
 }
 
 async fn episode_article_status(
@@ -1910,16 +2074,17 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
 
         let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
 
-        // Timeout: 3 minutes per chapter
+        // Timeout: 10 minutes per chapter
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(180),
+            std::time::Duration::from_secs(600),
             call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 16_384),
         ).await;
 
         let is_ok = match result {
             Ok(Ok(content)) => {
-                // Persist
-                let mut chapters_val = serde_json::to_value(&ep.chapters).unwrap_or_default();
+                // Re-fetch latest episode before persisting so concurrent updates are never overwritten
+                let base_ep = state.store.get_episode(&episode_id).await.unwrap_or(ep);
+                let mut chapters_val = serde_json::to_value(&base_ep.chapters).unwrap_or_default();
                 if let Some(arr) = chapters_val.as_array_mut() {
                     if let Some(ch) = arr.get_mut(idx) {
                         ch["deepRead"] = serde_json::Value::String(content);
@@ -1933,7 +2098,7 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
                 false
             }
             Err(_timeout) => {
-                tracing::warn!(%episode_id, idx, "batch deep read timed out (180s)");
+                tracing::warn!(%episode_id, idx, "batch deep read timed out (600s)");
                 false
             }
         };
@@ -2601,9 +2766,11 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         let article_prompt = article_system_prompt("zh", None);
         assert!(article_prompt.contains("[H:MM:SS]"));
         assert!(article_prompt.contains("[0:11:33]"));
+        assert!(article_prompt.contains("Cortex（皮层）"));
         let chapter_prompt = deep_read_system_prompt("zh");
         assert!(chapter_prompt.contains("[H:MM:SS]"));
         assert!(chapter_prompt.contains("[0:11:33]"));
+        assert!(chapter_prompt.contains("Cortex（皮层）"));
     }
 
     #[test]

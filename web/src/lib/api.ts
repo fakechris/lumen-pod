@@ -117,10 +117,57 @@ export async function requestChapterDeepRead(
   const params = new URLSearchParams();
   if (opts?.lang) params.set("lang", opts.lang);
   if (opts?.regenerate) params.set("regenerate", "true");
+  params.set("async", "true");
   const qs = params.toString();
-  return apiFetch(`/api/episodes/${episodeId}/chapters/${chapterIndex}/deep-read${qs ? `?${qs}` : ""}`, {
+
+  const startRes = await apiFetch<{
+    status?: string;
+    content?: string;
+    cached?: boolean;
+    error?: string;
+  }>(`/api/episodes/${episodeId}/chapters/${chapterIndex}/deep-read?${qs}`, {
     method: "POST",
+    body: JSON.stringify({
+      lang: opts?.lang ?? "zh",
+      regenerate: opts?.regenerate ?? false,
+      async: true,
+    }),
   });
+
+  if (startRes.content) {
+    return { content: startRes.content, cached: startRes.cached };
+  }
+
+  const maxPolls = 480; // up to 20 minutes (2.5s interval) per chapter
+  let consecutiveNetErrors = 0;
+  for (let i = 0; i < maxPolls; i++) {
+    await new Promise((r) => setTimeout(r, 2500));
+    let pollRes: { status: string; content?: string; cached?: boolean; error?: string };
+    try {
+      pollRes = await apiFetch<{
+        status: string;
+        content?: string;
+        cached?: boolean;
+        error?: string;
+      }>(`/api/episodes/${episodeId}/chapters/${chapterIndex}/deep-read`);
+      consecutiveNetErrors = 0;
+    } catch (err) {
+      consecutiveNetErrors++;
+      if (consecutiveNetErrors >= 3) throw err;
+      continue;
+    }
+
+    if (pollRes.status === "complete" && pollRes.content) {
+      return { content: pollRes.content, cached: pollRes.cached ?? false };
+    }
+    if (pollRes.status === "error") {
+      throw new Error(pollRes.error || "Chapter deep-read generation failed");
+    }
+    if (pollRes.status === "idle") {
+      throw new Error("Chapter deep-read generation stopped unexpectedly");
+    }
+  }
+  throw new Error("Chapter deep-read generation timed out");
 }
 
 // ---- Episode Article (YouMind v54 Read-and-Done Long-Form Article) ----
@@ -148,7 +195,7 @@ export async function requestEpisodeArticle(
     return { article: startRes.article, cached: startRes.cached };
   }
 
-  const maxPolls = 600; // up to 30 minutes (3s interval) for 2-4 hour episodes
+  const maxPolls = 1800; // up to 90 minutes (3s interval) for 3-4 hour episodes
   let consecutiveNetErrors = 0;
   for (let i = 0; i < maxPolls; i++) {
     await new Promise((r) => setTimeout(r, 3000));
