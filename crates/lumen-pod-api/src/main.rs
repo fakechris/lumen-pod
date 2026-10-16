@@ -95,6 +95,7 @@ async fn run_server(database_url: &str) {
         llm: llm_config,
         audio_dir,
         batch_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        article_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     use axum::http::Method;
@@ -153,7 +154,7 @@ async fn run_server(database_url: &str) {
         )
         .route(
             "/api/episodes/{id}/article",
-            axum::routing::post(episode_article),
+            axum::routing::post(episode_article).get(episode_article_status),
         )
         .route(
             "/api/episodes/{id}/deep-read-all",
@@ -439,7 +440,7 @@ async fn call_llm_anthropic_with_tokens(
     };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(600))
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
@@ -1345,6 +1346,8 @@ struct ArticleParams {
     lang: Option<String>,
     focus: Option<String>,
     regenerate: Option<bool>,
+    #[serde(rename = "async")]
+    async_mode: Option<bool>,
 }
 
 fn article_system_prompt(lang: &str, focus: Option<&str>) -> String {
@@ -1498,6 +1501,7 @@ async fn episode_article(
         .map(|f| f.trim().to_string())
         .filter(|f| !f.is_empty());
     let regenerate = body.regenerate.or(query_params.regenerate).unwrap_or(false);
+    let async_mode = body.async_mode.or(query_params.async_mode).unwrap_or(false);
 
     if !regenerate && focus.is_none() {
         if let Some(existing) = &ep.article {
@@ -1509,8 +1513,26 @@ async fn episode_article(
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
+                        "status": "complete",
                         "article": existing,
                         "cached": true
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Check if an async generation task is already running for this episode (within last 10 mins)
+    {
+        let tasks = state.article_tasks.lock().unwrap();
+        if let Some(t) = tasks.get(&id) {
+            if t.status == "running" && epoch_ms().saturating_sub(t.started_at_ms) < 600_000 {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "running",
+                        "elapsedMs": epoch_ms().saturating_sub(t.started_at_ms)
                     })),
                 )
                     .into_response();
@@ -1525,6 +1547,71 @@ async fn episode_article(
          Ensure timestamps like `[MM:SS]` or `[H:MM:SS]` are preserved on quotes and visual referrals so readers can jump directly to the audio/video player.\n\n\
          {context}"
     );
+
+    if async_mode {
+        let now_ms = epoch_ms();
+        {
+            let mut tasks = state.article_tasks.lock().unwrap();
+            tasks.insert(
+                id.clone(),
+                auth::ArticleGenStatus {
+                    status: "running".to_string(),
+                    error: None,
+                    started_at_ms: now_ms,
+                },
+            );
+        }
+
+        let state_clone = state.clone();
+        let id_clone = id.clone();
+        let fallback_title = ep.source.title.clone();
+        tokio::spawn(async move {
+            let messages = vec![serde_json::json!({"role": "user", "content": user_prompt})];
+            match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 32_768).await
+            {
+                Ok(raw_output) => {
+                    let (title, content) = extract_markdown_title(&raw_output, &fallback_title);
+                    let article = lumen_pod_core::episode::Article {
+                        title,
+                        content,
+                        format: Some("markdown".to_string()),
+                        lang: Some(lang),
+                        focus,
+                        generated_at: Some(chrono::Utc::now().to_rfc3339()),
+                    };
+                    let updates = serde_json::json!({
+                        "article": serde_json::to_value(&article).unwrap_or_default()
+                    });
+                    if let Err(e) = state_clone.store.update_episode(&id_clone, &updates).await {
+                        tracing::warn!(id = %id_clone, error = %e, "failed to persist generated article");
+                    }
+                    let mut tasks = state_clone.article_tasks.lock().unwrap();
+                    tasks.remove(&id_clone);
+                }
+                Err(err) => {
+                    tracing::error!(id = %id_clone, error = %err, "async article generation failed");
+                    let mut tasks = state_clone.article_tasks.lock().unwrap();
+                    tasks.insert(
+                        id_clone,
+                        auth::ArticleGenStatus {
+                            status: "error".to_string(),
+                            error: Some(err),
+                            started_at_ms: now_ms,
+                        },
+                    );
+                }
+            }
+        });
+
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "running",
+                "elapsedMs": 0
+            })),
+        )
+            .into_response();
+    }
 
     let messages = vec![serde_json::json!({"role": "user", "content": user_prompt})];
     // Use 32,768 max_tokens so reasoning models (e.g. MiniMax-M3.1) have ample budget for both thinking and long-form article output
@@ -1559,8 +1646,76 @@ async fn episode_article(
     (
         StatusCode::OK,
         Json(serde_json::json!({
+            "status": "complete",
             "article": article,
             "cached": false
+        })),
+    )
+        .into_response()
+}
+
+async fn episode_article_status(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
+
+    {
+        let tasks = state.article_tasks.lock().unwrap();
+        if let Some(t) = tasks.get(&id) {
+            if t.status == "running" && epoch_ms().saturating_sub(t.started_at_ms) < 600_000 {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "running",
+                        "elapsedMs": epoch_ms().saturating_sub(t.started_at_ms)
+                    })),
+                )
+                    .into_response();
+            }
+            if t.status == "error" {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "error": t.error
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Some(art) = &ep.article {
+        let trimmed = art.content.trim();
+        if !trimmed.is_empty() && trimmed != "No response from AI" {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "complete",
+                    "article": art
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "idle"
         })),
     )
         .into_response()

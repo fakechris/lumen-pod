@@ -309,12 +309,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 // ---- Google OAuth Handlers ----
 
 #[derive(Clone)]
+pub struct ArticleGenStatus {
+    pub status: String, // "running" | "error"
+    pub error: Option<String>,
+    pub started_at_ms: u64,
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
     pub auth: AuthConfig,
     pub llm: crate::LlmConfig,
     pub audio_dir: String,
     pub batch_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::BatchDeepReadTask>>>,
+    pub article_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, ArticleGenStatus>>>,
 }
 
 pub async fn google_login(State(state): State<AppState>) -> impl IntoResponse {

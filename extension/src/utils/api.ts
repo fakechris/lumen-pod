@@ -52,14 +52,45 @@ export async function requestEpisodeArticle(
   episodeId: string,
   opts?: { lang?: string; focus?: string; regenerate?: boolean }
 ): Promise<{ article: Article; cached?: boolean }> {
-  return apiFetch(`/api/episodes/${episodeId}/article`, {
+  const startRes = await apiFetch<{
+    status?: string;
+    article?: Article;
+    cached?: boolean;
+    error?: string;
+  }>(`/api/episodes/${episodeId}/article`, {
     method: "POST",
     body: JSON.stringify({
       lang: opts?.lang ?? "zh",
       focus: opts?.focus || undefined,
       regenerate: opts?.regenerate ?? false,
+      async: true,
     }),
   });
+
+  if (startRes.article) {
+    return { article: startRes.article, cached: startRes.cached };
+  }
+
+  const maxPolls = 200; // up to 10 minutes (3s interval)
+  for (let i = 0; i < maxPolls; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    const pollRes = await apiFetch<{
+      status: string;
+      article?: Article;
+      error?: string;
+    }>(`/api/episodes/${episodeId}/article`);
+
+    if (pollRes.status === "complete" && pollRes.article) {
+      return { article: pollRes.article, cached: false };
+    }
+    if (pollRes.status === "error") {
+      throw new Error(pollRes.error || "Article generation failed");
+    }
+    if (pollRes.status === "idle") {
+      throw new Error("Article generation stopped unexpectedly");
+    }
+  }
+  throw new Error("Article generation timed out");
 }
 
 export function formatDuration(seconds: number): string {
