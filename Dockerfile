@@ -7,7 +7,10 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release --bin lumen-pod-server
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --bin lumen-pod-server && \
+    cp /app/target/release/lumen-pod-server /usr/local/bin/lumen-pod-server
 
 # ---- Runtime stage ----
 FROM debian:bookworm-slim
@@ -19,7 +22,7 @@ RUN apt-get update && \
 RUN useradd -m -s /bin/bash lumenpod && \
     mkdir -p /data/audio && chown lumenpod:lumenpod /data/audio
 
-COPY --from=builder /app/target/release/lumen-pod-server /usr/local/bin/lumen-pod-server
+COPY --from=builder /usr/local/bin/lumen-pod-server /usr/local/bin/lumen-pod-server
 
 USER lumenpod
 EXPOSE 3210

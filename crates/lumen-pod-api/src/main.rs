@@ -321,7 +321,112 @@ fn extract_llm_text_from_response(json: &serde_json::Value) -> Result<String, St
     }
 }
 
-/// Call LLM using the Anthropic Messages API format with an explicit `max_tokens` budget.
+/// Parse an Anthropic Messages SSE stream (`stream: true`) or non-streaming JSON body
+/// and extract the text response.
+/// Using `stream: true` prevents reverse-proxy / CDN idle read timeouts during 30-90s
+/// reasoning (`thinking`) and long-form generation phases.
+fn extract_llm_text_from_sse_or_json(body: &str) -> Result<String, String> {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') {
+        let json: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|e| format!("Failed to parse LLM JSON response: {e}"))?;
+        return extract_llm_text_from_response(&json);
+    }
+
+    let mut text_buf = String::new();
+    let mut stop_reason = String::from("unknown");
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut thinking_tokens: u64 = 0;
+
+    for line in body.lines() {
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        match ev["type"].as_str().unwrap_or("") {
+            "message_start" => {
+                if let Some(in_tok) = ev["message"]["usage"]["input_tokens"].as_u64() {
+                    input_tokens = in_tok;
+                }
+            }
+            "content_block_start" => {
+                if ev["content_block"]["type"].as_str() == Some("text") {
+                    if let Some(t) = ev["content_block"]["text"].as_str() {
+                        text_buf.push_str(t);
+                    }
+                }
+            }
+            "content_block_delta" => {
+                if ev["delta"]["type"].as_str() == Some("text_delta") {
+                    if let Some(t) = ev["delta"]["text"].as_str() {
+                        text_buf.push_str(t);
+                    }
+                }
+            }
+            "message_delta" => {
+                if let Some(sr) = ev["delta"]["stop_reason"].as_str() {
+                    stop_reason = sr.to_string();
+                }
+                if let Some(in_tok) = ev["usage"]["input_tokens"].as_u64() {
+                    input_tokens = in_tok;
+                }
+                if let Some(out_tok) = ev["usage"]["output_tokens"].as_u64() {
+                    output_tokens = out_tok;
+                }
+                if let Some(think_tok) =
+                    ev["usage"]["output_tokens_details"]["thinking_tokens"].as_u64()
+                {
+                    thinking_tokens = think_tok;
+                }
+            }
+            "error" => {
+                let err_msg = ev["error"]["message"]
+                    .as_str()
+                    .unwrap_or("unknown stream error");
+                return Err(format!("LLM stream error: {err_msg}"));
+            }
+            _ => {}
+        }
+    }
+
+    let final_text = text_buf.trim().to_string();
+    let has_text = !final_text.is_empty();
+
+    tracing::info!(
+        %stop_reason,
+        input_tokens,
+        output_tokens,
+        thinking_tokens,
+        has_text,
+        text_chars = final_text.chars().count(),
+        "LLM stream response received"
+    );
+
+    if has_text {
+        Ok(final_text)
+    } else {
+        tracing::warn!(
+            %stop_reason,
+            input_tokens,
+            output_tokens,
+            thinking_tokens,
+            "LLM stream returned no text block (likely exhausted max_tokens during thinking)"
+        );
+        Err(format!(
+            "LLM returned empty text response (stop_reason={stop_reason}, output_tokens={output_tokens}, thinking_tokens={thinking_tokens})"
+        ))
+    }
+}
+
+/// Call LLM using the Anthropic Messages API format with `stream: true` and an explicit `max_tokens` budget.
 async fn call_llm_anthropic_with_tokens(
     config: &LlmConfig,
     system: &str,
@@ -335,6 +440,7 @@ async fn call_llm_anthropic_with_tokens(
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -346,6 +452,7 @@ async fn call_llm_anthropic_with_tokens(
         .json(&serde_json::json!({
             "model": config.model,
             "max_tokens": max_tokens,
+            "stream": true,
             "system": system,
             "messages": messages,
         }))
@@ -360,9 +467,9 @@ async fn call_llm_anthropic_with_tokens(
                 tracing::error!(%status, %body, "LLM API error");
                 return Err(format!("LLM API error: {status}. {body}"));
             }
-            match res.json::<serde_json::Value>().await {
-                Ok(json) => extract_llm_text_from_response(&json),
-                Err(e) => Err(format!("Failed to parse LLM response: {e}")),
+            match res.text().await {
+                Ok(body) => extract_llm_text_from_sse_or_json(&body),
+                Err(e) => Err(format!("Failed to read LLM response stream: {e}")),
             }
         }
         Err(e) => Err(format!("Failed to call LLM: {e}")),
@@ -2268,6 +2375,32 @@ mod tests {
         });
         let text = extract_llm_text_from_response(&ok_json).unwrap();
         assert_eq!(text, "# 经验时代的黎明\n\n[1:02:15] 正文内容");
+
+        // Case 3: SSE stream with thinking deltas followed by text deltas
+        let sse_ok = r##"
+event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":23622}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Thinking deeply..."}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"# 经验时代的黎明\n\n"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"正文第一段 [1:02:15]"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":23622,"output_tokens":4200,"output_tokens_details":{"thinking_tokens":1800}}}
+"##;
+        let sse_text = extract_llm_text_from_sse_or_json(sse_ok).unwrap();
+        assert_eq!(sse_text, "# 经验时代的黎明\n\n正文第一段 [1:02:15]");
     }
 
     #[test]
