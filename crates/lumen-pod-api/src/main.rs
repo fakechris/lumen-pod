@@ -1393,18 +1393,12 @@ async fn chapter_deep_read(
         let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
         match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 16_384).await {
             Ok(content) => {
-                // Re-fetch latest episode before updating chapters so concurrent chapter updates never overwrite each other
-                if let Ok(latest_ep) = state_clone.store.get_episode(&id_clone).await {
-                    let mut chapters_val = serde_json::to_value(&latest_ep.chapters).unwrap_or_default();
-                    if let Some(arr) = chapters_val.as_array_mut() {
-                        if let Some(ch) = arr.get_mut(idx) {
-                            ch["deepRead"] = serde_json::Value::String(content.clone());
-                        }
-                    }
-                    let updates = serde_json::json!({"chapters": chapters_val});
-                    if let Err(e) = state_clone.store.update_episode(&id_clone, &updates).await {
-                        tracing::warn!(id = %id_clone, idx, error = %e, "failed to persist deep read");
-                    }
+                if let Err(e) = state_clone
+                    .store
+                    .update_chapter_deep_read(&id_clone, idx, &content)
+                    .await
+                {
+                    tracing::warn!(id = %id_clone, idx, error = %e, "failed to persist deep read");
                 }
                 let mut tasks = state_clone.chapter_tasks.lock().unwrap();
                 tasks.remove(&task_key_clone);
@@ -1804,10 +1798,11 @@ async fn episode_article(
                     focus,
                     generated_at: Some(chrono::Utc::now().to_rfc3339()),
                 };
-                let updates = serde_json::json!({
-                    "article": serde_json::to_value(&article).unwrap_or_default()
-                });
-                if let Err(e) = state_clone.store.update_episode(&id_clone, &updates).await {
+                if let Err(e) = state_clone
+                    .store
+                    .update_episode_article(&id_clone, &article)
+                    .await
+                {
                     tracing::warn!(id = %id_clone, error = %e, "failed to persist generated article");
                 }
                 let mut tasks = state_clone.article_tasks.lock().unwrap();
@@ -2081,18 +2076,11 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
         ).await;
 
         let is_ok = match result {
-            Ok(Ok(content)) => {
-                // Re-fetch latest episode before persisting so concurrent updates are never overwritten
-                let base_ep = state.store.get_episode(&episode_id).await.unwrap_or(ep);
-                let mut chapters_val = serde_json::to_value(&base_ep.chapters).unwrap_or_default();
-                if let Some(arr) = chapters_val.as_array_mut() {
-                    if let Some(ch) = arr.get_mut(idx) {
-                        ch["deepRead"] = serde_json::Value::String(content);
-                    }
-                }
-                let updates = serde_json::json!({"chapters": chapters_val});
-                state.store.update_episode(&episode_id, &updates).await.is_ok()
-            }
+            Ok(Ok(content)) => state
+                .store
+                .update_chapter_deep_read(&episode_id, idx, &content)
+                .await
+                .is_ok(),
             Ok(Err(err_content)) => {
                 tracing::warn!(%episode_id, idx, %err_content, "batch deep read LLM error");
                 false

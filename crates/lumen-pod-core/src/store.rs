@@ -7,6 +7,11 @@ use crate::error::{PodError, PodResult};
 
 pub struct Store {
     pool: PgPool,
+    episode_locks: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        >,
+    >,
 }
 
 impl Store {
@@ -15,13 +20,32 @@ impl Store {
             .max_connections(10)
             .connect(database_url)
             .await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            episode_locks: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+        };
         store.migrate().await?;
         Ok(store)
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            episode_locks: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+        }
+    }
+
+    /// Return a per-episode async mutex so concurrent read-modify-write operations
+    /// on the same episode are serialized in-process in addition to DB row locking.
+    pub fn episode_lock(&self, id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.episode_locks.lock().unwrap();
+        map.entry(id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -254,7 +278,22 @@ impl Store {
         id: &str,
         updates: &serde_json::Value,
     ) -> PodResult<Episode> {
-        let mut ep = self.get_episode(id).await?;
+        let lock = self.episode_lock(id);
+        let _guard = lock.lock().await;
+
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT source, processing, summary, chapters, mindmap, transcript,
+                    keywords, highlights, qas, clips, article, shownotes,
+                    is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
+             FROM episodes WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| PodError::NotFound(id.to_string()))?;
+
+        let mut ep = Self::row_to_episode(id, &row)?;
 
         // Helper: try both camelCase and snake_case keys
         macro_rules! patch {
@@ -397,10 +436,96 @@ impl Store {
         .bind(&search_text)
         .bind(ep.updated_at)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(ep)
+    }
+
+    /// Concurrency-safe, single-chapter update for `chapters[idx].deepRead`.
+    /// Serialized per episode via both `episode_lock` and `SELECT ... FOR UPDATE`,
+    /// modifying only `chapters[idx].deep_read` on the freshly locked row so concurrent
+    /// completions (single-chapter async/sync or batch `deep-read-all`) never overwrite each other.
+    pub async fn update_chapter_deep_read(
+        &self,
+        id: &str,
+        idx: usize,
+        deep_read: &str,
+    ) -> PodResult<Episode> {
+        self.update_chapter_deep_read_with_delay(id, idx, deep_read, None)
+            .await
+    }
+
+    pub async fn update_chapter_deep_read_with_delay(
+        &self,
+        id: &str,
+        idx: usize,
+        deep_read: &str,
+        after_read_delay: Option<std::time::Duration>,
+    ) -> PodResult<Episode> {
+        let lock = self.episode_lock(id);
+        let _guard = lock.lock().await;
+
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT source, processing, summary, chapters, mindmap, transcript,
+                    keywords, highlights, qas, clips, article, shownotes,
+                    is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
+             FROM episodes WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| PodError::NotFound(id.to_string()))?;
+
+        let mut ep = Self::row_to_episode(id, &row)?;
+
+        if let Some(delay) = after_read_delay {
+            tokio::time::sleep(delay).await;
+        }
+
+        if idx >= ep.chapters.len() {
+            return Err(PodError::InvalidInput(format!(
+                "chapter index {idx} out of range (len={})",
+                ep.chapters.len()
+            )));
+        }
+
+        ep.chapters[idx].deep_read = Some(deep_read.to_string());
+        ep.updated_at = Utc::now();
+
+        sqlx::query("UPDATE episodes SET chapters = $1, updated_at = $2 WHERE id = $3")
+            .bind(serde_json::to_value(&ep.chapters)?)
+            .bind(ep.updated_at)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(ep)
+    }
+
+    /// Targeted, concurrency-safe update for `episode.article` that never touches `chapters` or other columns.
+    pub async fn update_episode_article(
+        &self,
+        id: &str,
+        article: &crate::episode::Article,
+    ) -> PodResult<()> {
+        let lock = self.episode_lock(id);
+        let _guard = lock.lock().await;
+
+        let result = sqlx::query("UPDATE episodes SET article = $1, updated_at = $2 WHERE id = $3")
+            .bind(serde_json::to_value(article)?)
+            .bind(Utc::now())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(PodError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
 
     pub async fn delete_episode(&self, id: &str) -> PodResult<bool> {
@@ -408,6 +533,7 @@ impl Store {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.episode_locks.lock().unwrap().remove(id);
         Ok(result.rows_affected() > 0)
     }
 
@@ -1298,6 +1424,89 @@ mod tests {
         });
         let cleared = store.update_episode(&ep.id, &clear_updates).await.unwrap();
         assert!(cleared.article.is_none());
+
+        store.delete_episode(&ep.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_chapter_deep_reads_with_aligned_read_write_window_preserve_all_chapters() {
+        let store = std::sync::Arc::new(test_store().await);
+        let mut ep = sample_episode();
+        ep.chapters = (0..4)
+            .map(|i| Chapter {
+                title: format!("Chapter {i}"),
+                start_time: (i * 300) as f64,
+                end_time: ((i + 1) * 300) as f64,
+                summary: format!("Summary {i}"),
+                has_ads: false,
+                deep_read: None,
+            })
+            .collect();
+        store.insert_episode(&ep).await.unwrap();
+
+        // Align all 4 chapter tasks + 1 concurrent article update at a barrier, and inject an
+        // 80ms sleep inside the read-to-write window. Without per-episode locking / FOR UPDATE,
+        // all 4 tasks read `deep_read: None` before any writes and clobber each other.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(5));
+        let mut handles = Vec::new();
+        for idx in 0..4usize {
+            let store_c = store.clone();
+            let barrier_c = barrier.clone();
+            let ep_id = ep.id.clone();
+            handles.push(tokio::spawn(async move {
+                barrier_c.wait().await;
+                store_c
+                    .update_chapter_deep_read_with_delay(
+                        &ep_id,
+                        idx,
+                        &format!("Deep read content for chapter #{idx}"),
+                        Some(std::time::Duration::from_millis(80)),
+                    )
+                    .await
+                    .unwrap();
+            }));
+        }
+
+        let store_art = store.clone();
+        let barrier_art = barrier.clone();
+        let ep_id_art = ep.id.clone();
+        let art_handle = tokio::spawn(async move {
+            barrier_art.wait().await;
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            store_art
+                .update_episode_article(
+                    &ep_id_art,
+                    &Article {
+                        title: "Concurrent Article".into(),
+                        content: "Full article body".into(),
+                        format: Some("markdown".into()),
+                        lang: Some("zh".into()),
+                        focus: None,
+                        generated_at: None,
+                    },
+                )
+                .await
+                .unwrap();
+        });
+
+        for h in handles {
+            h.await.unwrap();
+        }
+        art_handle.await.unwrap();
+
+        let final_ep = store.get_episode(&ep.id).await.unwrap();
+        assert_eq!(final_ep.chapters.len(), 4);
+        for idx in 0..4usize {
+            assert_eq!(
+                final_ep.chapters[idx].deep_read.as_deref(),
+                Some(format!("Deep read content for chapter #{idx}").as_str()),
+                "chapter {idx} deepRead was lost under concurrent aligned writes"
+            );
+        }
+        assert_eq!(
+            final_ep.article.as_ref().map(|a| a.title.as_str()),
+            Some("Concurrent Article")
+        );
 
         store.delete_episode(&ep.id).await.unwrap();
     }
