@@ -18,9 +18,19 @@ CREATE TABLE IF NOT EXISTS episodes (
     is_read BOOLEAN NOT NULL DEFAULT FALSE,
     tags JSONB NOT NULL DEFAULT '[]'::jsonb,
     collection_id TEXT,
+    owner_id TEXT,
+    visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public', 'private')),
     search_vector TSVECTOR,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS user_episode_reads (
+    user_id TEXT NOT NULL,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    is_read BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, episode_id)
 );
 
 CREATE TABLE IF NOT EXISTS collections (
@@ -61,9 +71,25 @@ CREATE TABLE IF NOT EXISTS invites (
 -- Migration: add approved column to users
 ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Migration: RBAC permissions on users
+ALTER TABLE users ADD COLUMN IF NOT EXISTS can_edit BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS can_delete BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS can_publish_private BOOLEAN NOT NULL DEFAULT FALSE;
+UPDATE users SET can_edit = TRUE, can_delete = TRUE, can_publish_private = TRUE WHERE role = 'admin';
+
+-- Migration: episode ownership and private visibility
+ALTER TABLE episodes ADD COLUMN IF NOT EXISTS owner_id TEXT;
+ALTER TABLE episodes ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'public';
+
+-- Migration: per-user chat messages
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT '';
+
 CREATE INDEX IF NOT EXISTS idx_episodes_source_url ON episodes(source_url);
 CREATE INDEX IF NOT EXISTS idx_episodes_created_at ON episodes(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_episodes_search ON episodes USING GIN(search_vector);
 CREATE INDEX IF NOT EXISTS idx_episodes_collection ON episodes(collection_id);
+CREATE INDEX IF NOT EXISTS idx_episodes_owner_visibility ON episodes(owner_id, visibility);
+CREATE INDEX IF NOT EXISTS idx_user_episode_reads_user ON user_episode_reads(user_id);
 CREATE INDEX IF NOT EXISTS idx_chat_episode ON chat_messages(episode_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_episode_user ON chat_messages(episode_id, user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email);

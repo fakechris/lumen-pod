@@ -15,6 +15,17 @@ export interface Episode {
   isRead: boolean;
   tags: string[];
   collectionId?: string;
+  ownerId?: string;
+  visibility?: "public" | "private";
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Collection {
+  id: string;
+  name: string;
+  description?: string;
+  coverUrl?: string;
   createdAt: string;
   updatedAt: string;
 }

@@ -30,13 +30,26 @@ pub struct Episode {
     pub article: Option<Article>,
     pub shownotes: Option<String>,
 
-    // ---- User interaction ----
+    // ---- User interaction & Access Control ----
+    #[serde(default)]
     pub is_read: bool,
+    #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
     pub collection_id: Option<String>,
+    /// Owner user ID who created/uploaded this episode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    /// Visibility: "public" (default) or "private" (only owner and admin can see).
+    #[serde(default = "default_episode_visibility")]
+    pub visibility: String,
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+pub fn default_episode_visibility() -> String {
+    "public".to_string()
 }
 
 // ---- Source metadata ----
@@ -291,6 +304,8 @@ pub struct TranslationEntry {
 pub struct ChatMessage {
     pub id: String,
     pub episode_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     pub role: ChatRole,
     pub content: String,
     pub created_at: DateTime<Utc>,
@@ -340,6 +355,12 @@ pub struct User {
     pub avatar_url: Option<String>,
     pub role: UserRole,
     pub approved: bool,
+    #[serde(default)]
+    pub can_edit: bool,
+    #[serde(default)]
+    pub can_delete: bool,
+    #[serde(default)]
+    pub can_publish_private: bool,
     pub created_at: DateTime<Utc>,
 }
 

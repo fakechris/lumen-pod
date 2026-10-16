@@ -9,6 +9,9 @@ interface AuthUser {
   avatar_url?: string;
   role: string;
   approved: boolean;
+  can_edit?: boolean;
+  can_delete?: boolean;
+  can_publish_private?: boolean;
 }
 
 interface AuthContextType {

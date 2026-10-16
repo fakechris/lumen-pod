@@ -11,6 +11,9 @@ interface AdminUser {
   avatar_url?: string;
   role: string;
   approved: boolean;
+  can_edit?: boolean;
+  can_delete?: boolean;
+  can_publish_private?: boolean;
   created_at: string;
 }
 
@@ -87,6 +90,21 @@ export default function AdminPage() {
       body: JSON.stringify({ role: newRole }),
     });
     setMessage(`Role changed to ${newRole}`);
+    fetchData();
+  };
+
+  const togglePermission = async (
+    id: string,
+    field: "can_edit" | "can_delete" | "can_publish_private",
+    currentValue: boolean
+  ) => {
+    await fetch(`/api/admin/users/${id}`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [field]: !currentValue }),
+    });
+    setMessage(`Updated permission ${field}`);
     fetchData();
   };
 
@@ -228,6 +246,49 @@ export default function AdminPage() {
                       </span>
                     </div>
                     <p className="text-sm text-zinc-500 truncate">{u.email}</p>
+                    <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                      {u.role === "admin" ? (
+                        <span className="px-2 py-0.5 text-xs rounded-md bg-purple-50 dark:bg-purple-950/40 text-purple-600 dark:text-purple-400 border border-purple-200 dark:border-purple-800">
+                          👑 全部权限 (Admin)
+                        </span>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => togglePermission(u.id, "can_edit", !!u.can_edit)}
+                            className={`px-2 py-0.5 text-xs rounded-md border transition-colors ${
+                              u.can_edit
+                                ? "bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-400 border-blue-300 dark:border-blue-800"
+                                : "bg-zinc-50 dark:bg-zinc-800/50 text-zinc-400 border-zinc-200 dark:border-zinc-700"
+                            }`}
+                            title="允许修改视频标签、合集与内容"
+                          >
+                            {u.can_edit ? "✓ ✏️ 可编辑视频" : "○ ✏️ 可编辑视频"}
+                          </button>
+                          <button
+                            onClick={() => togglePermission(u.id, "can_delete", !!u.can_delete)}
+                            className={`px-2 py-0.5 text-xs rounded-md border transition-colors ${
+                              u.can_delete
+                                ? "bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-400 border-rose-300 dark:border-rose-800"
+                                : "bg-zinc-50 dark:bg-zinc-800/50 text-zinc-400 border-zinc-200 dark:border-zinc-700"
+                            }`}
+                            title="允许删除视频"
+                          >
+                            {u.can_delete ? "✓ 🗑️ 可删除视频" : "○ 🗑️ 可删除视频"}
+                          </button>
+                          <button
+                            onClick={() => togglePermission(u.id, "can_publish_private", !!u.can_publish_private)}
+                            className={`px-2 py-0.5 text-xs rounded-md border transition-colors ${
+                              u.can_publish_private
+                                ? "bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 border-amber-300 dark:border-amber-800"
+                                : "bg-zinc-50 dark:bg-zinc-800/50 text-zinc-400 border-zinc-200 dark:border-zinc-700"
+                            }`}
+                            title="允许发布仅自己可见的私密视频"
+                          >
+                            {u.can_publish_private ? "✓ 🔒 可发私密视频" : "○ 🔒 可发私密视频"}
+                          </button>
+                        </>
+                      )}
+                    </div>
                   </div>
                   <div className="flex gap-1 shrink-0">
                     {!u.approved && (

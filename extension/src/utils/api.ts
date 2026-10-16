@@ -10,6 +10,7 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     headers["Authorization"] = `Bearer ${token}`;
   }
   const res = await fetch(`${baseUrl}${path}`, {
+    credentials: "include",
     ...init,
     headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
   });
@@ -38,11 +39,12 @@ export async function getEpisode(id: string): Promise<Episode> {
 
 export async function submitEpisodeUrl(
   url: string,
-  title?: string
-): Promise<{ id: string; url: string; status: string; message: string }> {
+  title?: string,
+  visibility: "public" | "private" = "public"
+): Promise<{ id: string; url: string; visibility?: string; status: string; message: string }> {
   return apiFetch(`/api/episodes/submit-url`, {
     method: "POST",
-    body: JSON.stringify({ url, title }),
+    body: JSON.stringify({ url, title, visibility }),
   });
 }
 

@@ -1,4 +1,4 @@
-import type { Article, Episode, User } from "./types";
+import type { Article, Collection, Episode, User } from "./types";
 
 // Client-side: use relative URLs — Caddy (prod) or Next.js rewrites (dev) proxy to API
 // Server-side: use env var for SSR fetch if needed
@@ -67,6 +67,20 @@ export async function updateEpisode(
 
 export async function deleteEpisode(id: string): Promise<void> {
   await apiFetch(`/api/episodes/${id}`, { method: "DELETE" });
+}
+
+export async function listCollections(): Promise<{ collections: Collection[] }> {
+  return apiFetch("/api/collections");
+}
+
+export async function createCollection(
+  name: string,
+  description?: string
+): Promise<Collection> {
+  return apiFetch("/api/collections", {
+    method: "POST",
+    body: JSON.stringify({ name, description }),
+  });
 }
 
 // ---- Chat ----

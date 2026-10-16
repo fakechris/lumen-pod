@@ -2,10 +2,12 @@
 
 import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { getEpisode, formatTimestamp, formatDuration, getExportUrl, sendChatMessage, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, type ChatMsg, type BatchStatus } from "@/lib/api";
-import type { Article, Episode } from "@/lib/types";
+import { getEpisode, updateEpisode, deleteEpisode, listCollections, createCollection, formatTimestamp, formatDuration, getExportUrl, sendChatMessage, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, type ChatMsg, type BatchStatus } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
+import type { Article, Collection, Episode } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -323,7 +325,18 @@ function TimestampMarkdown({
 type DeepReadState = Record<number, { loading: boolean; content?: string; error?: string; collapsed?: boolean }>;
 
 export default function EpisodeDetail({ id }: { id: string }) {
+  const router = useRouter();
+  const { user } = useAuth();
+  const canEdit = Boolean(user?.role === "admin" || user?.can_edit);
+  const canDelete = Boolean(user?.role === "admin" || user?.can_delete);
+  const canPublishPrivate = Boolean(user?.role === "admin" || user?.can_publish_private);
+
   const [episode, setEpisode] = useState<Episode | null>(null);
+  const [collections, setCollections] = useState<Collection[]>([]);
+  const [editingMeta, setEditingMeta] = useState(false);
+  const [newTagInput, setNewTagInput] = useState("");
+  const [newCollectionName, setNewCollectionName] = useState("");
+  const [metaSaving, setMetaSaving] = useState(false);
   const [activeTab, setActiveTab] = useState<TabName>("Summary");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -347,7 +360,108 @@ export default function EpisodeDetail({ id }: { id: string }) {
       });
       if (Object.keys(restored).length > 0) setDeepReads(restored);
     }).catch((e) => setError(e.message)).finally(() => setLoading(false));
+    listCollections().then((res) => setCollections(res.collections || [])).catch(() => {});
   }, [id]);
+
+  const handleToggleRead = async () => {
+    if (!episode) return;
+    try {
+      const updated = await updateEpisode(id, { isRead: !episode.isRead });
+      setEpisode(updated);
+    } catch (e: any) {
+      alert(e.message || "更新已读状态失败");
+    }
+  };
+
+  const handleAddTag = async () => {
+    const tag = newTagInput.trim();
+    if (!episode || !tag) return;
+    if (episode.tags.includes(tag)) {
+      setNewTagInput("");
+      return;
+    }
+    setMetaSaving(true);
+    try {
+      const updated = await updateEpisode(id, { tags: [...episode.tags, tag] });
+      setEpisode(updated);
+      setNewTagInput("");
+    } catch (e: any) {
+      alert(e.message || "更新标签失败");
+    } finally {
+      setMetaSaving(false);
+    }
+  };
+
+  const handleRemoveTag = async (tagToRemove: string) => {
+    if (!episode) return;
+    setMetaSaving(true);
+    try {
+      const updated = await updateEpisode(id, {
+        tags: episode.tags.filter((t) => t !== tagToRemove),
+      });
+      setEpisode(updated);
+    } catch (e: any) {
+      alert(e.message || "删除标签失败");
+    } finally {
+      setMetaSaving(false);
+    }
+  };
+
+  const handleChangeCollection = async (collectionId: string) => {
+    if (!episode) return;
+    setMetaSaving(true);
+    try {
+      const updated = await updateEpisode(id, {
+        collectionId: collectionId || null,
+      });
+      setEpisode(updated);
+    } catch (e: any) {
+      alert(e.message || "更新合集失败");
+    } finally {
+      setMetaSaving(false);
+    }
+  };
+
+  const handleCreateCollection = async () => {
+    const name = newCollectionName.trim();
+    if (!name) return;
+    setMetaSaving(true);
+    try {
+      const col = await createCollection(name);
+      setCollections((prev) => [col, ...prev]);
+      setNewCollectionName("");
+      const updated = await updateEpisode(id, { collectionId: col.id });
+      setEpisode(updated);
+    } catch (e: any) {
+      alert(e.message || "创建合集失败");
+    } finally {
+      setMetaSaving(false);
+    }
+  };
+
+  const handleToggleVisibility = async (newVisibility: "public" | "private") => {
+    if (!episode) return;
+    setMetaSaving(true);
+    try {
+      const updated = await updateEpisode(id, { visibility: newVisibility });
+      setEpisode(updated);
+    } catch (e: any) {
+      alert(e.message || "切换可见性失败");
+    } finally {
+      setMetaSaving(false);
+    }
+  };
+
+  const handleDeleteEpisode = async () => {
+    if (!episode) return;
+    if (!confirm(`确定要删除「${episode.source.title}」吗？此操作不可撤销。`)) return;
+    try {
+      await deleteEpisode(id);
+      router.push("/");
+    } catch (e: any) {
+      alert(e.message || "删除失败");
+    }
+  };
 
   const seekTo = useCallback((time: number) => {
     if (playerHandleRef.current) {
@@ -393,14 +507,67 @@ export default function EpisodeDetail({ id }: { id: string }) {
       {/* Header */}
       <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
         <div className="max-w-5xl mx-auto px-4 py-4">
-          <Link href="/" className="text-sm text-blue-600 hover:underline mb-2 inline-block">← Back</Link>
-          <h1 className="text-xl font-bold text-zinc-900 dark:text-zinc-100 mt-1">{episode.source.title}</h1>
+          <div className="flex items-center justify-between gap-2 mb-2">
+            <Link href="/" className="text-sm text-blue-600 hover:underline inline-block">← Back</Link>
+            <div className="flex items-center gap-2 flex-wrap">
+              {/* Personal Read Status Toggle (Any approved user) */}
+              <button
+                onClick={handleToggleRead}
+                className={`px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors ${
+                  episode.isRead
+                    ? "bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800"
+                    : "bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700 hover:border-blue-400"
+                }`}
+                title="个人已读状态（仅对你自己生效）"
+              >
+                {episode.isRead ? "✓ 已读 (个人)" : "○ 标为已读"}
+              </button>
+
+              {canEdit && (
+                <button
+                  onClick={() => setEditingMeta((v) => !v)}
+                  className="px-2.5 py-1 text-xs font-medium rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 transition-colors"
+                >
+                  ✏️ {editingMeta ? "收起设置" : "标签 / 合集 / 权限"}
+                </button>
+              )}
+
+              {canDelete && (
+                <button
+                  onClick={handleDeleteEpisode}
+                  className="px-2.5 py-1 text-xs font-medium rounded-lg border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-950/30 hover:bg-red-100 dark:hover:bg-red-900/50 text-red-600 dark:text-red-400 transition-colors"
+                >
+                  🗑️ 删除
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <h1 className="text-xl font-bold text-zinc-900 dark:text-zinc-100 mt-1">{episode.source.title}</h1>
+            {episode.visibility === "private" ? (
+              <span className="mt-1 px-2 py-0.5 text-xs font-medium rounded-full bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300">
+                🔒 私密视频 (仅自己与管理员可见)
+              </span>
+            ) : (
+              <span className="mt-1 px-2 py-0.5 text-xs rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500">
+                🌐 公开
+              </span>
+            )}
+          </div>
           <div className="flex items-center gap-2 mt-1.5 text-sm text-zinc-500 flex-wrap">
             <span>{icon} {episode.source.platform}</span>
             {episode.source.author && <><span>·</span><span>{episode.source.author}</span></>}
             <span>·</span><span>{formatDuration(episode.source.duration)}</span>
             {episode.source.language && <><span>·</span><span>🌐 {episode.source.language.toUpperCase()}</span></>}
             {episode.processing.llmModel && <><span>·</span><span>🤖 {episode.processing.llmModel}</span></>}
+            {episode.collectionId && (() => {
+              const col = collections.find((c) => c.id === episode.collectionId);
+              return col ? (
+                <span className="px-2 py-0.5 text-xs rounded-full bg-indigo-50 dark:bg-indigo-950/50 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-800">
+                  📁 {col.name}
+                </span>
+              ) : null;
+            })()}
             {episode.tags.length > 0 && episode.tags.map((t) => (
               <span key={t} className="px-2 py-0.5 text-xs rounded-full bg-zinc-100 dark:bg-zinc-800">{t}</span>
             ))}
@@ -412,6 +579,103 @@ export default function EpisodeDetail({ id }: { id: string }) {
             <a href={getExportUrl(id, "notion")} className="text-blue-500 hover:underline text-xs">📓 Notion</a>
             <a href={getExportUrl(id, "obsidian")} className="text-blue-500 hover:underline text-xs">🗄️ Obsidian</a>
           </div>
+
+          {/* Podcast-level Tags / Collection / Visibility Editor (Requires can_edit) */}
+          {canEdit && editingMeta && (
+            <div className="mt-4 p-4 rounded-xl bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700 space-y-3 text-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-medium text-zinc-700 dark:text-zinc-300 w-24">🏷️ 节目精签:</span>
+                {episode.tags.map((t) => (
+                  <span key={t} className="inline-flex items-center gap-1 px-2.5 py-0.5 text-xs rounded-full bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700">
+                    {t}
+                    <button
+                      disabled={metaSaving}
+                      onClick={() => handleRemoveTag(t)}
+                      className="text-zinc-400 hover:text-red-500"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+                <div className="flex items-center gap-1">
+                  <input
+                    type="text"
+                    placeholder="新增标签..."
+                    value={newTagInput}
+                    onChange={(e) => setNewTagInput(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && handleAddTag()}
+                    className="px-2.5 py-1 text-xs rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 outline-none"
+                  />
+                  <button
+                    disabled={metaSaving || !newTagInput.trim()}
+                    onClick={handleAddTag}
+                    className="px-2.5 py-1 text-xs rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    添加
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-medium text-zinc-700 dark:text-zinc-300 w-24">📁 所属合集:</span>
+                <select
+                  value={episode.collectionId || ""}
+                  onChange={(e) => handleChangeCollection(e.target.value)}
+                  disabled={metaSaving}
+                  className="px-2.5 py-1 text-xs rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900"
+                >
+                  <option value="">（无合集）</option>
+                  {collections.map((c) => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="text"
+                    placeholder="新建合集名称..."
+                    value={newCollectionName}
+                    onChange={(e) => setNewCollectionName(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && handleCreateCollection()}
+                    className="px-2.5 py-1 text-xs rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 outline-none"
+                  />
+                  <button
+                    disabled={metaSaving || !newCollectionName.trim()}
+                    onClick={handleCreateCollection}
+                    className="px-2.5 py-1 text-xs rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    新建并归入
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-medium text-zinc-700 dark:text-zinc-300 w-24">🔐 可见性:</span>
+                <button
+                  disabled={metaSaving || episode.visibility !== "private"}
+                  onClick={() => handleToggleVisibility("public")}
+                  className={`px-2.5 py-1 text-xs rounded-lg border ${
+                    episode.visibility !== "private"
+                      ? "bg-blue-600 text-white border-blue-600"
+                      : "bg-white dark:bg-zinc-900 border-zinc-300 dark:border-zinc-600"
+                  }`}
+                >
+                  🌐 公开 (所有人可见)
+                </button>
+                <button
+                  disabled={metaSaving || episode.visibility === "private" || !canPublishPrivate}
+                  onClick={() => handleToggleVisibility("private")}
+                  className={`px-2.5 py-1 text-xs rounded-lg border ${
+                    episode.visibility === "private"
+                      ? "bg-amber-600 text-white border-amber-600"
+                      : "bg-white dark:bg-zinc-900 border-zinc-300 dark:border-zinc-600 disabled:opacity-50"
+                  }`}
+                  title={!canPublishPrivate ? "需要管理员授予「发布私密视频」权限" : ""}
+                >
+                  🔒 私密 (仅自己可见){!canPublishPrivate ? " — 需授权" : ""}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </header>
 
@@ -1122,6 +1386,10 @@ function ChatTab({ episodeId, episode }: { episodeId: string; episode: Episode }
 
   return (
     <div className="flex flex-col h-[600px]">
+      <div className="flex items-center justify-between px-3 py-1.5 mb-2 rounded-lg bg-zinc-100 dark:bg-zinc-800/60 text-xs text-zinc-500">
+        <span>💬 AI 深度追问</span>
+        <span>🔒 个人独立对话历史（仅你可见）</span>
+      </div>
       <div className="flex-1 overflow-y-auto space-y-3 mb-4">
         {loadingHistory ? <div className="text-center py-8 text-zinc-400">Loading chat history...</div> : messages.length === 0 ? (
           <div className="space-y-4">

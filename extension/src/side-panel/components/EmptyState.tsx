@@ -15,6 +15,7 @@ export function EmptyState({
   onSubmitted,
 }: EmptyStateProps) {
   const [submitting, setSubmitting] = useState(false);
+  const [visibility, setVisibility] = useState<"public" | "private">("public");
   const [submitResult, setSubmitResult] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -23,7 +24,7 @@ export function EmptyState({
     setSubmitting(true);
     setSubmitError(null);
     try {
-      const res = await submitEpisodeUrl(currentUrl);
+      const res = await submitEpisodeUrl(currentUrl, undefined, visibility);
       setSubmitResult(res.message || "已提交至处理队列");
       onSubmitted?.();
     } catch (e: any) {
@@ -47,7 +48,18 @@ export function EmptyState({
         </p>
 
         {currentUrl && (
-          <div className="pt-2">
+          <div className="pt-2 space-y-2">
+            <div className="flex items-center justify-center gap-2">
+              <select
+                value={visibility}
+                onChange={(e) => setVisibility(e.target.value as "public" | "private")}
+                disabled={submitting || !!submitResult}
+                className="px-2.5 py-1.5 text-xs rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 outline-none"
+              >
+                <option value="public">🌐 公开 (所有人可见)</option>
+                <option value="private">🔒 私密 (仅自己可见，需授权)</option>
+              </select>
+            </div>
             <button
               onClick={handleSubmit}
               disabled={submitting || !!submitResult}

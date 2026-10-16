@@ -173,6 +173,10 @@ async fn run_server(database_url: &str) {
             "/api/invites",
             get(auth::list_invites).post(auth::create_invite),
         )
+        .route(
+            "/api/admin/invites",
+            get(auth::list_invites).post(auth::create_invite),
+        )
         .route("/api/admin/users", get(auth::list_users))
         .route(
             "/api/admin/users/{id}",
@@ -322,13 +326,26 @@ struct ListParams {
 
 async fn list_episodes(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<ListParams>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let limit = params.limit.unwrap_or(20).min(100);
     let offset = params.offset.unwrap_or(0);
-    match state.store.list_episodes(limit, offset).await {
+    match state
+        .store
+        .list_episodes_for_user(limit, offset, Some(&viewer.user_id), viewer.is_admin())
+        .await
+    {
         Ok(episodes) => {
-            let total = state.store.episode_count().await.unwrap_or(0);
+            let total = state
+                .store
+                .episode_count_for_user(Some(&viewer.user_id), viewer.is_admin())
+                .await
+                .unwrap_or(0);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "total": total, "episodes": episodes })),
@@ -341,10 +358,25 @@ async fn list_episodes(
 
 async fn get_episode(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     match state.store.get_episode(&id).await {
-        Ok(ep) => (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response(),
+        Ok(mut ep) => {
+            if !viewer.can_view_episode(&ep) {
+                return err_404();
+            }
+            ep.is_read = state
+                .store
+                .get_user_episode_read(&viewer.user_id, &id)
+                .await
+                .unwrap_or(false);
+            (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response()
+        }
         Err(lumen_pod_core::error::PodError::NotFound(_)) => err_404(),
         Err(e) => err_500(e),
     }
@@ -352,10 +384,21 @@ async fn get_episode(
 
 async fn create_episode(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(mut episode): Json<lumen_pod_core::episode::Episode>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if episode.visibility == "private" && !viewer.can_publish_private_episodes() {
+        return err_403("需要管理员授权「发布私密视频」权限 (can_publish_private)");
+    }
     if episode.id.is_empty() {
         episode.id = uuid::Uuid::new_v4().to_string();
+    }
+    if episode.owner_id.is_none() && !viewer.is_api_token {
+        episode.owner_id = Some(viewer.user_id.clone());
     }
     let now = chrono::Utc::now();
     episode.created_at = now;
@@ -372,20 +415,102 @@ async fn create_episode(
 
 async fn update_episode(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Json(updates): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    match state.store.update_episode(&id, &updates).await {
-        Ok(ep) => (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response(),
-        Err(lumen_pod_core::error::PodError::NotFound(_)) => err_404(),
-        Err(e) => err_500(e),
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
     }
+
+    // 1. Per-user read state (any approved viewer can mark their own read/unread state)
+    if let Some(v) = updates.get("isRead").or_else(|| updates.get("is_read")) {
+        let is_read = v.as_bool().unwrap_or(false);
+        if let Err(e) = state
+            .store
+            .set_user_episode_read(&viewer.user_id, &id, is_read)
+            .await
+        {
+            return err_500(e);
+        }
+    }
+
+    // 2. Check if there are any episode-level fields being modified
+    let has_episode_mutation = updates
+        .as_object()
+        .map(|obj| obj.keys().any(|k| k != "isRead" && k != "is_read"))
+        .unwrap_or(false);
+
+    if has_episode_mutation {
+        if !viewer.can_edit_episodes() {
+            return err_403("需要管理员授权「修改视频」权限 (can_edit)");
+        }
+        if let Some(vis) = updates.get("visibility").and_then(|v| v.as_str()) {
+            if vis == "private" && !viewer.can_publish_private_episodes() {
+                return err_403("需要管理员授权「发布私密视频」权限 (can_publish_private)");
+            }
+        }
+        // Strip isRead/is_read from episode table update so global row isn't polluted
+        let mut clean_updates = updates.clone();
+        if let Some(obj) = clean_updates.as_object_mut() {
+            obj.remove("isRead");
+            obj.remove("is_read");
+            // If setting private and episode has no owner_id yet, assign current user
+            if obj.get("visibility").and_then(|v| v.as_str()) == Some("private")
+                && ep.owner_id.is_none()
+                && !viewer.is_api_token
+            {
+                obj.insert(
+                    "ownerId".to_string(),
+                    serde_json::Value::String(viewer.user_id.clone()),
+                );
+            }
+        }
+        ep = match state.store.update_episode(&id, &clean_updates).await {
+            Ok(updated) => updated,
+            Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+            Err(e) => return err_500(e),
+        };
+    }
+
+    ep.is_read = state
+        .store
+        .get_user_episode_read(&viewer.user_id, &id)
+        .await
+        .unwrap_or(false);
+    (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response()
 }
 
 async fn delete_episode(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
+    if !viewer.can_delete_episodes() {
+        return err_403("需要管理员授权「删除视频」权限 (can_delete)");
+    }
+
     match state.store.delete_episode(&id).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response(),
         Ok(false) => err_404(),
@@ -397,9 +522,17 @@ async fn delete_episode(
 
 async fn upload_audio(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !viewer.can_edit_episodes() {
+        return err_403("需要管理员授权「修改视频」权限 (can_edit)");
+    }
     if body.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -414,6 +547,9 @@ async fn upload_audio(
         Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
         Err(e) => return err_500(e),
     };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
 
     let ext = detect_audio_ext(&body);
     let filename = format!("{}.{}", id, ext);
@@ -485,6 +621,7 @@ fn detect_audio_ext(bytes: &[u8]) -> &'static str {
 struct SubmitUrlRequest {
     url: String,
     title: Option<String>,
+    visibility: Option<String>,
 }
 
 async fn submit_url(
@@ -492,9 +629,20 @@ async fn submit_url(
     headers: axum::http::HeaderMap,
     Json(req): Json<SubmitUrlRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = auth::require_approved(&headers, &state.auth.jwt_secret) {
-        return e;
-    }
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let visibility = match req.visibility.as_deref() {
+        Some("private") => {
+            if !viewer.can_publish_private_episodes() {
+                return err_403("需要管理员授权「发布私密视频」权限 (can_publish_private)");
+            }
+            "private".to_string()
+        }
+        _ => "public".to_string(),
+    };
 
     let url = req.url.trim().to_string();
     if url.is_empty() {
@@ -554,6 +702,12 @@ async fn submit_url(
         is_read: false,
         tags: vec!["pending".to_string()],
         collection_id: None,
+        owner_id: if viewer.is_api_token {
+            None
+        } else {
+            Some(viewer.user_id.clone())
+        },
+        visibility: visibility.clone(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -564,6 +718,7 @@ async fn submit_url(
             Json(serde_json::json!({
                 "id": episode.id,
                 "url": url,
+                "visibility": visibility,
                 "status": "pending",
                 "message": "Episode submitted. Use MCP agent or skill to process it."
             })),
@@ -600,8 +755,13 @@ struct LookupParams {
 
 async fn lookup_episode_by_url(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<LookupParams>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let url = params.url.trim().to_string();
     if url.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "url parameter required"}))).into_response();
@@ -609,8 +769,15 @@ async fn lookup_episode_by_url(
 
     // Try exact URL match first
     match state.store.find_episode_by_url(&url).await {
-        Ok(Some(ep)) => (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response(),
-        Ok(None) => {
+        Ok(Some(mut ep)) if viewer.can_view_episode(&ep) => {
+            ep.is_read = state
+                .store
+                .get_user_episode_read(&viewer.user_id, &ep.id)
+                .await
+                .unwrap_or(false);
+            (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response()
+        }
+        Ok(_) => {
             // For YouTube, also try alternate URL forms
             if let Some(video_id) = extract_youtube_video_id(&url) {
                 let alt_urls = [
@@ -620,8 +787,15 @@ async fn lookup_episode_by_url(
                 ];
                 for alt in &alt_urls {
                     if alt == &url { continue; }
-                    if let Ok(Some(ep)) = state.store.find_episode_by_url(alt).await {
-                        return (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response();
+                    if let Ok(Some(mut ep)) = state.store.find_episode_by_url(alt).await {
+                        if viewer.can_view_episode(&ep) {
+                            ep.is_read = state
+                                .store
+                                .get_user_episode_read(&viewer.user_id, &ep.id)
+                                .await
+                                .unwrap_or(false);
+                            return (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response();
+                        }
                     }
                 }
             }
@@ -662,17 +836,32 @@ struct SearchParams {
 
 async fn search_episodes(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let limit = params.limit.unwrap_or(10).min(50);
-    match state.store.search_episodes(&params.q, limit).await {
+    match state
+        .store
+        .search_episodes_for_user(&params.q, limit, Some(&viewer.user_id), viewer.is_admin())
+        .await
+    {
         Ok(ids) => {
             let mut episodes = Vec::new();
             for id in &ids {
                 if let Ok(ep) = state.store.get_episode(id).await {
-                    episodes.push(ep);
+                    if viewer.can_view_episode(&ep) {
+                        episodes.push(ep);
+                    }
                 }
             }
+            let _ = state
+                .store
+                .hydrate_episodes_read_state(&mut episodes, &viewer.user_id)
+                .await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"results": episodes})),
@@ -683,7 +872,7 @@ async fn search_episodes(
     }
 }
 
-// ---- Chat with AI ----
+// ---- Chat with AI (Per-User Scoped) ----
 
 #[derive(Deserialize)]
 struct ChatRequest {
@@ -694,9 +883,23 @@ struct ChatRequest {
 
 async fn list_chat(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.store.list_chat_messages(&id).await {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Ok(ep) = state.store.get_episode(&id).await {
+        if !viewer.can_view_episode(&ep) {
+            return err_404();
+        }
+    }
+    match state
+        .store
+        .list_user_chat_messages(&id, &viewer.user_id)
+        .await
+    {
         Ok(messages) => (StatusCode::OK, Json(serde_json::json!({"messages": messages}))).into_response(),
         Err(e) => err_500(e),
     }
@@ -704,35 +907,41 @@ async fn list_chat(
 
 async fn create_chat_with_ai(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    let user_msg = match state.store.add_chat_message(&id, "user", &req.content).await {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => {
+            if !viewer.can_view_episode(&ep) {
+                return err_404();
+            }
+            ep
+        }
+        Err(_) => {
+            return err_404();
+        }
+    };
+
+    let user_msg = match state
+        .store
+        .add_user_chat_message(&id, &viewer.user_id, "user", &req.content)
+        .await
+    {
         Ok(msg) => msg,
         Err(e) => return err_500(e),
     };
 
-    let ep = match state.store.get_episode(&id).await {
-        Ok(ep) => ep,
-        Err(_) => {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "userMessage": serde_json::to_value(&user_msg).unwrap(),
-                    "assistantMessage": {
-                        "id": uuid::Uuid::new_v4().to_string(),
-                        "episodeId": id,
-                        "role": "assistant",
-                        "content": "Episode not found.",
-                        "createdAt": chrono::Utc::now()
-                    }
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let history = state.store.list_chat_messages(&id).await.unwrap_or_default();
+    let history = state
+        .store
+        .list_user_chat_messages(&id, &viewer.user_id)
+        .await
+        .unwrap_or_default();
 
     // Build context
     let system = build_chat_system_prompt(&ep);
@@ -750,7 +959,11 @@ async fn create_chat_with_ai(
 
     let assistant_content = call_llm_anthropic(&state.llm, &system, &messages).await;
 
-    let assistant_msg = match state.store.add_chat_message(&id, "assistant", &assistant_content).await {
+    let assistant_msg = match state
+        .store
+        .add_user_chat_message(&id, &viewer.user_id, "assistant", &assistant_content)
+        .await
+    {
         Ok(msg) => msg,
         Err(e) => return err_500(e),
     };
@@ -863,14 +1076,22 @@ fn deep_read_system_prompt(lang: &str) -> String {
 
 async fn chapter_deep_read(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((id, idx)): Path<(String, usize)>,
     Query(params): Query<DeepReadParams>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let ep = match state.store.get_episode(&id).await {
         Ok(ep) => ep,
         Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
         Err(e) => return err_500(e),
     };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
 
     if idx >= ep.chapters.len() {
         return (
@@ -1058,15 +1279,23 @@ fn extract_markdown_title(markdown: &str, fallback_title: &str) -> (String, Stri
 
 async fn episode_article(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Query(query_params): Query<ArticleParams>,
     body_params: Option<Json<ArticleParams>>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let ep = match state.store.get_episode(&id).await {
         Ok(ep) => ep,
         Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
         Err(e) => return err_500(e),
     };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
 
     let body = body_params.map(|b| b.0).unwrap_or_default();
     let lang = body
@@ -1155,15 +1384,23 @@ struct BatchDeepReadParams {
 
 async fn batch_deep_read_start(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<BatchDeepReadParams>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let lang = params.lang.unwrap_or_else(|| "zh".into());
     let ep = match state.store.get_episode(&id).await {
         Ok(ep) => ep,
         Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
         Err(e) => return err_500(e),
     };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
 
     if ep.chapters.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "no chapters"}))).into_response();
@@ -1410,13 +1647,21 @@ async fn batch_deep_read_cancel(
 
 async fn export_episode(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path((id, format)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
     let ep = match state.store.get_episode(&id).await {
         Ok(ep) => ep,
         Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
         Err(e) => return err_500(e),
     };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
 
     match format.as_str() {
         "markdown" | "md" => {
@@ -1701,8 +1946,16 @@ async fn list_collections(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn create_collection(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CreateCollectionRequest>,
 ) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !viewer.can_edit_episodes() {
+        return err_403("需要管理员授权「修改视频/合集」权限 (can_edit)");
+    }
     match state.store.create_collection(&req.name, req.description.as_deref()).await {
         Ok(col) => (StatusCode::CREATED, Json(serde_json::to_value(col).unwrap())).into_response(),
         Err(e) => err_500(e),
@@ -1711,13 +1964,32 @@ async fn create_collection(
 
 // ---- Utils ----
 
-async fn stats(State(state): State<AppState>) -> impl IntoResponse {
-    let count = state.store.episode_count().await.unwrap_or(0);
+async fn stats(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (uid, is_admin) = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => (Some(v.user_id.clone()), v.is_admin()),
+        Err(_) => (None, false),
+    };
+    let count = state
+        .store
+        .episode_count_for_user(uid.as_deref(), is_admin)
+        .await
+        .unwrap_or(0);
     Json(serde_json::json!({"episode_count": count}))
 }
 
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+fn err_403(msg: &str) -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({"error": msg})),
+    )
+        .into_response()
 }
 
 fn err_404() -> axum::response::Response {
@@ -1775,5 +2047,103 @@ mod tests {
         assert!(chapter_prompt.contains("Scene-First Opening"));
         assert!(chapter_prompt.contains("Reasoning over Assertions"));
         assert!(chapter_prompt.contains("Tri-part Notable Quotes"));
+    }
+
+    #[test]
+    fn test_viewer_rbac_and_private_visibility() {
+        use lumen_pod_core::episode::{Episode, Processing, ProcessingStatus, Source, UserRole};
+
+        let make_ep = |owner: Option<&str>, vis: &str| Episode {
+            id: "ep-1".into(),
+            source: Source {
+                url: "https://youtube.com/watch?v=123".into(),
+                platform: "youtube".into(),
+                title: "Test".into(),
+                author: "Author".into(),
+                published_at: None,
+                thumbnail_url: None,
+                duration: 100.0,
+                feed_url: None,
+                description: None,
+                podcast_name: None,
+                episode_cover_url: None,
+                language: None,
+                audio_path: None,
+            },
+            processing: Processing {
+                status: ProcessingStatus::Done,
+                asr_engine: None,
+                llm_model: None,
+                processed_at: None,
+                agent_id: None,
+                error: None,
+            },
+            summary: None,
+            chapters: vec![],
+            mindmap: None,
+            transcript: None,
+            keywords: vec![],
+            highlights: vec![],
+            qas: vec![],
+            clips: vec![],
+            article: None,
+            shownotes: None,
+            is_read: false,
+            tags: vec![],
+            collection_id: None,
+            owner_id: owner.map(String::from),
+            visibility: vis.into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let admin = auth::ViewerContext {
+            user_id: "u-admin".into(),
+            email: "admin@test.com".into(),
+            role: UserRole::Admin,
+            approved: true,
+            can_edit: true,
+            can_delete: true,
+            can_publish_private: true,
+            is_api_token: false,
+        };
+        let user_a = auth::ViewerContext {
+            user_id: "u-a".into(),
+            email: "a@test.com".into(),
+            role: UserRole::Member,
+            approved: true,
+            can_edit: false,
+            can_delete: false,
+            can_publish_private: true,
+            is_api_token: false,
+        };
+        let user_b = auth::ViewerContext {
+            user_id: "u-b".into(),
+            email: "b@test.com".into(),
+            role: UserRole::Member,
+            approved: true,
+            can_edit: true,
+            can_delete: false,
+            can_publish_private: false,
+            is_api_token: false,
+        };
+
+        let priv_ep = make_ep(Some("u-a"), "private");
+        let pub_ep = make_ep(Some("u-a"), "public");
+
+        // Private episode: visible ONLY to owner (user_a) and admin, NOT user_b
+        assert!(user_a.can_view_episode(&priv_ep));
+        assert!(admin.can_view_episode(&priv_ep));
+        assert!(!user_b.can_view_episode(&priv_ep));
+
+        // Public episode: visible to all approved users
+        assert!(user_a.can_view_episode(&pub_ep));
+        assert!(user_b.can_view_episode(&pub_ep));
+        assert!(admin.can_view_episode(&pub_ep));
+
+        // RBAC permissions
+        assert!(admin.can_edit_episodes() && admin.can_delete_episodes() && admin.can_publish_private_episodes());
+        assert!(!user_a.can_edit_episodes() && !user_a.can_delete_episodes() && user_a.can_publish_private_episodes());
+        assert!(user_b.can_edit_episodes() && !user_b.can_delete_episodes() && !user_b.can_publish_private_episodes());
     }
 }

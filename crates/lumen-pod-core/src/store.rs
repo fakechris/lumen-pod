@@ -46,17 +46,24 @@ impl Store {
 
     pub async fn insert_episode(&self, ep: &Episode) -> PodResult<()> {
         let search_text = Self::build_search_text(ep);
+        let visibility = if ep.visibility == "private" {
+            "private"
+        } else {
+            "public"
+        };
 
         sqlx::query(
             "INSERT INTO episodes (
                 id, source_url, source, processing, summary, chapters,
                 mindmap, transcript, keywords, highlights, qas, clips,
                 article, shownotes, is_read, tags, collection_id,
+                owner_id, visibility,
                 search_vector, created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17,
-                to_tsvector('english', $18), $19, $20
+                $18, $19,
+                to_tsvector('english', $20), $21, $22
             )",
         )
         .bind(&ep.id)
@@ -96,6 +103,8 @@ impl Store {
         .bind(ep.is_read)
         .bind(serde_json::to_value(&ep.tags)?)
         .bind(&ep.collection_id)
+        .bind(&ep.owner_id)
+        .bind(visibility)
         .bind(&search_text)
         .bind(ep.created_at)
         .bind(ep.updated_at)
@@ -109,7 +118,7 @@ impl Store {
         let row = sqlx::query(
             "SELECT source, processing, summary, chapters, mindmap, transcript,
                     keywords, highlights, qas, clips, article, shownotes,
-                    is_read, tags, collection_id, created_at, updated_at
+                    is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
              FROM episodes WHERE id = $1",
         )
         .bind(id)
@@ -121,23 +130,123 @@ impl Store {
     }
 
     pub async fn list_episodes(&self, limit: usize, offset: usize) -> PodResult<Vec<Episode>> {
-        let rows = sqlx::query(
-            "SELECT id, source, processing, summary, chapters, mindmap, transcript,
-                    keywords, highlights, qas, clips, article, shownotes,
-                    is_read, tags, collection_id, created_at, updated_at
-             FROM episodes ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-        )
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        self.list_episodes_for_user(limit, offset, None, true).await
+    }
 
-        rows.iter()
+    pub async fn list_episodes_for_user(
+        &self,
+        limit: usize,
+        offset: usize,
+        user_id: Option<&str>,
+        is_admin: bool,
+    ) -> PodResult<Vec<Episode>> {
+        let rows = if is_admin {
+            sqlx::query(
+                "SELECT id, source, processing, summary, chapters, mindmap, transcript,
+                        keywords, highlights, qas, clips, article, shownotes,
+                        is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
+                 FROM episodes ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            )
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, source, processing, summary, chapters, mindmap, transcript,
+                        keywords, highlights, qas, clips, article, shownotes,
+                        is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
+                 FROM episodes
+                 WHERE visibility = 'public' OR owner_id = $3
+                 ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            )
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .bind(user_id.unwrap_or(""))
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        let mut episodes: Vec<Episode> = rows
+            .iter()
             .map(|row| {
                 let id: &str = row.get("id");
                 Self::row_to_episode(id, row)
             })
-            .collect()
+            .collect::<PodResult<Vec<_>>>()?;
+
+        if let Some(uid) = user_id {
+            self.hydrate_episodes_read_state(&mut episodes, uid).await?;
+        }
+
+        Ok(episodes)
+    }
+
+    pub async fn set_user_episode_read(
+        &self,
+        user_id: &str,
+        episode_id: &str,
+        is_read: bool,
+    ) -> PodResult<()> {
+        sqlx::query(
+            "INSERT INTO user_episode_reads (user_id, episode_id, is_read, updated_at)
+             VALUES ($1, $2, $3, NOW())
+             ON CONFLICT (user_id, episode_id) DO UPDATE SET
+               is_read = EXCLUDED.is_read,
+               updated_at = NOW()",
+        )
+        .bind(user_id)
+        .bind(episode_id)
+        .bind(is_read)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_user_episode_read(
+        &self,
+        user_id: &str,
+        episode_id: &str,
+    ) -> PodResult<bool> {
+        let row = sqlx::query(
+            "SELECT is_read FROM user_episode_reads WHERE user_id = $1 AND episode_id = $2",
+        )
+        .bind(user_id)
+        .bind(episode_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<bool, _>("is_read")).unwrap_or(false))
+    }
+
+    pub async fn hydrate_episodes_read_state(
+        &self,
+        episodes: &mut [Episode],
+        user_id: &str,
+    ) -> PodResult<()> {
+        if episodes.is_empty() || user_id.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = episodes.iter().map(|e| e.id.clone()).collect();
+        let rows = sqlx::query(
+            "SELECT episode_id, is_read FROM user_episode_reads
+             WHERE user_id = $1 AND episode_id = ANY($2)",
+        )
+        .bind(user_id)
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut read_map = std::collections::HashMap::new();
+        for r in rows {
+            let ep_id: String = r.get("episode_id");
+            let is_read: bool = r.get("is_read");
+            read_map.insert(ep_id, is_read);
+        }
+
+        for ep in episodes.iter_mut() {
+            ep.is_read = *read_map.get(&ep.id).unwrap_or(&false);
+        }
+        Ok(())
     }
 
     pub async fn update_episode(
@@ -181,7 +290,23 @@ impl Store {
         }
         patch!(tags, "tags", "tags");
         if let Some(v) = updates.get("collectionId").or_else(|| updates.get("collection_id")) {
-            ep.collection_id = v.as_str().map(String::from);
+            ep.collection_id = if v.is_null() {
+                None
+            } else {
+                v.as_str().filter(|s| !s.is_empty()).map(String::from)
+            };
+        }
+        if let Some(v) = updates.get("visibility") {
+            if let Some(vis) = v.as_str() {
+                if vis == "public" || vis == "private" {
+                    ep.visibility = vis.to_string();
+                }
+            }
+        }
+        if let Some(v) = updates.get("ownerId").or_else(|| updates.get("owner_id")) {
+            if let Some(oid) = v.as_str() {
+                ep.owner_id = Some(oid.to_string());
+            }
         }
         if let Some(v) = updates.get("summary") {
             if let Ok(s) = serde_json::from_value(v.clone()) {
@@ -217,9 +342,10 @@ impl Store {
                 keywords = $7, highlights = $8, qas = $9,
                 clips = $10, article = $11, shownotes = $12,
                 is_read = $13, tags = $14, collection_id = $15,
-                search_vector = to_tsvector('english', $16),
-                updated_at = $17
-             WHERE id = $18",
+                owner_id = $16, visibility = $17,
+                search_vector = to_tsvector('english', $18),
+                updated_at = $19
+             WHERE id = $20",
         )
         .bind(serde_json::to_value(&ep.source)?)
         .bind(serde_json::to_value(&ep.processing)?)
@@ -256,6 +382,8 @@ impl Store {
         .bind(ep.is_read)
         .bind(serde_json::to_value(&ep.tags)?)
         .bind(&ep.collection_id)
+        .bind(&ep.owner_id)
+        .bind(&ep.visibility)
         .bind(&search_text)
         .bind(ep.updated_at)
         .bind(id)
@@ -274,24 +402,66 @@ impl Store {
     }
 
     pub async fn search_episodes(&self, query: &str, limit: usize) -> PodResult<Vec<String>> {
-        let rows = sqlx::query(
-            "SELECT id FROM episodes
-             WHERE search_vector @@ websearch_to_tsquery('english', $1)
-             ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', $1)) DESC
-             LIMIT $2",
-        )
-        .bind(query)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        self.search_episodes_for_user(query, limit, None, true).await
+    }
+
+    pub async fn search_episodes_for_user(
+        &self,
+        query: &str,
+        limit: usize,
+        user_id: Option<&str>,
+        is_admin: bool,
+    ) -> PodResult<Vec<String>> {
+        let rows = if is_admin {
+            sqlx::query(
+                "SELECT id FROM episodes
+                 WHERE search_vector @@ websearch_to_tsquery('english', $1)
+                 ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', $1)) DESC
+                 LIMIT $2",
+            )
+            .bind(query)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id FROM episodes
+                 WHERE search_vector @@ websearch_to_tsquery('english', $1)
+                   AND (visibility = 'public' OR owner_id = $3)
+                 ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', $1)) DESC
+                 LIMIT $2",
+            )
+            .bind(query)
+            .bind(limit as i64)
+            .bind(user_id.unwrap_or(""))
+            .fetch_all(&self.pool)
+            .await?
+        };
 
         Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
     }
 
     pub async fn episode_count(&self) -> PodResult<usize> {
-        let row = sqlx::query("SELECT COUNT(*) as cnt FROM episodes")
+        self.episode_count_for_user(None, true).await
+    }
+
+    pub async fn episode_count_for_user(
+        &self,
+        user_id: Option<&str>,
+        is_admin: bool,
+    ) -> PodResult<usize> {
+        let row = if is_admin {
+            sqlx::query("SELECT COUNT(*) as cnt FROM episodes")
+                .fetch_one(&self.pool)
+                .await?
+        } else {
+            sqlx::query(
+                "SELECT COUNT(*) as cnt FROM episodes WHERE visibility = 'public' OR owner_id = $1",
+            )
+            .bind(user_id.unwrap_or(""))
             .fetch_one(&self.pool)
-            .await?;
+            .await?
+        };
         Ok(row.get::<i64, _>("cnt") as usize)
     }
 
@@ -305,17 +475,19 @@ impl Store {
     }
 
     pub async fn find_episode_by_url(&self, url: &str) -> PodResult<Option<Episode>> {
-        let row = sqlx::query("SELECT id, data, source_url, created_at, updated_at FROM episodes WHERE source_url = $1 LIMIT 1")
-            .bind(url)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT id, source, processing, summary, chapters, mindmap, transcript,
+                    keywords, highlights, qas, clips, article, shownotes,
+                    is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
+             FROM episodes WHERE source_url = $1 LIMIT 1",
+        )
+        .bind(url)
+        .fetch_optional(&self.pool)
+        .await?;
         match row {
             Some(r) => {
-                let data: serde_json::Value = r.get("data");
-                let mut ep: Episode = serde_json::from_value(data)
-                    .map_err(|e| crate::error::PodError::InvalidInput(e.to_string()))?;
-                ep.id = r.get("id");
-                Ok(Some(ep))
+                let id: String = r.get("id");
+                Ok(Some(Self::row_to_episode(&id, &r)?))
             }
             None => Ok(None),
         }
@@ -324,34 +496,43 @@ impl Store {
     // ---- User / Auth ----
 
     pub async fn upsert_user(&self, user: &User) -> PodResult<()> {
+        let is_admin = user.role == UserRole::Admin;
         sqlx::query(
-            "INSERT INTO users (id, email, name, avatar_url, role, approved, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO users (id, email, name, avatar_url, role, approved, can_edit, can_delete, can_publish_private, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT(email) DO UPDATE SET
                name = EXCLUDED.name,
-               avatar_url = EXCLUDED.avatar_url",
+               avatar_url = EXCLUDED.avatar_url,
+               can_edit = EXCLUDED.can_edit,
+               can_delete = EXCLUDED.can_delete,
+               can_publish_private = EXCLUDED.can_publish_private",
         )
         .bind(&user.id)
         .bind(&user.email)
         .bind(&user.name)
         .bind(&user.avatar_url)
-        .bind(match user.role {
-            UserRole::Admin => "admin",
-            UserRole::Member => "member",
-        })
+        .bind(if is_admin { "admin" } else { "member" })
         .bind(user.approved)
+        .bind(is_admin || user.can_edit)
+        .bind(is_admin || user.can_delete)
+        .bind(is_admin || user.can_publish_private)
         .bind(user.created_at)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Seed a built-in admin. Idempotent: if user exists, upgrades to admin+approved.
+    /// Seed a built-in admin. Idempotent: if user exists, upgrades to admin+approved with full permissions.
     pub async fn seed_admin(&self, email: &str) -> PodResult<()> {
         sqlx::query(
-            "INSERT INTO users (id, email, role, approved, created_at)
-             VALUES ($1, $2, 'admin', TRUE, NOW())
-             ON CONFLICT(email) DO UPDATE SET role = 'admin', approved = TRUE",
+            "INSERT INTO users (id, email, role, approved, can_edit, can_delete, can_publish_private, created_at)
+             VALUES ($1, $2, 'admin', TRUE, TRUE, TRUE, TRUE, NOW())
+             ON CONFLICT(email) DO UPDATE SET
+               role = 'admin',
+               approved = TRUE,
+               can_edit = TRUE,
+               can_delete = TRUE,
+               can_publish_private = TRUE",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(email)
@@ -361,7 +542,8 @@ impl Store {
     }
 
     /// Upsert user from Google OAuth. Does NOT block anyone.
-    /// - Admin emails → role=admin, approved=true
+    /// - First human user in the system (no admin with google_sub yet, or empty users table) → role=admin, approved=true, all permissions=true
+    /// - Admin emails → role=admin, approved=true, all permissions=true
     /// - Invited emails → role=member, approved=true
     /// - Others → role=member, approved=false (pending)
     pub async fn upsert_user_google(
@@ -372,22 +554,37 @@ impl Store {
         google_sub: &str,
         admin_emails: &[String],
     ) -> PodResult<User> {
-        let is_admin = admin_emails.iter().any(|e| e.eq_ignore_ascii_case(email));
+        let has_google_admin: bool = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE role = 'admin' AND google_sub IS NOT NULL) as exists",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map(|r| r.get::<bool, _>("exists"))
+        .unwrap_or(false);
+
+        let is_admin = !has_google_admin
+            || admin_emails.iter().any(|e| e.eq_ignore_ascii_case(email));
         let is_invited = self.is_email_invited(email).await.unwrap_or(false);
         let auto_approved = is_admin || is_invited;
 
         let role = if is_admin { "admin" } else { "member" };
 
         let row = sqlx::query(
-            "INSERT INTO users (id, email, name, avatar_url, role, approved, google_sub, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            "INSERT INTO users (
+                id, email, name, avatar_url, role, approved,
+                can_edit, can_delete, can_publish_private, google_sub, created_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $7, $8, NOW())
              ON CONFLICT(email) DO UPDATE SET
                name = COALESCE(EXCLUDED.name, users.name),
                avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
                google_sub = EXCLUDED.google_sub,
                role = CASE WHEN EXCLUDED.role = 'admin' THEN 'admin' ELSE users.role END,
-               approved = CASE WHEN EXCLUDED.approved THEN TRUE ELSE users.approved END
-             RETURNING id, email, name, avatar_url, role, approved, created_at",
+               approved = CASE WHEN EXCLUDED.approved THEN TRUE ELSE users.approved END,
+               can_edit = CASE WHEN EXCLUDED.role = 'admin' OR users.role = 'admin' THEN TRUE ELSE users.can_edit END,
+               can_delete = CASE WHEN EXCLUDED.role = 'admin' OR users.role = 'admin' THEN TRUE ELSE users.can_delete END,
+               can_publish_private = CASE WHEN EXCLUDED.role = 'admin' OR users.role = 'admin' THEN TRUE ELSE users.can_publish_private END
+             RETURNING id, email, name, avatar_url, role, approved, can_edit, can_delete, can_publish_private, created_at",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(email)
@@ -395,6 +592,7 @@ impl Store {
         .bind(avatar_url)
         .bind(role)
         .bind(auto_approved)
+        .bind(is_admin)
         .bind(google_sub)
         .fetch_one(&self.pool)
         .await?;
@@ -404,7 +602,7 @@ impl Store {
 
     pub async fn get_user_by_email(&self, email: &str) -> PodResult<Option<User>> {
         let row = sqlx::query(
-            "SELECT id, email, name, avatar_url, role, approved, created_at
+            "SELECT id, email, name, avatar_url, role, approved, can_edit, can_delete, can_publish_private, created_at
              FROM users WHERE email = $1",
         )
         .bind(email)
@@ -414,9 +612,21 @@ impl Store {
         Ok(row.as_ref().map(Self::row_to_user))
     }
 
+    pub async fn get_user_by_id(&self, id: &str) -> PodResult<Option<User>> {
+        let row = sqlx::query(
+            "SELECT id, email, name, avatar_url, role, approved, can_edit, can_delete, can_publish_private, created_at
+             FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.as_ref().map(Self::row_to_user))
+    }
+
     pub async fn list_users(&self) -> PodResult<Vec<User>> {
         let rows = sqlx::query(
-            "SELECT id, email, name, avatar_url, role, approved, created_at
+            "SELECT id, email, name, avatar_url, role, approved, can_edit, can_delete, can_publish_private, created_at
              FROM users ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -442,12 +652,80 @@ impl Store {
     }
 
     pub async fn set_user_role(&self, user_id: &str, role: &str) -> PodResult<bool> {
-        let result =
-            sqlx::query("UPDATE users SET role = $1 WHERE id = $2")
-                .bind(role)
-                .bind(user_id)
-                .execute(&self.pool)
-                .await?;
+        let is_admin = role == "admin";
+        let result = sqlx::query(
+            "UPDATE users SET
+                role = $1,
+                can_edit = CASE WHEN $3 THEN TRUE ELSE can_edit END,
+                can_delete = CASE WHEN $3 THEN TRUE ELSE can_delete END,
+                can_publish_private = CASE WHEN $3 THEN TRUE ELSE can_publish_private END
+             WHERE id = $2",
+        )
+        .bind(role)
+        .bind(user_id)
+        .bind(is_admin)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_user_permissions(
+        &self,
+        user_id: &str,
+        approved: Option<bool>,
+        role: Option<&str>,
+        can_edit: Option<bool>,
+        can_delete: Option<bool>,
+        can_publish_private: Option<bool>,
+    ) -> PodResult<bool> {
+        let Some(mut user) = self.get_user_by_id(user_id).await? else {
+            return Ok(false);
+        };
+        if let Some(a) = approved {
+            user.approved = a;
+        }
+        if let Some(r) = role {
+            if r == "admin" {
+                user.role = UserRole::Admin;
+                user.can_edit = true;
+                user.can_delete = true;
+                user.can_publish_private = true;
+            } else if r == "member" {
+                user.role = UserRole::Member;
+            }
+        }
+        if let Some(ce) = can_edit {
+            user.can_edit = ce || user.role == UserRole::Admin;
+        }
+        if let Some(cd) = can_delete {
+            user.can_delete = cd || user.role == UserRole::Admin;
+        }
+        if let Some(cp) = can_publish_private {
+            user.can_publish_private = cp || user.role == UserRole::Admin;
+        }
+
+        let role_str = match user.role {
+            UserRole::Admin => "admin",
+            UserRole::Member => "member",
+        };
+        let result = sqlx::query(
+            "UPDATE users SET
+                approved = $1,
+                role = $2,
+                can_edit = $3,
+                can_delete = $4,
+                can_publish_private = $5
+             WHERE id = $6",
+        )
+        .bind(user.approved)
+        .bind(role_str)
+        .bind(user.can_edit)
+        .bind(user.can_delete)
+        .bind(user.can_publish_private)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+
         Ok(result.rows_affected() > 0)
     }
 
@@ -505,21 +783,26 @@ impl Store {
     }
 
     fn row_to_user(r: &sqlx::postgres::PgRow) -> User {
+        let role = match r.get::<String, _>("role").as_str() {
+            "admin" => UserRole::Admin,
+            _ => UserRole::Member,
+        };
+        let is_admin = role == UserRole::Admin;
         User {
             id: r.get("id"),
             email: r.get("email"),
             name: r.get("name"),
             avatar_url: r.get("avatar_url"),
-            role: match r.get::<String, _>("role").as_str() {
-                "admin" => UserRole::Admin,
-                _ => UserRole::Member,
-            },
+            role,
             approved: r.get("approved"),
+            can_edit: is_admin || r.try_get("can_edit").unwrap_or(false),
+            can_delete: is_admin || r.try_get("can_delete").unwrap_or(false),
+            can_publish_private: is_admin || r.try_get("can_publish_private").unwrap_or(false),
             created_at: r.get("created_at"),
         }
     }
 
-    // ---- Chat Messages ----
+    // ---- Chat Messages (Per-User Scoped) ----
 
     pub async fn add_chat_message(
         &self,
@@ -527,22 +810,35 @@ impl Store {
         role: &str,
         content: &str,
     ) -> PodResult<crate::episode::ChatMessage> {
+        self.add_user_chat_message(episode_id, "", role, content).await
+    }
+
+    pub async fn add_user_chat_message(
+        &self,
+        episode_id: &str,
+        user_id: &str,
+        role: &str,
+        content: &str,
+    ) -> PodResult<crate::episode::ChatMessage> {
         let id = uuid::Uuid::new_v4().to_string();
         let row = sqlx::query(
-            "INSERT INTO chat_messages (id, episode_id, role, content, created_at)
-             VALUES ($1, $2, $3, $4, NOW())
-             RETURNING id, episode_id, role, content, created_at",
+            "INSERT INTO chat_messages (id, episode_id, user_id, role, content, created_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())
+             RETURNING id, episode_id, user_id, role, content, created_at",
         )
         .bind(&id)
         .bind(episode_id)
+        .bind(user_id)
         .bind(role)
         .bind(content)
         .fetch_one(&self.pool)
         .await?;
 
+        let uid: String = row.get("user_id");
         Ok(crate::episode::ChatMessage {
             id: row.get("id"),
             episode_id: row.get("episode_id"),
+            user_id: if uid.is_empty() { None } else { Some(uid) },
             role: match row.get::<String, _>("role").as_str() {
                 "assistant" => crate::episode::ChatRole::Assistant,
                 _ => crate::episode::ChatRole::User,
@@ -556,26 +852,39 @@ impl Store {
         &self,
         episode_id: &str,
     ) -> PodResult<Vec<crate::episode::ChatMessage>> {
+        self.list_user_chat_messages(episode_id, "").await
+    }
+
+    pub async fn list_user_chat_messages(
+        &self,
+        episode_id: &str,
+        user_id: &str,
+    ) -> PodResult<Vec<crate::episode::ChatMessage>> {
         let rows = sqlx::query(
-            "SELECT id, episode_id, role, content, created_at
-             FROM chat_messages WHERE episode_id = $1
+            "SELECT id, episode_id, user_id, role, content, created_at
+             FROM chat_messages WHERE episode_id = $1 AND user_id = $2
              ORDER BY created_at ASC",
         )
         .bind(episode_id)
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
 
         Ok(rows
             .iter()
-            .map(|r| crate::episode::ChatMessage {
-                id: r.get("id"),
-                episode_id: r.get("episode_id"),
-                role: match r.get::<String, _>("role").as_str() {
-                    "assistant" => crate::episode::ChatRole::Assistant,
-                    _ => crate::episode::ChatRole::User,
-                },
-                content: r.get("content"),
-                created_at: r.get("created_at"),
+            .map(|r| {
+                let uid: String = r.get("user_id");
+                crate::episode::ChatMessage {
+                    id: r.get("id"),
+                    episode_id: r.get("episode_id"),
+                    user_id: if uid.is_empty() { None } else { Some(uid) },
+                    role: match r.get::<String, _>("role").as_str() {
+                        "assistant" => crate::episode::ChatRole::Assistant,
+                        _ => crate::episode::ChatRole::User,
+                    },
+                    content: r.get("content"),
+                    created_at: r.get("created_at"),
+                }
             })
             .collect())
     }
@@ -703,6 +1012,10 @@ impl Store {
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default(),
             collection_id: row.get("collection_id"),
+            owner_id: row.try_get("owner_id").unwrap_or(None),
+            visibility: row
+                .try_get::<String, _>("visibility")
+                .unwrap_or_else(|_| "public".to_string()),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })
@@ -840,6 +1153,8 @@ mod tests {
             is_read: false,
             tags: vec!["ai".into(), "tech".into()],
             collection_id: None,
+            owner_id: None,
+            visibility: "public".into(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -927,6 +1242,9 @@ mod tests {
             avatar_url: None,
             role: UserRole::Member,
             approved: false,
+            can_edit: false,
+            can_delete: false,
+            can_publish_private: false,
             created_at: Utc::now(),
         };
         store.upsert_user(&user).await.unwrap();

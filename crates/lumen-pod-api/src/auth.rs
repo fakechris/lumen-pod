@@ -142,43 +142,150 @@ pub fn extract_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims> {
     None
 }
 
-/// Require authenticated + approved user. Returns claims or error response.
-pub fn require_approved(headers: &HeaderMap, jwt_secret: &str) -> Result<Claims, axum::response::Response> {
-    match extract_claims(headers, jwt_secret) {
-        None => Err((
+// ---- Viewer Context (RBAC + Per-User Isolation) ----
+
+#[derive(Debug, Clone)]
+pub struct ViewerContext {
+    pub user_id: String,
+    pub email: String,
+    pub role: UserRole,
+    pub approved: bool,
+    pub can_edit: bool,
+    pub can_delete: bool,
+    pub can_publish_private: bool,
+    pub is_api_token: bool,
+}
+
+impl ViewerContext {
+    pub fn api_token() -> Self {
+        Self {
+            user_id: "api-token".to_string(),
+            email: "agent@lumen-pod.local".to_string(),
+            role: UserRole::Admin,
+            approved: true,
+            can_edit: true,
+            can_delete: true,
+            can_publish_private: true,
+            is_api_token: true,
+        }
+    }
+
+    pub fn is_admin(&self) -> bool {
+        self.is_api_token || self.role == UserRole::Admin
+    }
+
+    pub fn can_edit_episodes(&self) -> bool {
+        self.is_admin() || self.can_edit
+    }
+
+    pub fn can_delete_episodes(&self) -> bool {
+        self.is_admin() || self.can_delete
+    }
+
+    pub fn can_publish_private_episodes(&self) -> bool {
+        self.is_admin() || self.can_publish_private
+    }
+
+    pub fn can_view_episode(&self, ep: &lumen_pod_core::episode::Episode) -> bool {
+        if ep.visibility != "private" {
+            return true;
+        }
+        self.is_admin() || ep.owner_id.as_deref() == Some(self.user_id.as_str())
+    }
+}
+
+/// Resolve the current viewer from Bearer API token or JWT session + live DB permissions.
+pub async fn resolve_viewer(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ViewerContext, axum::response::Response> {
+    if let Some(auth_header) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if let Some(token) = auth_header.strip_prefix("Bearer ") {
+            if state
+                .auth
+                .api_tokens
+                .iter()
+                .any(|t| constant_time_eq(t.as_bytes(), token.as_bytes()))
+            {
+                return Ok(ViewerContext::api_token());
+            }
+        }
+    }
+
+    let Some(claims) = extract_claims(headers, &state.auth.jwt_secret) else {
+        return Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "not authenticated"})),
         )
-            .into_response()),
-        Some(c) if !c.approved => Err((
+            .into_response());
+    };
+
+    // Fetch live user record from DB so permission/role/approval changes take effect immediately
+    let db_user = match state.store.get_user_by_id(&claims.sub).await {
+        Ok(Some(u)) => Some(u),
+        _ => state.store.get_user_by_email(&claims.email).await.ok().flatten(),
+    };
+
+    let viewer = if let Some(u) = db_user {
+        let is_admin = u.role == UserRole::Admin;
+        ViewerContext {
+            user_id: u.id,
+            email: u.email,
+            role: u.role,
+            approved: u.approved,
+            can_edit: is_admin || u.can_edit,
+            can_delete: is_admin || u.can_delete,
+            can_publish_private: is_admin || u.can_publish_private,
+            is_api_token: false,
+        }
+    } else {
+        let is_admin = claims.role == "admin";
+        ViewerContext {
+            user_id: claims.sub,
+            email: claims.email,
+            role: if is_admin { UserRole::Admin } else { UserRole::Member },
+            approved: claims.approved,
+            can_edit: is_admin,
+            can_delete: is_admin,
+            can_publish_private: is_admin,
+            is_api_token: false,
+        }
+    };
+
+    if !viewer.approved {
+        return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": "pending_approval",
                 "message": "Your account is awaiting admin approval.",
-                "email": c.email,
+                "email": viewer.email,
             })),
         )
-            .into_response()),
-        Some(c) => Ok(c),
+            .into_response());
     }
+
+    Ok(viewer)
 }
 
-/// Require authenticated + approved + admin role.
-pub fn require_admin(headers: &HeaderMap, jwt_secret: &str) -> Result<Claims, axum::response::Response> {
-    let claims = require_approved(headers, jwt_secret)?;
-    if claims.role != "admin" {
+/// Require authenticated + approved + admin role (resolves live DB role).
+pub async fn require_admin_viewer(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ViewerContext, axum::response::Response> {
+    let viewer = resolve_viewer(state, headers).await?;
+    if !viewer.is_admin() {
         return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "admin only"})),
         )
             .into_response());
     }
-    Ok(claims)
+    Ok(viewer)
 }
 
 // ---- Auth middleware (axum layer) ----
 
-/// Middleware: require either a valid API token (Bearer) or an approved cookie session.
+/// Middleware: require either a valid API token (Bearer) or an approved session (resolved from DB).
 /// Attach to all /api/* routes except /api/me.
 pub async fn require_auth(
     State(state): State<AppState>,
@@ -186,18 +293,7 @@ pub async fn require_auth(
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, axum::response::Response> {
     let headers = req.headers();
-
-    // 1. Check Bearer API token (for agents / curl)
-    if let Some(auth_header) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        if let Some(token) = auth_header.strip_prefix("Bearer ") {
-            if state.auth.api_tokens.iter().any(|t| constant_time_eq(t.as_bytes(), token.as_bytes())) {
-                return Ok(next.run(req).await);
-            }
-        }
-    }
-
-    // 2. Check cookie session (for browser)
-    match require_approved(headers, &state.auth.jwt_secret) {
+    match resolve_viewer(&state, headers).await {
         Ok(_) => Ok(next.run(req).await),
         Err(e) => Err(e),
     }
@@ -398,6 +494,7 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
             let user = state.store.get_user_by_email(&claims.email).await;
             match user {
                 Ok(Some(u)) => {
+                    let is_admin = u.role == UserRole::Admin;
                     let role_str = match u.role {
                         UserRole::Admin => "admin",
                         UserRole::Member => "member",
@@ -411,20 +508,29 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
                             "avatar_url": u.avatar_url,
                             "role": role_str,
                             "approved": u.approved,
+                            "can_edit": is_admin || u.can_edit,
+                            "can_delete": is_admin || u.can_delete,
+                            "can_publish_private": is_admin || u.can_publish_private,
                         })),
                     )
                         .into_response()
                 }
-                _ => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "id": claims.sub,
-                        "email": claims.email,
-                        "role": claims.role,
-                        "approved": claims.approved,
-                    })),
-                )
-                    .into_response(),
+                _ => {
+                    let is_admin = claims.role == "admin";
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": claims.sub,
+                            "email": claims.email,
+                            "role": claims.role,
+                            "approved": claims.approved,
+                            "can_edit": is_admin,
+                            "can_delete": is_admin,
+                            "can_publish_private": is_admin,
+                        })),
+                    )
+                        .into_response()
+                }
             }
         }
         None => (
@@ -441,7 +547,7 @@ pub async fn list_users(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&headers, &state.auth.jwt_secret) {
+    if let Err(e) = require_admin_viewer(&state, &headers).await {
         return e;
     }
 
@@ -450,6 +556,7 @@ pub async fn list_users(
             let data: Vec<_> = users
                 .iter()
                 .map(|u| {
+                    let is_admin = u.role == UserRole::Admin;
                     serde_json::json!({
                         "id": u.id,
                         "email": u.email,
@@ -457,6 +564,9 @@ pub async fn list_users(
                         "avatar_url": u.avatar_url,
                         "role": match u.role { UserRole::Admin => "admin", UserRole::Member => "member" },
                         "approved": u.approved,
+                        "can_edit": is_admin || u.can_edit,
+                        "can_delete": is_admin || u.can_delete,
+                        "can_publish_private": is_admin || u.can_publish_private,
                         "created_at": u.created_at,
                     })
                 })
@@ -475,6 +585,12 @@ pub async fn list_users(
 pub struct UpdateUserRequest {
     pub approved: Option<bool>,
     pub role: Option<String>,
+    #[serde(alias = "canEdit")]
+    pub can_edit: Option<bool>,
+    #[serde(alias = "canDelete")]
+    pub can_delete: Option<bool>,
+    #[serde(alias = "canPublishPrivate")]
+    pub can_publish_private: Option<bool>,
 }
 
 pub async fn update_user(
@@ -483,20 +599,34 @@ pub async fn update_user(
     Path(user_id): Path<String>,
     Json(req): Json<UpdateUserRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&headers, &state.auth.jwt_secret) {
+    if let Err(e) = require_admin_viewer(&state, &headers).await {
         return e;
     }
 
-    if let Some(true) = req.approved {
-        let _ = state.store.approve_user(&user_id).await;
+    match state
+        .store
+        .update_user_permissions(
+            &user_id,
+            req.approved,
+            req.role.as_deref(),
+            req.can_edit,
+            req.can_delete,
+            req.can_publish_private,
+        )
+        .await
+    {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"updated": true}))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "user not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
-    if let Some(role) = &req.role {
-        if role == "admin" || role == "member" {
-            let _ = state.store.set_user_role(&user_id, role).await;
-        }
-    }
-
-    (StatusCode::OK, Json(serde_json::json!({"updated": true}))).into_response()
 }
 
 pub async fn delete_user(
@@ -504,7 +634,7 @@ pub async fn delete_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&headers, &state.auth.jwt_secret) {
+    if let Err(e) = require_admin_viewer(&state, &headers).await {
         return e;
     }
 
@@ -535,15 +665,15 @@ pub async fn create_invite(
     headers: HeaderMap,
     Json(req): Json<CreateInviteRequest>,
 ) -> impl IntoResponse {
-    let claims = match require_admin(&headers, &state.auth.jwt_secret) {
-        Ok(c) => c,
+    let viewer = match require_admin_viewer(&state, &headers).await {
+        Ok(v) => v,
         Err(e) => return e,
     };
 
     let invite = lumen_pod_core::episode::Invite {
         id: uuid::Uuid::new_v4().to_string(),
         email: req.email.clone(),
-        invited_by: claims.sub,
+        invited_by: viewer.user_id,
         created_at: Utc::now(),
         accepted_at: None,
     };
@@ -566,7 +696,7 @@ pub async fn list_invites(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = require_admin(&headers, &state.auth.jwt_secret) {
+    if let Err(e) = require_admin_viewer(&state, &headers).await {
         return e;
     }
 

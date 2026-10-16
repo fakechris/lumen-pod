@@ -66,6 +66,16 @@ function EpisodeCard({ episode }: { episode: Episode }) {
             <span className={`px-1.5 py-0.5 text-xs rounded-full ${statusColors[episode.processing.status] || statusColors.pending}`}>
               {episode.processing.status}
             </span>
+            {episode.visibility === "private" && (
+              <span className="px-1.5 py-0.5 text-xs rounded-full bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 font-medium">
+                🔒 私密
+              </span>
+            )}
+            {episode.isRead && (
+              <span className="px-1.5 py-0.5 text-xs rounded-full bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400">
+                ✓ 已读
+              </span>
+            )}
           </div>
           {episode.summary && (
             <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400 line-clamp-2">
@@ -95,8 +105,15 @@ function EpisodeCard({ episode }: { episode: Episode }) {
   );
 }
 
-function SubmitUrlForm({ onSubmitted }: { onSubmitted: () => void }) {
+function SubmitUrlForm({
+  onSubmitted,
+  canPublishPrivate,
+}: {
+  onSubmitted: () => void;
+  canPublishPrivate: boolean;
+}) {
   const [url, setUrl] = useState("");
+  const [visibility, setVisibility] = useState<"public" | "private">("public");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -114,11 +131,13 @@ function SubmitUrlForm({ onSubmitted }: { onSubmitted: () => void }) {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: trimmed }),
+        body: JSON.stringify({ url: trimmed, visibility }),
       });
       const data = await res.json();
       if (res.ok) {
-        setSuccess(`✓ Submitted! Episode ID: ${data.id}`);
+        setSuccess(
+          `✓ Submitted (${visibility === "private" ? "🔒 Private" : "🌐 Public"})! Episode ID: ${data.id}`
+        );
         setUrl("");
         onSubmitted();
       } else {
@@ -133,7 +152,7 @@ function SubmitUrlForm({ onSubmitted }: { onSubmitted: () => void }) {
 
   return (
     <div className="space-y-3">
-      <div className="flex gap-2">
+      <div className="flex gap-2 flex-wrap sm:flex-nowrap">
         <input
           type="url"
           placeholder="Paste a podcast or video URL (YouTube, Bilibili, Spotify, Apple...)"
@@ -141,8 +160,24 @@ function SubmitUrlForm({ onSubmitted }: { onSubmitted: () => void }) {
           onChange={(e) => { setUrl(e.target.value); setError(null); setSuccess(null); }}
           onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
           disabled={submitting}
-          className="flex-1 px-4 py-2.5 rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-50 placeholder:text-zinc-400"
+          className="flex-1 min-w-[220px] px-4 py-2.5 rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none disabled:opacity-50 placeholder:text-zinc-400"
         />
+        <select
+          value={visibility}
+          onChange={(e) => setVisibility(e.target.value as "public" | "private")}
+          disabled={submitting}
+          className="px-3 py-2.5 rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-200 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+          title={
+            canPublishPrivate
+              ? "选择公开或仅自己可见的私密视频"
+              : "发布私密视频需管理员授权 (can_publish_private)"
+          }
+        >
+          <option value="public">🌐 公开 (Public)</option>
+          <option value="private" disabled={!canPublishPrivate}>
+            🔒 私密 (仅自己可见){!canPublishPrivate ? " — 需管理员授权" : ""}
+          </option>
+        </select>
         <button
           onClick={handleSubmit}
           disabled={submitting || !url.trim()}
@@ -270,7 +305,10 @@ export default function Home() {
             <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100 mb-3">
               Add a Podcast or Video
             </h2>
-            <SubmitUrlForm onSubmitted={fetchEpisodes} />
+            <SubmitUrlForm
+              onSubmitted={fetchEpisodes}
+              canPublishPrivate={Boolean(user.role === "admin" || user.can_publish_private)}
+            />
           </div>
         )}
 
