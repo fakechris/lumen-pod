@@ -132,16 +132,16 @@ Generate a complete, standalone long-form article so thorough that the reader do
 2. **Reasoning over Assertions (重推理轻结论)**: Do not just list conclusions. Reconstruct HOW and WHY the speaker arrives at each insight — what conventional wisdom they challenge and how they deduce the conclusion.
 3. **1:1 Framework + Primary Case Preservation (1:1 保留讲者框架与主案例细节)**: Mirror the speaker's logical structure using `##` headings. Under every major branch, preserve the primary example, experiment, or dataset in full narrative detail — never compress a core story into one sentence.
 4. **Term Pinning & ASR Correction (专有名词核对与原词锚定)**: Fix ASR homophone errors using metadata. When a key concept or technical term first appears, include the original term in parentheses: `认知负荷（Cognitive Load）`.
-5. **Tri-part Notable Quotes (三段式高规格金句引用)**: Include 3–6 verbatim quotes formatted as a three-line blockquote:
+5. **Tri-part Notable Quotes (三段式高规格金句引用)**: Include 3–6 verbatim quotes formatted as a three-line blockquote (use the exact sentence-level timestamp `[MM:SS]` or `[H:MM:SS]`, NOT the paragraph opening timestamp):
    > 「精炼传神的中文译文」
    > *"Exact original wording from the speaker"*
-   > —— Speaker Name `[MM:SS]`
-6. **High-Bar Visual Referrals (高门槛的「回看原片画面」指针)**: Only when words genuinely cannot replace the visual (live UI/code demo, physical experiment, complex chart), insert `🎬 [MM:SS 建议回看原片画面：具体原因]`.
+   > —— Speaker Name `[MM:SS]` (or `[H:MM:SS]` when >= 1 hour)
+6. **High-Bar Visual Referrals (高门槛的「回看原片画面」指针)**: Only when words genuinely cannot replace the visual (live UI/code demo, physical experiment, complex chart), insert `🎬 [MM:SS 建议回看原片画面：具体原因]` (or `🎬 [H:MM:SS 建议回看原片画面：具体原因]` when >= 1 hour).
 7. **Structured Post-Article Curations (结构化尾注)**: Always end the article with:
    - `## 💡 值得记住的核心认知` (3–5 sharp cognitive takeaways)
    - `## 📚 视频提及的书影音与工具` (All books, papers, films, products, tools, or people mentioned, with original names and context)
    - `## 🧭 延伸探索建议` (2–3 genuinely relevant follow-up topics or search queries)
-8. **Interactive Timestamps**: Ensure all timestamps use `[MM:SS]` or `[HH:MM:SS]` so the `lumen-pod` Web UI and Chrome Extension automatically turn them into click-to-seek player buttons.
+8. **Interactive Timestamps**: For timestamps under 1 hour (`< 60:00`), ALWAYS use `[MM:SS]` with two-digit minutes (e.g. `[05:14]`, `[11:33]`) and NEVER prefix with `0:` like `[0:11:33]`. For timestamps at or over 1 hour (`>= 1:00:00`), use `[H:MM:SS]` (e.g. `[1:02:15]`). The `lumen-pod` Web UI and Chrome Extension automatically turn them into click-to-seek player buttons.
 
 #### 4d. Keywords
 ```json

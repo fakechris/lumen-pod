@@ -427,7 +427,13 @@ fn extract_llm_text_from_sse_or_json(body: &str) -> Result<String, String> {
     }
 }
 
+const ARTICLE_TASK_TIMEOUT_MS: u64 = 2_400_000; // 40 minutes for 2-4 hour long-form episodes
+const LLM_STREAM_TOTAL_TIMEOUT_SECS: u64 = 2_400; // 40 minutes wall-clock cap
+const LLM_STREAM_CHUNK_IDLE_TIMEOUT_SECS: u64 = 180; // 3 minutes max silence between SSE chunks
+
 /// Call LLM using the Anthropic Messages API format with `stream: true` and an explicit `max_tokens` budget.
+/// Uses per-chunk idle timeout (`LLM_STREAM_CHUNK_IDLE_TIMEOUT_SECS`) so 2-4 hour podcast generations
+/// taking 10-25 minutes are never cut off as long as SSE chunks continue to arrive.
 async fn call_llm_anthropic_with_tokens(
     config: &LlmConfig,
     system: &str,
@@ -440,7 +446,8 @@ async fn call_llm_anthropic_with_tokens(
     };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(LLM_STREAM_TOTAL_TIMEOUT_SECS))
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
@@ -461,17 +468,29 @@ async fn call_llm_anthropic_with_tokens(
         .await;
 
     match response {
-        Ok(res) => {
+        Ok(mut res) => {
             if !res.status().is_success() {
                 let status = res.status();
                 let body = res.text().await.unwrap_or_default();
                 tracing::error!(%status, %body, "LLM API error");
                 return Err(format!("LLM API error: {status}. {body}"));
             }
-            match res.text().await {
-                Ok(body) => extract_llm_text_from_sse_or_json(&body),
-                Err(e) => Err(format!("Failed to read LLM response stream: {e}")),
+            let mut raw_bytes = Vec::new();
+            let idle_timeout = std::time::Duration::from_secs(LLM_STREAM_CHUNK_IDLE_TIMEOUT_SECS);
+            loop {
+                match tokio::time::timeout(idle_timeout, res.chunk()).await {
+                    Ok(Ok(Some(chunk))) => raw_bytes.extend_from_slice(&chunk),
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => return Err(format!("Failed to read LLM response stream: {e}")),
+                    Err(_) => {
+                        return Err(format!(
+                            "LLM stream idle timeout (no data received for {LLM_STREAM_CHUNK_IDLE_TIMEOUT_SECS}s)"
+                        ));
+                    }
+                }
             }
+            let body = String::from_utf8_lossy(&raw_bytes);
+            extract_llm_text_from_sse_or_json(&body)
         }
         Err(e) => Err(format!("Failed to call LLM: {e}")),
     }
@@ -1244,11 +1263,14 @@ fn deep_read_system_prompt(lang: &str) -> String {
          2. **Reasoning over Assertions**: Do not just list conclusions. Reconstruct the speaker's chain of reasoning (Why & How) — how they move from observation/problem to conclusion.\n\
          3. **Preserve the Primary Case**: Keep the main example, experiment, or story in full narrative detail; never compress a concrete case study into a dry one-sentence bullet.\n\
          4. **Term Pinning & ASR Correction**: Cross-check proper nouns against the episode title/description to fix ASR homophone errors. When a key concept or technical term appears for the first time, include the original term in parentheses, e.g. `认知负荷（Cognitive Load）`.\n\
-         5. **Tri-part Notable Quotes**: Include 1-2 of the most impactful verbatim quotes formatted as a three-part blockquote (preserve the exact timestamp format from the transcript, whether `[MM:SS]` or `[H:MM:SS]` for episodes over an hour):\n\
+         5. **Tri-part Notable Quotes**: Include 1-2 of the most impactful verbatim quotes formatted as a three-part blockquote. Use the exact sentence-level timestamp placed immediately before that quote in the transcript:\n\
             > 「Translated quote in target language」\n\
             > *\"Original verbatim quote\"*\n\
-            > —— Speaker Name `[MM:SS]` (or `[H:MM:SS]`)\n\
-         6. **High-Bar Visual Referrals**: Only if the speaker is demonstrating something that words cannot replace (e.g. live UI/code demo, physical experiment, complex chart), insert `🎬 [MM:SS 建议回看原片画面：reason]` (or `[H:MM:SS ...]`). Otherwise, explain everything thoroughly in text.\n\n\
+            > —— Speaker Name `[MM:SS]` (or `[H:MM:SS]` when >= 1 hour)\n\
+         6. **High-Bar Visual Referrals**: Only if the speaker is demonstrating something that words cannot replace (e.g. live UI/code demo, physical experiment, complex chart), insert `🎬 [MM:SS 建议回看原片画面：reason]` (or `🎬 [H:MM:SS 建议回看原片画面：reason]` when >= 1 hour). Otherwise, explain everything thoroughly in text.\n\
+         7. **Unified Timestamp Format**:\n\
+            - Under 1 hour (`< 60:00`): ALWAYS use `[MM:SS]` (e.g. `[05:14]`, `[11:33]`). NEVER add a leading zero hour such as `[0:11:33]` or `[00:11:33]`.\n\
+            - 1 hour or later (`>= 1:00:00`): ALWAYS use `[H:MM:SS]` (e.g. `[1:02:15]`).\n\n\
          {lang_instruction}"
     )
 }
@@ -1378,24 +1400,61 @@ fn article_system_prompt(lang: &str, focus: Option<&str>) -> String {
             - Use the episode title, author, and description to correct ASR homophone typos in person names, company names, books, and technical terms.\n\
             - When a key concept or technical term first appears, attach the original term in parentheses: `中文译名（Original Term）`.\n\
          5. **Tri-part Notable Quotes (三段式高规格金句引用)**:\n\
-            - Weave 3–6 of the most powerful verbatim quotes into the article using this exact three-line blockquote format (preserve the exact timestamp from the transcript, whether `[MM:SS]` or `[H:MM:SS]` for episodes over an hour):\n\
+            - Weave 3–6 of the most powerful verbatim quotes into the article using this exact three-line blockquote format (use the exact sentence-level timestamp placed immediately before that quoted sentence in the transcript, NOT the paragraph-start timestamp):\n\
               > 「精炼传神的中文译文（或目标语言译文）」\n\
               > *\"Exact original quote from the transcript\"*\n\
-              > —— Speaker Name `[MM:SS]` (or `[H:MM:SS]`)\n\
+              > —— Speaker Name `[MM:SS]` (or `[H:MM:SS]` when >= 1 hour)\n\
             - If the source language and target language are the same, you may omit the duplicate line and keep the quote + `—— Speaker Name [MM:SS]` (or `[H:MM:SS]`).\n\
          6. **High-Bar Visual Referrals (高门槛的「回看原片画面」指针)**:\n\
-            - Only when words genuinely cannot replace the visual (e.g. live code/UI demo, physical experiment, complex chart walkthrough), insert `🎬 [MM:SS 建议回看原片画面：具体原因]` (or `🎬 [H:MM:SS 建议回看原片画面：具体原因]` when over 1 hour).\n\
+            - Only when words genuinely cannot replace the visual (e.g. live code/UI demo, physical experiment, complex chart walkthrough), insert `🎬 [MM:SS 建议回看原片画面：具体原因]` (or `🎬 [H:MM:SS 建议回看原片画面：具体原因]` when >= 1 hour).\n\
             - For all verbal arguments and stories, explain them completely in text.\n\
-         7. **Structured Post-Article Curations (结构化尾注：要点 + 书影音清单 + 延伸探索)**:\n\
+         7. **Unified Timestamp Format (统一时间戳格式)**:\n\
+            - For any timestamp **under 1 hour (`< 60:00`)**, ALWAYS format as `[MM:SS]` with two-digit minutes (e.g. `[05:14]`, `[11:33]`). **NEVER** prefix with a zero hour like `[0:11:33]` or `[00:11:33]`, even if the episode is over an hour long.\n\
+            - For any timestamp **at or over 1 hour (`>= 1:00:00`)**, ALWAYS format as `[H:MM:SS]` (e.g. `[1:02:15]`, `[2:10:05]`).\n\
+         8. **Structured Post-Article Curations (结构化尾注：要点 + 书影音清单 + 延伸探索)**:\n\
             At the end of the article, always include these three curated sections:\n\
             - `## 💡 值得记住的核心认知` (Key Points Worth Remembering): 3–5 sharp cognitive takeaways.\n\
             - `## 📚 视频提及的书影音与工具` (Mentioned Books, Papers, Media & Tools): A structured list of books, papers, films, products, tools, or notable figures mentioned in the episode with their original names and context (if none were mentioned, state so briefly).\n\
             - `## 🧭 延伸探索建议` (Further Exploration): 2–3 genuinely relevant follow-up topics, search queries, or questions for active learning.\n\
-         8. **Clean Title**:\n\
+         9. **Clean Title**:\n\
             - Start the response with a single `# Title` line that is compelling and faithful to the core thesis (avoid clickbait), followed by the article body.\n\
          {focus_instruction}\n\
          {lang_instruction}"
     )
+}
+
+/// Format a transcript paragraph with sentence-level timestamps (`[MM:SS]` or `[H:MM:SS]`)
+/// so that quotes from the middle or end of a long paragraph carry the exact sentence timestamp
+/// rather than the paragraph's opening timestamp.
+fn format_paragraph_with_sentence_timestamps(
+    para: &lumen_pod_core::episode::Paragraph,
+) -> String {
+    let mut line = String::new();
+    let para_start = para
+        .sentences
+        .first()
+        .and_then(|s| s.words.first().map(|w| w.start))
+        .unwrap_or(0.0);
+    let mut last_ts = fmt_dur(para_start);
+    line.push_str(&format!("[{last_ts}] "));
+    if let Some(speaker) = &para.speaker {
+        line.push_str(&format!("{speaker}: "));
+    }
+    for (idx, sent) in para.sentences.iter().enumerate() {
+        if idx > 0 {
+            if let Some(sec) = sent.words.first().map(|w| w.start) {
+                let ts = fmt_dur(sec);
+                if ts != last_ts {
+                    line.push_str(&format!("[{ts}] "));
+                    last_ts = ts;
+                }
+            }
+        }
+        line.push_str(&sent.text);
+        line.push(' ');
+    }
+    line.push('\n');
+    line
 }
 
 fn build_episode_article_context(ep: &lumen_pod_core::episode::Episode) -> String {
@@ -1433,25 +1492,12 @@ fn build_episode_article_context(ep: &lumen_pod_core::episode::Episode) -> Strin
     }
 
     if let Some(t) = &ep.transcript {
-        ctx.push_str("Full Timestamped Transcript:\n");
+        ctx.push_str("Full Timestamped Transcript (sentence-level timestamps):\n");
         let mut trans_buf = String::new();
         for para in &t.paragraphs {
-            let start_sec = para
-                .sentences
-                .first()
-                .and_then(|s| s.words.first().map(|w| w.start))
-                .unwrap_or(0.0);
-            trans_buf.push_str(&format!("[{}] ", fmt_dur(start_sec)));
-            if let Some(speaker) = &para.speaker {
-                trans_buf.push_str(&format!("{speaker}: "));
-            }
-            for sent in &para.sentences {
-                trans_buf.push_str(&sent.text);
-                trans_buf.push(' ');
-            }
-            trans_buf.push('\n');
+            trans_buf.push_str(&format_paragraph_with_sentence_timestamps(para));
         }
-        ctx.push_str(truncate_utf8_chars(&trans_buf, 120_000));
+        ctx.push_str(truncate_utf8_chars(&trans_buf, 240_000));
     }
 
     ctx
@@ -1523,11 +1569,11 @@ async fn episode_article(
         }
     }
 
-    // Check if an async generation task is already running for this episode (within last 10 mins)
+    // Check if an async generation task is already running for this episode (within ARTICLE_TASK_TIMEOUT_MS)
     {
         let tasks = state.article_tasks.lock().unwrap();
         if let Some(t) = tasks.get(&id) {
-            if t.status == "running" && epoch_ms().saturating_sub(t.started_at_ms) < 600_000 {
+            if t.status == "running" && epoch_ms().saturating_sub(t.started_at_ms) < ARTICLE_TASK_TIMEOUT_MS {
                 return (
                     StatusCode::ACCEPTED,
                     Json(serde_json::json!({
@@ -1544,7 +1590,7 @@ async fn episode_article(
     let context = build_episode_article_context(&ep);
     let user_prompt = format!(
         "Write a complete, standalone 'Read-and-Done' long-form article for the following episode.\n\
-         Ensure timestamps like `[MM:SS]` or `[H:MM:SS]` are preserved on quotes and visual referrals so readers can jump directly to the audio/video player.\n\n\
+         Use the exact sentence-level timestamps from the transcript on quotes and visual referrals: `[MM:SS]` when under 1 hour (NEVER `[0:MM:SS]`) and `[H:MM:SS]` when 1 hour or later.\n\n\
          {context}"
     );
 
@@ -1567,7 +1613,7 @@ async fn episode_article(
         let fallback_title = ep.source.title.clone();
         tokio::spawn(async move {
             let messages = vec![serde_json::json!({"role": "user", "content": user_prompt})];
-            match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 32_768).await
+            match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 64_000).await
             {
                 Ok(raw_output) => {
                     let (title, content) = extract_markdown_title(&raw_output, &fallback_title);
@@ -1614,8 +1660,8 @@ async fn episode_article(
     }
 
     let messages = vec![serde_json::json!({"role": "user", "content": user_prompt})];
-    // Use 32,768 max_tokens so reasoning models (e.g. MiniMax-M3.1) have ample budget for both thinking and long-form article output
-    let raw_output = match call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 32_768).await {
+    // Use 64,000 max_tokens so reasoning models (e.g. MiniMax-M3.1) have ample budget for both thinking and 2-4h long-form article output
+    let raw_output = match call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 64_000).await {
         Ok(text) => text,
         Err(err) => {
             return (
@@ -1675,7 +1721,7 @@ async fn episode_article_status(
     {
         let tasks = state.article_tasks.lock().unwrap();
         if let Some(t) = tasks.get(&id) {
-            if t.status == "running" && epoch_ms().saturating_sub(t.started_at_ms) < 600_000 {
+            if t.status == "running" && epoch_ms().saturating_sub(t.started_at_ms) < ARTICLE_TASK_TIMEOUT_MS {
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
@@ -1930,15 +1976,7 @@ fn build_chapter_transcript(ep: &lumen_pod_core::episode::Episode, chapter: &lum
         let para_start = para.sentences.first().and_then(|s| s.words.first().map(|w| w.start)).unwrap_or(0.0);
         let para_end = para.sentences.last().and_then(|s| s.words.last().map(|w| w.end)).unwrap_or(0.0);
         if para_end >= chapter.start_time && para_start <= chapter.end_time {
-            text.push_str(&format!("[{}] ", fmt_dur(para_start)));
-            if let Some(speaker) = &para.speaker {
-                text.push_str(&format!("{speaker}: "));
-            }
-            for sent in &para.sentences {
-                text.push_str(&sent.text);
-                text.push(' ');
-            }
-            text.push('\n');
+            text.push_str(&format_paragraph_with_sentence_timestamps(para));
         }
     }
     text
@@ -2272,7 +2310,7 @@ fn fmt_dur(seconds: f64) -> String {
     let h = (seconds / 3600.0) as u32;
     let m = ((seconds % 3600.0) / 60.0) as u32;
     let s = (seconds % 60.0) as u32;
-    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m:02}:{s:02}") }
 }
 
 // ---- Collections ----
@@ -2562,7 +2600,62 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     fn test_prompts_support_hour_plus_timestamps() {
         let article_prompt = article_system_prompt("zh", None);
         assert!(article_prompt.contains("[H:MM:SS]"));
+        assert!(article_prompt.contains("[0:11:33]"));
         let chapter_prompt = deep_read_system_prompt("zh");
         assert!(chapter_prompt.contains("[H:MM:SS]"));
+        assert!(chapter_prompt.contains("[0:11:33]"));
+    }
+
+    #[test]
+    fn test_fmt_dur_and_sentence_level_timestamps() {
+        use lumen_pod_core::episode::{Paragraph, Sentence, Word};
+
+        assert_eq!(fmt_dur(0.0), "00:00");
+        assert_eq!(fmt_dur(314.0), "05:14");
+        assert_eq!(fmt_dur(693.0), "11:33");
+        assert_eq!(fmt_dur(3987.0), "1:06:27");
+
+        let para = Paragraph {
+            id: 1,
+            speaker: Some("Mark Zuckerberg".into()),
+            sentences: vec![
+                Sentence {
+                    id: "s1".into(),
+                    text: "When you're doing MMA, you get 60 seconds between rounds.".into(),
+                    words: vec![Word {
+                        id: "w1".into(),
+                        text: "When".into(),
+                        start: 693.2,
+                        end: 693.5,
+                    }],
+                },
+                Sentence {
+                    id: "s2".into(),
+                    text: "You're completely exhausted.".into(),
+                    words: vec![Word {
+                        id: "w2".into(),
+                        text: "You're".into(),
+                        start: 711.8,
+                        end: 712.1,
+                    }],
+                },
+                Sentence {
+                    id: "s3".into(),
+                    text: "And at the end of the hour we scale up.".into(),
+                    words: vec![Word {
+                        id: "w3".into(),
+                        text: "And".into(),
+                        start: 3987.4,
+                        end: 3987.9,
+                    }],
+                },
+            ],
+        };
+
+        let formatted = format_paragraph_with_sentence_timestamps(&para);
+        assert_eq!(
+            formatted,
+            "[11:33] Mark Zuckerberg: When you're doing MMA, you get 60 seconds between rounds. [11:51] You're completely exhausted. [1:06:27] And at the end of the hour we scale up. \n"
+        );
     }
 }

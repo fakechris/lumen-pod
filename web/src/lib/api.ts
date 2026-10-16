@@ -148,14 +148,23 @@ export async function requestEpisodeArticle(
     return { article: startRes.article, cached: startRes.cached };
   }
 
-  const maxPolls = 200; // up to 10 minutes (3s interval)
+  const maxPolls = 600; // up to 30 minutes (3s interval) for 2-4 hour episodes
+  let consecutiveNetErrors = 0;
   for (let i = 0; i < maxPolls; i++) {
     await new Promise((r) => setTimeout(r, 3000));
-    const pollRes = await apiFetch<{
-      status: string;
-      article?: Article;
-      error?: string;
-    }>(`/api/episodes/${episodeId}/article`);
+    let pollRes: { status: string; article?: Article; error?: string };
+    try {
+      pollRes = await apiFetch<{
+        status: string;
+        article?: Article;
+        error?: string;
+      }>(`/api/episodes/${episodeId}/article`);
+      consecutiveNetErrors = 0;
+    } catch (err) {
+      consecutiveNetErrors++;
+      if (consecutiveNetErrors >= 3) throw err;
+      continue;
+    }
 
     if (pollRes.status === "complete" && pollRes.article) {
       return { article: pollRes.article, cached: false };
