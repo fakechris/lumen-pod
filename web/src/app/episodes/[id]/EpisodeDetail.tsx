@@ -46,47 +46,158 @@ interface PlayerHandle {
 // Audio Player
 // ---------------------------------------------------------------------------
 
-function AudioPlayer({ src, onReady, onTimeUpdate }: {
-  src: string;
+function AudioPlayer({ sources, onReady, onTimeUpdate }: {
+  sources: string[];
   onReady?: (h: PlayerHandle) => void;
   onTimeUpdate?: (t: number) => void;
 }) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
-  const [duration, setDuration] = useState(0);
+  const [durations, setDurations] = useState<number[]>(() => sources.map(() => 0));
+  const [partIndex, setPartIndex] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [speed, setSpeed] = useState(1);
   const [volume, setVolume] = useState(1);
   const progressRef = useRef<HTMLDivElement>(null);
 
+  // Cumulative start offsets per part + total duration (global timeline).
+  const offsets = useMemo(() => {
+    const out: number[] = [];
+    let acc = 0;
+    for (const d of durations) { out.push(acc); acc += d || 0; }
+    return out;
+  }, [durations]);
+  const totalDuration = useMemo(() => durations.reduce((a, d) => a + (d || 0), 0), [durations]);
+  const durationsReady = totalDuration > 0;
+
+  // Refs mirroring the timeline so event listeners always read fresh values.
+  const offsetsRef = useRef(offsets);
+  const partIndexRef = useRef(partIndex);
+  const durationsRef = useRef(durations);
+  const sourcesRef = useRef(sources);
+  const wasPlayingRef = useRef(false);
+  const speedRef = useRef(speed);
+  const volumeRef = useRef(volume);
+  const pendingPartSeekRef = useRef<number | null>(null); // local time, applied after part switch
+  const pendingGlobalSeekRef = useRef<number | null>(null); // global time, applied once durations known
+  const onReadyFiredRef = useRef(false);
+  useEffect(() => { offsetsRef.current = offsets; }, [offsets]);
+  useEffect(() => { partIndexRef.current = partIndex; }, [partIndex]);
+  useEffect(() => { durationsRef.current = durations; }, [durations]);
+  useEffect(() => { sourcesRef.current = sources; }, [sources]);
+
+  const globalToLocal = useCallback((t: number): { part: number; local: number } => {
+    const offs = offsetsRef.current;
+    const durs = durationsRef.current;
+    let part = 0;
+    for (let i = 0; i < offs.length; i++) {
+      if (offs[i] <= t && (durs[i] || 0) > 0) part = i;
+    }
+    return { part, local: Math.max(0, t - offs[part]) };
+  }, []);
+
+  const seekToGlobal = useCallback((t: number) => {
+    const total = durationsRef.current.reduce((a, d) => a + (d || 0), 0);
+    if (total <= 0) { pendingGlobalSeekRef.current = t; return; }
+    const { part, local } = globalToLocal(Math.max(0, Math.min(t, total)));
+    if (part !== partIndexRef.current) {
+      pendingPartSeekRef.current = local;
+      setPartIndex(part);
+    } else if (audioRef.current) {
+      audioRef.current.currentTime = local;
+    }
+  }, [globalToLocal]);
+
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
-    const handle: PlayerHandle = { seekTo: (t) => { audio.currentTime = t; }, getCurrentTime: () => audio.currentTime };
-    const onLoaded = () => { setDuration(audio.duration); onReady?.(handle); };
-    const onTime = () => { setCurrentTime(audio.currentTime); onTimeUpdate?.(audio.currentTime); };
-    const onPlay = () => setPlaying(true);
-    const onPause = () => setPlaying(false);
+    const applyPendingGlobalSeek = () => {
+      if (pendingGlobalSeekRef.current !== null && durationsRef.current.reduce((a, d) => a + (d || 0), 0) > 0) {
+        const t = pendingGlobalSeekRef.current;
+        pendingGlobalSeekRef.current = null;
+        seekToGlobal(t);
+      }
+    };
+    const handle: PlayerHandle = { seekTo: seekToGlobal, getCurrentTime: () => offsetsRef.current[partIndexRef.current] + audio.currentTime };
+    const onLoaded = () => {
+      setDurations((prev) => {
+        const next = [...prev];
+        next[partIndexRef.current] = audio.duration || 0;
+        return next;
+      });
+      audio.playbackRate = speedRef.current;
+      audio.volume = volumeRef.current;
+      const seekLocal = pendingPartSeekRef.current;
+      if (seekLocal !== null) {
+        audio.currentTime = seekLocal;
+        pendingPartSeekRef.current = null;
+      }
+      if (!onReadyFiredRef.current) { onReadyFiredRef.current = true; onReady?.(handle); }
+      applyPendingGlobalSeek();
+      // Part switch while playing (natural "ended" → next part): keep going.
+      if (seekLocal !== null && wasPlayingRef.current) audio.play().catch(() => {});
+    };
+    const onTime = () => { const t = offsetsRef.current[partIndexRef.current] + audio.currentTime; setCurrentTime(t); onTimeUpdate?.(t); };
+    const onPlay = () => { setPlaying(true); wasPlayingRef.current = true; };
+    const onPause = () => { setPlaying(false); wasPlayingRef.current = false; };
+    const onEnded = () => {
+      const next = partIndexRef.current + 1;
+      if (next < sourcesRef.current.length) {
+        if (pendingPartSeekRef.current === null) {
+          pendingPartSeekRef.current = 0;
+          setPartIndex(next);
+          // autoplay continues via onLoaded + wasPlayingRef
+        }
+      }
+    };
     audio.addEventListener("loadedmetadata", onLoaded);
     audio.addEventListener("timeupdate", onTime);
     audio.addEventListener("play", onPlay);
     audio.addEventListener("pause", onPause);
-    audio.addEventListener("ended", onPause);
-    return () => { audio.removeEventListener("loadedmetadata", onLoaded); audio.removeEventListener("timeupdate", onTime); audio.removeEventListener("play", onPlay); audio.removeEventListener("pause", onPause); audio.removeEventListener("ended", onPause); };
-  }, [src]);
+    audio.addEventListener("ended", onEnded);
+    return () => { audio.removeEventListener("loadedmetadata", onLoaded); audio.removeEventListener("timeupdate", onTime); audio.removeEventListener("play", onPlay); audio.removeEventListener("pause", onPause); audio.removeEventListener("ended", onEnded); };
+  }, [sources, seekToGlobal, onReady, onTimeUpdate]);
+
+  // Continue playback seamlessly when the next part's metadata arrives after an "ended" switch.
+  // (Handled inside onLoaded: pending seek + wasPlayingRef → audio.play().)
+
+  // Probe metadata of every part in parallel to build the global timeline.
+  useEffect(() => {
+    let cancelled = false;
+    const elems: HTMLAudioElement[] = [];
+    setDurations(sources.map(() => 0));
+    sources.forEach((src, i) => {
+      const probe = new Audio();
+      probe.preload = "metadata";
+      probe.src = src;
+      probe.addEventListener("loadedmetadata", () => {
+        if (cancelled || !isFinite(probe.duration) || probe.duration <= 0) return;
+        setDurations((prev) => {
+          if (prev[i] && Math.abs(prev[i] - probe.duration) < 0.5) return prev;
+          const next = [...prev];
+          while (next.length < sources.length) next.push(0);
+          next[i] = probe.duration;
+          return next;
+        });
+      });
+      elems.push(probe);
+    });
+    return () => { cancelled = true; elems.forEach((a) => { a.removeAttribute("src"); a.load(); }); };
+  }, [sources]);
 
   const togglePlay = () => { const a = audioRef.current; if (!a) return; playing ? a.pause() : a.play(); };
   const handleProgressClick = (e: React.MouseEvent<HTMLDivElement>) => {
     const rect = progressRef.current?.getBoundingClientRect();
-    if (!rect || !audioRef.current) return;
-    audioRef.current.currentTime = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * duration;
+    if (!rect || !durationsReady) return;
+    seekToGlobal(Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * totalDuration);
   };
-  const changeSpeed = () => { const speeds = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]; const next = speeds[(speeds.indexOf(speed) + 1) % speeds.length]; setSpeed(next); if (audioRef.current) audioRef.current.playbackRate = next; };
-  const skip = (d: number) => { if (audioRef.current) audioRef.current.currentTime += d; };
+  const changeSpeed = () => { const speeds = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]; const next = speeds[(speeds.indexOf(speed) + 1) % speeds.length]; setSpeed(next); speedRef.current = next; if (audioRef.current) audioRef.current.playbackRate = next; };
+  const skip = (d: number) => seekToGlobal(currentTime + d);
 
   return (
     <div className="bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-4">
-      <audio ref={audioRef} src={src} preload="metadata" />
+      <audio ref={audioRef} src={sources[partIndex]} preload="metadata" />
+      {partIndex + 1 < sources.length && <audio src={sources[partIndex + 1]} preload="auto" className="hidden" />}
       <div className="flex items-center gap-3">
         <button onClick={() => skip(-15)} className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors" title="Back 15s">
           <svg viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5"><path d="M11.99 5V1l-5 5 5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6h-2c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/><text x="12" y="16" textAnchor="middle" fontSize="7" fill="currentColor">15</text></svg>
@@ -97,18 +208,19 @@ function AudioPlayer({ src, onReady, onTimeUpdate }: {
         <button onClick={() => skip(30)} className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors" title="Forward 30s">
           <svg viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5"><path d="M12.01 5V1l5 5-5 5V7c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6h2c0 4.42-3.58 8-8 8s-8-3.58-8-8 3.58-8 8-8z"/><text x="12" y="16" textAnchor="middle" fontSize="7" fill="currentColor">30</text></svg>
         </button>
-        <span className="text-xs font-mono text-zinc-500 shrink-0 w-24 text-center">{formatTimestamp(currentTime)} / {formatTimestamp(duration)}</span>
+        <span className="text-xs font-mono text-zinc-500 shrink-0 w-24 text-center">{formatTimestamp(currentTime)} / {formatTimestamp(totalDuration)}</span>
         <div ref={progressRef} onClick={handleProgressClick} className="flex-1 h-2 bg-zinc-200 dark:bg-zinc-700 rounded-full cursor-pointer group relative">
-          <div className="h-full bg-blue-600 rounded-full transition-all relative" style={{ width: duration ? `${(currentTime / duration) * 100}%` : "0%" }}>
+          <div className="h-full bg-blue-600 rounded-full transition-all relative" style={{ width: totalDuration ? `${(currentTime / totalDuration) * 100}%` : "0%" }}>
             <div className="absolute right-0 top-1/2 -translate-y-1/2 w-3.5 h-3.5 bg-blue-600 rounded-full shadow-md opacity-0 group-hover:opacity-100 transition-opacity" />
           </div>
         </div>
+        {sources.length > 1 && <span className="text-[10px] font-mono text-zinc-400 shrink-0" title="Audio uploaded in parts">P{partIndex + 1}/{sources.length}</span>}
         <button onClick={changeSpeed} className="px-2 py-1 text-xs font-mono rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors">{speed}x</button>
         <div className="flex items-center gap-1">
-          <button onClick={() => { const v = volume > 0 ? 0 : 1; setVolume(v); if (audioRef.current) audioRef.current.volume = v; }} className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300">
+          <button onClick={() => { const v = volume > 0 ? 0 : 1; setVolume(v); volumeRef.current = v; if (audioRef.current) audioRef.current.volume = v; }} className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300">
             {volume === 0 ? <svg viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.796 8.796 0 0021 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.99 8.99 0 003.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg> : <svg viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>}
           </button>
-          <input type="range" min={0} max={1} step={0.05} value={volume} onChange={(e) => { const v = parseFloat(e.target.value); setVolume(v); if (audioRef.current) audioRef.current.volume = v; }} className="w-16 h-1 accent-blue-600" />
+          <input type="range" min={0} max={1} step={0.05} value={volume} onChange={(e) => { const v = parseFloat(e.target.value); setVolume(v); volumeRef.current = v; if (audioRef.current) audioRef.current.volume = v; }} className="w-16 h-1 accent-blue-600" />
         </div>
       </div>
     </div>
@@ -497,7 +609,12 @@ export default function EpisodeDetail({ id }: { id: string }) {
   const youtubeId = useMemo(() => episode ? extractYouTubeId(episode.source.url) : null, [episode]);
   const bilibiliId = useMemo(() => episode ? extractBilibiliId(episode.source.url) : null, [episode]);
   const tweetId = useMemo(() => episode ? extractXTweetId(episode.source.url) : null, [episode]);
-  const hasAudio = !!episode?.source.audioPath;
+  const audioSources = useMemo(() => {
+    if (!episode) return [];
+    const { audioPaths, audioPath } = episode.source;
+    return audioPaths && audioPaths.length > 0 ? audioPaths : audioPath ? [audioPath] : [];
+  }, [episode]);
+  const hasAudio = audioSources.length > 0;
   const hasEmbed = !!(youtubeId || bilibiliId || tweetId);
   const hasPlayer = hasAudio || hasEmbed;
   const canSeek = hasAudio || !!youtubeId; // only audio & YouTube support programmatic seek
@@ -700,7 +817,7 @@ export default function EpisodeDetail({ id }: { id: string }) {
               {/* Sticky player + tab combo for Chapters/Transcript */}
               {stickyPlayer && (
                 <div className="sticky top-0 z-20 bg-zinc-50 dark:bg-zinc-950 -mx-4 px-4 pt-2 pb-1 space-y-2 shadow-sm">
-                  <AudioPlayer src={episode.source.audioPath!} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />
+                  <AudioPlayer sources={audioSources} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />
                   <div className="flex gap-1 overflow-x-auto bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-1">
                     {TABS.map((tab) => (
                       <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 text-sm font-medium rounded-lg whitespace-nowrap transition-colors ${activeTab === tab ? "bg-blue-600 text-white shadow-sm" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}>
@@ -714,7 +831,7 @@ export default function EpisodeDetail({ id }: { id: string }) {
               {/* Normal player section (non-sticky, or for non-audio tabs) */}
               {!stickyPlayer && hasPlayer && (
                 <div className="space-y-3">
-                  {hasAudio && <AudioPlayer src={episode.source.audioPath!} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
+                  {hasAudio && <AudioPlayer sources={audioSources} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
                   {!hasAudio && youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} autoActivate={ytAutoActivate} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
                   {!hasAudio && bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
                   {!hasAudio && tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}

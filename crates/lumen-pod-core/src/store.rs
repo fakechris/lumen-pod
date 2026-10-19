@@ -1189,6 +1189,7 @@ mod tests {
                 episode_cover_url: None,
                 language: Some("en".into()),
                 audio_path: None,
+                audio_paths: Vec::new(),
             },
             processing: Processing {
                 status: ProcessingStatus::Done,

@@ -711,10 +711,20 @@ async fn delete_episode(
 
 // ---- Audio Upload ----
 
+#[derive(Deserialize)]
+struct AudioUploadQuery {
+    /// 1-based part index for chunked uploads (files over ~90MB must be
+    /// split to pass Cloudflare's request-body cap).
+    part: Option<usize>,
+    /// Total number of parts; the final part finalizes `source.audioPaths`.
+    total: Option<usize>,
+}
+
 async fn upload_audio(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<AudioUploadQuery>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let viewer = match auth::resolve_viewer(&state, &headers).await {
@@ -731,6 +741,18 @@ async fn upload_audio(
         )
             .into_response();
     }
+    let (part, total) = match (query.part, query.total) {
+        (None, None) => (0, 0), // single-file mode
+        (Some(p), Some(t)) if p >= 1 && t >= 1 && p <= t => (p, t),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid part/total — need 1-based part <= total"})),
+            )
+                .into_response()
+        }
+    };
+    let chunked = total > 0;
 
     // Verify episode exists
     let ep = match state.store.get_episode(&id).await {
@@ -742,17 +764,30 @@ async fn upload_audio(
         return err_404();
     }
 
-    let ext = detect_audio_ext(&body);
-    let filename = format!("{}.{}", id, ext);
+    // Mid-file parts rarely carry magic bytes, so reuse the format detected
+    // for part 1 when it is already on disk.
+    let ext = if chunked && part > 1 {
+        existing_part_ext(&state.audio_dir, &id).unwrap_or_else(|| detect_audio_ext(&body).to_string())
+    } else {
+        detect_audio_ext(&body).to_string()
+    };
+    let filename = if chunked {
+        format!("{}.p{:03}.{}", id, part, ext)
+    } else {
+        format!("{}.{}", id, ext)
+    };
     let filepath = std::path::Path::new(&state.audio_dir).join(&filename);
 
-    // Remove any previous audio for this episode (may have different extension)
-    if let Ok(mut entries) = tokio::fs::read_dir(&state.audio_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with(&format!("{}.", id)) && *name_str != filename {
-                let _ = tokio::fs::remove_file(entry.path()).await;
+    // A new upload replaces all previous audio for this episode — single
+    // file, or all parts when re-uploading part 1.
+    if !chunked || part == 1 {
+        if let Ok(mut entries) = tokio::fs::read_dir(&state.audio_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(&format!("{}.", id)) && *name_str != filename {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                }
             }
         }
     }
@@ -762,26 +797,74 @@ async fn upload_audio(
     }
 
     let audio_url = format!("/audio/{}", filename);
-    tracing::info!(%id, bytes = body.len(), ext, path = %filepath.display(), "audio uploaded");
+    tracing::info!(%id, bytes = body.len(), ext, part, total, path = %filepath.display(), "audio uploaded");
 
-    // Update source.audioPath
     let mut source_val = serde_json::to_value(&ep.source).unwrap_or_default();
-    source_val["audioPath"] = serde_json::Value::String(audio_url.clone());
-    let updates = serde_json::json!({"source": source_val});
-    if let Err(e) = state.store.update_episode(&id, &updates).await {
-        return err_500(e);
+    let complete = !chunked || part == total;
+    let audio_paths = if chunked {
+        list_part_urls(&state.audio_dir, &id)
+    } else {
+        Vec::new()
+    };
+    if complete {
+        if chunked {
+            source_val["audioPath"] = serde_json::Value::Null;
+            source_val["audioPaths"] = serde_json::to_value(&audio_paths).unwrap_or_default();
+        } else {
+            source_val["audioPath"] = serde_json::Value::String(audio_url.clone());
+            source_val["audioPaths"] = serde_json::Value::Array(Vec::new());
+        }
+        let updates = serde_json::json!({"source": source_val});
+        if let Err(e) = state.store.update_episode(&id, &updates).await {
+            return err_500(e);
+        }
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "audioPath": audio_url,
-            "format": ext,
-            "sizeBytes": body.len()
-        })),
-    )
-        .into_response()
+    let mut resp = serde_json::json!({
+        "status": "ok",
+        "audioPath": audio_url,
+        "format": ext,
+        "sizeBytes": body.len(),
+        "complete": complete,
+    });
+    if chunked {
+        resp["part"] = serde_json::json!(part);
+        resp["total"] = serde_json::json!(total);
+        if complete {
+            resp["audioPaths"] = serde_json::to_value(&audio_paths).unwrap_or_default();
+        }
+    }
+
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// Format extension of an already-uploaded `"<id>.p001.<ext>"` part file.
+fn existing_part_ext(audio_dir: &str, id: &str) -> Option<String> {
+    let prefix = format!("{id}.p001.");
+    std::fs::read_dir(audio_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with(&prefix))
+        .map(|name| name[prefix.len()..].to_string())
+}
+
+/// Ordered `/audio/...` URLs of this episode's uploaded parts.
+fn list_part_urls(audio_dir: &str, id: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(audio_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.starts_with(&format!("{id}.p"))
+                && name.rsplit('.').next().is_some_and(|ext| {
+                    ["mp3", "m4a", "flac", "ogg", "wav"].contains(&ext)
+                })
+        })
+        .collect();
+    names.sort();
+    names.into_iter().map(|name| format!("/audio/{name}")).collect()
 }
 
 fn detect_audio_ext(bytes: &[u8]) -> &'static str {
@@ -871,6 +954,7 @@ async fn submit_url(
             episode_cover_url: None,
             language: None,
             audio_path: None,
+            audio_paths: Vec::new(),
         },
         processing: lumen_pod_core::episode::Processing {
             status: lumen_pod_core::episode::ProcessingStatus::Pending,
@@ -2606,6 +2690,7 @@ mod tests {
                 episode_cover_url: None,
                 language: None,
                 audio_path: None,
+                audio_paths: Vec::new(),
             },
             processing: Processing {
                 status: ProcessingStatus::Done,

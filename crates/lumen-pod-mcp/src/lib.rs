@@ -286,9 +286,11 @@ async fn call_tool(
             let guide = format!(
                 r#"## Upload Audio to Lumen Pod
 
-To upload an MP3 file for episode `{episode_id}`, send a POST request with the raw audio bytes:
+Upload endpoint: `POST {api_base}/api/episodes/{episode_id}/audio` with the raw audio bytes and `Authorization: Bearer $LUMEN_POD_API_TOKEN`.
 
-### Using curl:
+**Size rule (important):** any single request must stay **under 90 MB** — Cloudflare rejects request bodies over 100 MB with 413/502 before they reach the API. Files over 90 MB MUST be split into parts and uploaded with `?part=N&total=M`.
+
+### Files ≤ 90 MB — single upload
 ```bash
 curl -X POST "{api_base}/api/episodes/{episode_id}/audio" \
   -H "Authorization: Bearer $LUMEN_POD_API_TOKEN" \
@@ -296,53 +298,40 @@ curl -X POST "{api_base}/api/episodes/{episode_id}/audio" \
   --data-binary @/path/to/audio.mp3
 ```
 
-### Using Python:
-```python
-import requests
+### Files > 90 MB — chunked upload (1-based parts, in order)
 
-with open("audio.mp3", "rb") as f:
-    resp = requests.post(
-        "{api_base}/api/episodes/{episode_id}/audio",
-        headers={{
-            "Authorization": "Bearer " + os.environ["LUMEN_POD_API_TOKEN"],
-            "Content-Type": "application/octet-stream",
-        }},
-        data=f.read(),
-    )
-print(resp.json())
+1. Split losslessly with ffmpeg into roughly equal parts (all parts must be the same codec/format):
+```bash
+# duration_secs = source duration in seconds; N = ceil(size_mb / 85)
+ffmpeg -i audio.mp3 -c copy -f segment -segment_time $((duration_secs / N)) /tmp/lumen-pod/{episode_id}.part%03d.mp3
 ```
-
-### Using fetch (Node.js):
-```javascript
-const fs = require('fs');
-const audio = fs.readFileSync('audio.mp3');
-const resp = await fetch("{api_base}/api/episodes/{episode_id}/audio", {{
-  method: "POST",
-  headers: {{
-    "Authorization": `Bearer ${{process.env.LUMEN_POD_API_TOKEN}}`,
-    "Content-Type": "application/octet-stream",
-  }},
-  body: audio,
-}});
-console.log(await resp.json());
+2. Upload each part in order, passing `?part=N&total=M`:
+```bash
+curl -X POST "{api_base}/api/episodes/{episode_id}/audio?part=1&total=3" \
+  -H "Authorization: Bearer $LUMEN_POD_API_TOKEN" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @/tmp/lumen-pod/{episode_id}.part001.mp3
+# ... repeat for part=2, part=3 ...
 ```
+Each response is `{{"status":"ok", "part":N, "total":M, "complete":false, ...}}`. The **final** part returns `"complete": true` plus `"audioPaths": [...]` and finalizes the episode — the web player then plays the parts back-to-back as one continuous timeline. Uploading `part=1` again replaces all previous parts; a plain single upload replaces everything too.
 
 ### Environment variable:
 The API token is set as `LUMEN_POD_API_TOKEN`. Ask the user for the token if you don't have it.
 
-### Response:
+### Response (single or final part):
 ```json
-{{"status": "ok", "audioPath": "/audio/{episode_id}.mp3", "sizeBytes": 12345678}}
+{{"status": "ok", "audioPath": "/audio/{episode_id}.mp3", "sizeBytes": 12345678, "complete": true}}
 ```
 
-After upload, the episode's `source.audioPath` is automatically updated. The UI will show a self-hosted audio player instead of YouTube/Bilibili embed, which avoids platform embed restrictions.
+After upload, the episode's audio (`source.audioPath` or `source.audioPaths`) is automatically updated. The UI will show a self-hosted audio player instead of YouTube/Bilibili embed, which avoids platform embed restrictions.
 
 ### Typical agent workflow:
 1. Download audio using yt-dlp: `yt-dlp -x --audio-format mp3 "<source_url>" -o audio.mp3`
-2. Transcribe with ASR (e.g., Whisper, Qwen3-ASR)
-3. Generate summary/chapters/etc with LLM
-4. Publish episode using `pod_publish`
-5. Upload audio using the curl command above"#
+2. If the MP3 is over 90 MB, split it with ffmpeg as shown above
+3. Transcribe with ASR (e.g., Whisper, Qwen3-ASR)
+4. Generate summary/chapters/etc with LLM
+5. Publish episode using `pod_publish`
+6. Upload audio (single or chunked) using the curl commands above"#
             );
 
             Ok(guide)

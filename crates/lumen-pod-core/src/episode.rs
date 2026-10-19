@@ -80,6 +80,12 @@ pub struct Source {
     /// Audio file path (local storage, optional — user decides whether to upload).
     #[serde(default)]
     pub audio_path: Option<String>,
+    /// Ordered audio part paths for chunked uploads — a single MP3 over
+    /// ~100MB cannot pass Cloudflare's request-body cap, so large audio is
+    /// uploaded and played back as sequential parts. Takes precedence over
+    /// `audio_path` when non-empty.
+    #[serde(default)]
+    pub audio_paths: Vec<String>,
 }
 
 // ---- Processing state ----

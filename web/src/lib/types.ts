@@ -44,6 +44,8 @@ export interface Source {
   episodeCoverUrl?: string;
   language?: string;
   audioPath?: string;
+  /** Ordered audio parts (chunked uploads); takes precedence over audioPath. */
+  audioPaths?: string[];
 }
 
 export interface Processing {
