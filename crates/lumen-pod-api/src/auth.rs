@@ -119,6 +119,20 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::err
 
 // ---- Auth middleware helpers ----
 
+/// True when the request carries a valid `Authorization: Bearer <api-token>`
+/// header matching one of the configured `LUMEN_POD_API_TOKEN` values.
+pub fn matches_api_token(auth: &AuthConfig, headers: &HeaderMap) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .is_some_and(|token| {
+            auth.api_tokens
+                .iter()
+                .any(|t| constant_time_eq(t.as_bytes(), token.as_bytes()))
+        })
+}
+
 pub fn extract_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims> {
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
@@ -199,17 +213,8 @@ pub async fn resolve_viewer(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<ViewerContext, axum::response::Response> {
-    if let Some(auth_header) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        if let Some(token) = auth_header.strip_prefix("Bearer ") {
-            if state
-                .auth
-                .api_tokens
-                .iter()
-                .any(|t| constant_time_eq(t.as_bytes(), token.as_bytes()))
-            {
-                return Ok(ViewerContext::api_token());
-            }
-        }
+    if matches_api_token(&state.auth, headers) {
+        return Ok(ViewerContext::api_token());
     }
 
     let Some(claims) = extract_claims(headers, &state.auth.jwt_secret) else {
@@ -496,8 +501,27 @@ pub async fn google_callback(
         .into_response()
 }
 
-/// GET /api/me — always works for authenticated users (even pending)
+/// GET /api/me — always works for authenticated users (even pending).
+/// Also accepts a Bearer API token so agents can validate their token here
+/// (returning 401 for a valid token reads as "rejected" to API clients).
 pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if matches_api_token(&state.auth, &headers) {
+        let viewer = ViewerContext::api_token();
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": viewer.user_id,
+                "email": viewer.email,
+                "role": "admin",
+                "approved": true,
+                "can_edit": true,
+                "can_delete": true,
+                "can_publish_private": true,
+            })),
+        )
+            .into_response();
+    }
+
     match extract_claims(&headers, &state.auth.jwt_secret) {
         Some(claims) => {
             let user = state.store.get_user_by_email(&claims.email).await;
@@ -721,4 +745,48 @@ pub async fn list_invites(
 
 fn urlencoded(s: &str) -> String {
     s.replace(':', "%3A").replace('/', "%2F")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth_with_tokens(tokens: &[&str]) -> AuthConfig {
+        AuthConfig {
+            google_client_id: String::new(),
+            google_client_secret: String::new(),
+            google_redirect_uri: String::new(),
+            jwt_secret: "test-secret-0123456789abcdef0123456789abcdef".into(),
+            admin_emails: vec![],
+            api_tokens: tokens.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn headers_with_bearer(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn api_token_matches_any_configured_token_exactly() {
+        let auth = auth_with_tokens(&["tok-a", "tok-b"]);
+        assert!(matches_api_token(&auth, &headers_with_bearer("tok-b")));
+        assert!(matches_api_token(&auth, &headers_with_bearer("tok-a")));
+    }
+
+    #[test]
+    fn api_token_rejects_wrong_or_mangled_values() {
+        let auth = auth_with_tokens(&["tok-a"]);
+        assert!(!matches_api_token(&auth, &headers_with_bearer("tok-b")));
+        assert!(!matches_api_token(
+            &auth,
+            &headers_with_bearer("\"tok-a\"")
+        ));
+        assert!(!matches_api_token(&auth, &headers_with_bearer("tok-a ")));
+        assert!(!matches_api_token(&auth, &HeaderMap::new()));
+    }
 }
