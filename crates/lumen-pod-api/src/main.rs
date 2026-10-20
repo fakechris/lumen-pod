@@ -89,11 +89,18 @@ async fn run_server(database_url: &str) {
     let audio_dir = std::env::var("AUDIO_DIR").unwrap_or_else(|_| "/data/audio".into());
     tokio::fs::create_dir_all(&audio_dir).await.ok();
 
+    // Ensure static directory (episode thumbnails land in <static_dir>/thumbs)
+    let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "/data/static".into());
+    tokio::fs::create_dir_all(std::path::Path::new(&static_dir).join("thumbs"))
+        .await
+        .ok();
+
     let state = AppState {
         store: Arc::new(store),
         auth: auth_config,
         llm: llm_config,
         audio_dir,
+        static_dir,
         batch_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         article_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chapter_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -128,10 +135,8 @@ async fn run_server(database_url: &str) {
     let audio_serve = Router::new()
         .nest_service("/audio", tower_http::services::ServeDir::new(&state.audio_dir));
 
-    let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "/data/static".into());
-    tokio::fs::create_dir_all(&static_dir).await.ok();
     let static_serve = Router::new()
-        .nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
+        .nest_service("/static", tower_http::services::ServeDir::new(&state.static_dir));
 
     let protected = Router::new()
         .route("/api/episodes", get(list_episodes).post(create_episode))
@@ -144,6 +149,11 @@ async fn run_server(database_url: &str) {
             "/api/episodes/{id}/audio",
             axum::routing::post(upload_audio)
                 .layer(axum::extract::DefaultBodyLimit::max(200 * 1024 * 1024)),
+        )
+        .route(
+            "/api/episodes/{id}/thumbnail",
+            axum::routing::post(upload_thumbnail)
+                .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024)),
         )
         .route(
             "/api/episodes/{id}/chat",
@@ -869,6 +879,106 @@ fn list_part_urls(audio_dir: &str, id: &str) -> Vec<String> {
         .collect();
     names.sort();
     names.into_iter().map(|name| format!("/audio/{name}")).collect()
+}
+
+// ---- Thumbnail Upload ----
+
+async fn upload_thumbnail(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !viewer.can_edit_episodes() {
+        return err_403("需要管理员授权「修改视频」权限 (can_edit)");
+    }
+    if body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "empty body — send raw image bytes"})),
+        )
+            .into_response();
+    }
+
+    // Verify episode exists and is visible
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
+
+    let ext = match detect_image_ext(&body) {
+        Some(ext) => ext,
+        None => {
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                Json(serde_json::json!({"error": "not a jpg/png/webp image"})),
+            )
+                .into_response()
+        }
+    };
+
+    let thumbs_dir = std::path::Path::new(&state.static_dir).join("thumbs");
+    let filename = format!("{id}.{ext}");
+    let filepath = thumbs_dir.join(&filename);
+
+    // Replace any previous thumbnail for this episode (may have different extension)
+    if let Ok(mut entries) = tokio::fs::read_dir(&thumbs_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(&format!("{id}.")) && *name_str != filename {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+
+    if let Err(e) = tokio::fs::write(&filepath, &body).await {
+        return err_500(format!("failed to write thumbnail: {e}"));
+    }
+
+    let thumb_url = format!("/static/thumbs/{filename}");
+    tracing::info!(%id, bytes = body.len(), ext, "thumbnail uploaded");
+
+    let mut source_val = serde_json::to_value(&ep.source).unwrap_or_default();
+    source_val["thumbnailUrl"] = serde_json::Value::String(thumb_url.clone());
+    if let Err(e) = state
+        .store
+        .update_episode(&id, &serde_json::json!({"source": source_val}))
+        .await
+    {
+        return err_500(e);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "thumbnailUrl": thumb_url,
+            "sizeBytes": body.len()
+        })),
+    )
+        .into_response()
+}
+
+/// Image format from magic bytes; only web-safe formats we are willing to host.
+fn detect_image_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("png")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
 }
 
 // ---- Admin: Runtime Settings ----

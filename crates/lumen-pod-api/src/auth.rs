@@ -326,6 +326,7 @@ pub struct AppState {
     pub auth: AuthConfig,
     pub llm: crate::LlmConfig,
     pub audio_dir: String,
+    pub static_dir: String,
     pub batch_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::BatchDeepReadTask>>>,
     pub article_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, ArticleGenStatus>>>,
     pub chapter_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, ArticleGenStatus>>>,

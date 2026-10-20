@@ -1,0 +1,165 @@
+{
+  "id": "",
+  "source": {
+    "url": "https://xiaoyuzhoufm.com/episode/abc123def456",
+    "platform": "xiaoyuzhou",
+    "title": "E30 与宝玉聊 AI 创业：从 0 到 1 的踩坑实录",
+    "author": "硬地骇客",
+    "publishedAt": "2026-09-15T00:00:00Z",
+    "thumbnailUrl": "https://image.xyzcdn.net/abc123.jpg",
+    "duration": 4500.0,
+    "feedUrl": "https://api.xyzfm.cn/v1/podcast/abc",
+    "description": "本期硬地骇客邀请了连续创业者宝玉，聊他从第一次失败的 SaaS 到第二次成功的 AI 产品的全过程。涵盖技术选型、团队组建、融资节奏、产品迭代。",
+    "podcastName": "硬地骇客",
+    "episodeCoverUrl": "https://image.xyzcdn.net/abc123-cover.jpg",
+    "language": "zh",
+    "audioPath": null
+  },
+  "processing": {
+    "status": "done",
+    "asrEngine": "sensevoice-small",
+    "llmModel": "claude-4-opus",
+    "processedAt": "2026-10-18T11:00:00Z",
+    "agentId": "download-expert-v2",
+    "error": null
+  },
+  "summary": {
+    "oneLiner": "宝玉回顾从第一次失败 SaaS 学费到第二次 AI 产品成功的过程，重点是「早期不融资、技术先自用、用户量过 100 才上付费」三条非主流决策。",
+    "abstract": "本期节目是一次对 AI 创业从 0 到 1 路径的非主流反思。宝玉作为连续创业者，第一次做 SaaS 时几乎犯完了所有能犯的错——团队 12 人、产品线 4 条、融资 1000 万但 18 个月花完。第二次做 AI 产品时他做了三个反常识决定：前 6 个月不融资（用自己工资维持团队 4 人）、技术先内部用 3 个月（每个工程师都是自己的第一个用户）、用户量过 100 才上线付费功能。宝玉把这种节奏叫做「慢就是快」，跟硅谷常见的「快速失败、快速迭代」叙事形成对比。节目最后讨论了为什么 AI 产品的 unit economics 比 SaaS 更难做（推理成本、用户期望天花板、模型升级风险），以及为什么他在 2026 年坚持只用开源模型而不是调用 API。",
+    "keyTakeaways": [
+      "「慢就是快」：早期不融资，先把技术做扎实到内部能用，再去面对市场。",
+      "「用户量过 100 再上付费」：在 0~100 用户阶段，免费 + 直接对话 > 付费墙。",
+      "AI 产品的 unit economics 比 SaaS 难：推理成本浮动、用户期望被 ChatGPT 拉高、底层模型升级会瞬间废掉你的差异化。",
+      "2026 年的 AI 创业坚持用开源模型 + 自托管，比调用 API 更有 defensibility。",
+      "团队人数不是越多越好：第一次 12 人失败的核心原因是 4 条产品线分散了注意力。"
+    ],
+    "thinkingQuestions": [
+      "「慢就是快」是幸存者偏差，还是在 AI 时代有了新的可行性？",
+      "如果你的产品依赖调用闭源 API，模型升级那天你的壁垒会怎么变化？",
+      "100 用户以下的产品，免费 + 直接对话真的比付费墙好吗？"
+    ],
+    "glossary": [
+      {"term": "Unit economics", "definition": "单位经济模型——单用户带来的收入是否覆盖获取成本和服务成本。"},
+      {"term": "MVP", "definition": "Minimum Viable Product，最小可行产品——能用最小投入验证核心假设的产品形态。"},
+      {"term": "Defensibility", "definition": "壁垒——为什么用户不会轻易切换到竞品。AI 产品的 defensibility 来源和数据、网络效应、模型所有权等有关。"}
+    ]
+  },
+  "chapters": [
+    {
+      "title": "开场：第一次创业是怎么失败的",
+      "startTime": 0.0,
+      "endTime": 720.0,
+      "summary": "宝玉回顾 2018-2020 年第一次 SaaS 创业：从 0 到 12 人团队，融资 1000 万，18 个月烧完。失败的核心原因不是市场判断，而是 4 条产品线分散了精力，团队里谁都说服不了谁。",
+      "hasAds": false,
+      "deepRead": null
+    },
+    {
+      "title": "第二次创业的三个反常识决定",
+      "startTime": 720.0,
+      "endTime": 2700.0,
+      "summary": "不融资 6 个月 / 技术先自用 3 个月 / 用户过 100 才上线付费。宝玉把每条决定背后的逻辑、踩过的坑、当时的风险说清楚。",
+      "hasAds": false,
+      "deepRead": null
+    },
+    {
+      "title": "AI 产品的 unit economics 为什么更难做",
+      "startTime": 2700.0,
+      "endTime": 4500.0,
+      "summary": "推理成本、用户期望、模型升级三个变量。宝玉算了一笔账：同样的用户数，AI 产品的毛利比 SaaS 低 30~40 个百分点，必须用规模摊薄。",
+      "hasAds": false,
+      "deepRead": null
+    }
+  ],
+  "mindmap": {
+    "markdown": "# 与宝玉聊 AI 创业\n## 第一次失败\n### 团队 12 人\n### 产品线 4 条\n### 18 个月烧完 1000 万\n## 第二次的反常识\n### 不融资 6 个月\n### 技术先自用 3 个月\n### 100 用户再付费\n## AI 产品的经济学\n### 推理成本浮动\n### 用户期望天花板\n### 模型升级风险\n### 开源自托管",
+    "opml": null
+  },
+  "transcript": {
+    "paragraphs": [
+      {
+        "id": 1,
+        "speaker": "Jack",
+        "sentences": [
+          {
+            "id": "s1",
+            "text": "大家好欢迎收听硬地骇客，我是主持人 Jack。",
+            "words": [
+              {"id": "w0", "text": "大家好", "start": 0.0, "end": 0.5},
+              {"id": "w1", "text": "欢迎", "start": 0.5, "end": 0.8}
+            ]
+          },
+          {
+            "id": "s2",
+            "text": "今天我们请到了连续创业者宝玉老师，宝玉先跟大家打个招呼。",
+            "words": []
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "speaker": "宝玉",
+        "sentences": [
+          {
+            "id": "s3",
+            "text": "Jack 老师好，听众朋友们大家好。",
+            "words": []
+          },
+          {
+            "id": "s4",
+            "text": "我先说一下我第一次创业的失败故事，2018 年到 2020 年。",
+            "words": []
+          }
+        ]
+      }
+    ],
+    "translations": {}
+  },
+  "keywords": [
+    {"key": "AI 创业", "desc": "在 AI 时代从 0 到 1 创业的非主流经验"},
+    {"key": "Unit economics", "desc": "AI 产品的单位经济模型与 SaaS 的差异"},
+    {"key": "开源模型", "desc": "2026 年坚持用开源 LLM + 自托管的 defensibility 逻辑"}
+  ],
+  "highlights": [
+    {
+      "time": 580.0,
+      "content": "我们 12 个人的团队 4 条产品线，谁都说服不了谁。",
+      "cueId": "s4",
+      "note": null
+    },
+    {
+      "time": 1850.0,
+      "content": "用户量过 100 之前，免费 + 直接对话比付费墙有效 10 倍。",
+      "cueId": null,
+      "note": null
+    }
+  ],
+  "qas": [
+    {
+      "question": "为什么第二次创业前 6 个月不融资？",
+      "answer": "融资的隐含成本是 O(融资额) 的注意力分散。每个投资人月报、董事会准备、数据指标监控都在拉走工程团队的 focus。前 6 个月你最需要的是把技术做扎实到内部能用。",
+      "questionSpeaker": "Jack",
+      "answerSpeaker": "宝玉"
+    },
+    {
+      "question": "AI 产品的 unit economics 比 SaaS 难在哪？",
+      "answer": "三个变量：推理成本（每次调用都是现金支出，跟用户使用强度正相关）、用户期望（被 ChatGPT 拉高，免费版都想要 GPT-4 体验）、模型升级（底层 API 一升级，你做的所有 prompt engineering 全部要重做）。",
+      "questionSpeaker": "Jack",
+      "answerSpeaker": "宝玉"
+    }
+  ],
+  "clips": [],
+  "article": {
+    "title": "「慢就是快」：一个连续创业者的 AI 产品从 0 到 1 三条反常识",
+    "content": "# 「慢就是快」：一个连续创业者的 AI 产品从 0 到 1 三条反常识\n\n2018 年，宝玉跟两个合伙人凑了 200 万启动资金，组了一个 12 人的团队，开了 4 条 SaaS 产品线。投资人很喜欢，3 个月内就拿到 1000 万 A 轮。2020 年，钱烧完了，4 条产品线只有 1 条做到盈亏平衡，他关掉公司，重新上班。\n\n2022 年，他再次创业。这次做的是 AI 产品。三年后，他告诉我，团队稳定在 6 个人，年营收已经超过第一次创业峰值的两倍。但最让他意外的是：他前 6 个月没有拿任何融资，技术上花了 3 个月让 4 个工程师自己做产品的第一个用户，在用户量过 100 之前根本没有上线付费功能。\n\n这不是一份「成功学」叙事。这是一份关于「哪些反常识的决定让 6 个人能跑赢 12 个人」的复盘。下面是宝玉亲口说的三条非主流决策。\n\n## 决定一：前 6 个月不融资\n\n第一次创业时，宝玉认为「快速融资 = 快速验证」。拿到钱之后可以做更多事——更快的招聘、更快的产品迭代、更快的市场推广。18 个月后他承认，这种思维是灾难。\n\n> 「融资的隐形成本是 O(融资额) 的注意力分散。每个月投资人月报、董事会准备、数据指标监控，都在拉走工程团队的 focus。」\n> *\"The hidden cost of fundraising is O(amount raised) of attention debt. Every month, investor updates, board prep, and metric monitoring pulls engineering focus away.\"*\n> —— 宝玉 [12:25]\n\n第二次创业时，他给自己定了一个规则：前 6 个月不融资。团队的工资靠他和合伙人的个人积蓄。这意味着团队人数上限是 4 个人（再多就发不起工资了）。代价是慢。好处是——所有人都在做产品，没人做汇报。\n\n[... article continues ...]\n\n## 💡 值得记住的核心认知\n\n- 「慢就是快」不是玄学，是 6 人团队 vs 12 人团队的真实 ROI 差距。\n- 融资的隐形成本不是稀释股权，是 O(融资额) 的注意力分散。\n- AI 产品的 unit economics 比 SaaS 难 30~40 个百分点，必须用规模摊薄。\n- 2026 年坚持用开源模型 + 自托管，比调用闭源 API 更有 defensibility。\n\n## 📚 视频提及的书影音与工具\n\n- **《Lean Startup》** by Eric Ries — 宝玉承认第一次创业时奉为圣经，第二次才意识到 MVP 概念在 AI 时代需要重新校准。\n- **vLLM** — 宝玉团队 2026 年的推理基础设施，开源 + 自托管。\n- **Qwen3 系列** — 国内开源模型，宝玉在生产环境的主力。\n- **宝玉的博客 baoyu.io** — 持续记录 AI 创业的反思。\n\n## 🧭 延伸探索建议\n\n- 对比宝玉的「6 人不开 4 条线」原则和 YC 当前推荐的 AI 创业模式，看哪个更适合你的场景。\n- 调研 2026 年开源 LLM 推理的真实成本结构——是不是真的比 API 便宜。\n- 找一个你最近用过 100+ 次的 AI 产品，看它是不是符合「100 用户之前免费 + 直接对话」的模式。",
+    "format": "markdown",
+    "lang": "zh",
+    "focus": null,
+    "generatedAt": "2026-10-18T11:00:00Z"
+  },
+  "shownotes": "本期硬地骇客邀请了连续创业者宝玉，聊他从第一次失败的 SaaS 到第二次成功的 AI 产品的全过程。涵盖技术选型、团队组建、融资节奏、产品迭代。",
+  "isRead": false,
+  "tags": ["auto-processed", "ai", "创业", "podcast"],
+  "collectionId": null,
+  "ownerId": null,
+  "visibility": "public"
+}

@@ -1,0 +1,151 @@
+{
+  "id": "",
+  "source": {
+    "url": "https://www.youtube.com/watch?v=ABCDEFG1234",
+    "platform": "youtube",
+    "title": "Andrej Karpathy: Software 2.0, Transformers, Agents, RLHF",
+    "author": "Andrej Karpathy",
+    "publishedAt": "2024-03-12T00:00:00Z",
+    "thumbnailUrl": "https://i.ytimg.com/vi/ABCDEFG1234/maxresdefault.jpg",
+    "duration": 7320.0,
+    "feedUrl": null,
+    "description": "Lex Fridman Podcast #324 with Andrej Karpathy. We discuss Software 2.0, the Transformer architecture, the future of agents, RLHF vs RL from environment, and what Karpathy learned building Tesla Autopilot.",
+    "podcastName": "Lex Fridman Podcast",
+    "episodeCoverUrl": null,
+    "language": "en",
+    "audioPath": null
+  },
+  "processing": {
+    "status": "done",
+    "asrEngine": "youtube-subs",
+    "llmModel": "claude-4-opus",
+    "processedAt": "2026-10-18T11:00:00Z",
+    "agentId": "download-expert-v2",
+    "error": null
+  },
+  "summary": {
+    "oneLiner": "Karpathy argues Software 2.0 is a paradigm shift in how we build systems — replacing written code with trained neural networks — and that the same shift is now hitting robotics, agents, and education.",
+    "abstract": "In this 2-hour conversation, Andrej Karpathy and Lex Fridman trace the arc from Software 1.0 (explicitly written code) to Software 2.0 (trained neural networks) and explore what the shift means for every layer of the stack. Karpathy argues that neural networks are not a tool inside the programmer's toolkit — they are a different kind of programming entirely, with different debugging, different correctness, different failure modes. The conversation then moves to agents: Karpathy distinguishes between autonomous and assistive agents, argues the latter are the realistic near-term target, and walks through why RLHF (reinforcement learning from human feedback) is fundamentally a different beast from RL on environment rewards. The episode closes with Karpathy's prediction that the next 5 years will see Software 2.0 eat Software 1.0 in domains where labeled data is plentiful, evaluation is fast, and the cost of a wrong answer is bounded.",
+    "keyTakeaways": [
+      "Software 2.0 is a different kind of programming: you write a dataset and a network architecture, then 'compile' via training, instead of writing explicit instructions.",
+      "Neural networks are the first programming paradigm where the source code is unreadable by humans — debugging is statistical, not symbolic.",
+      "RLHF and RL from environment rewards optimize for fundamentally different signals: human preference vs. ground-truth outcome. They are not interchangeable.",
+      "Assistive agents (a human in the loop, the agent doing the heavy lifting) are realistic in 2026; autonomous agents (the agent doing everything) are not.",
+      "The next 5 years of Software 2.0 will eat Software 1.0 first in domains with abundant labeled data, fast evaluation, and bounded error cost — e.g. vision, translation, code suggestions."
+    ],
+    "thinkingQuestions": [
+      "If Software 2.0 programs are unreadable, who is responsible when one fails?",
+      "What evaluation harness would you need to trust a Software 2.0 program in a high-stakes domain?",
+      "Could a Software 2.0 program be made auditable end-to-end, or is opacity the price of the paradigm?"
+    ],
+    "glossary": [
+      {"term": "Software 2.0", "definition": "Karpathy's term for programming by curating training data and architecture, then letting gradient descent produce the program. Distinct from Software 1.0 (explicitly written code)."},
+      {"term": "RLHF", "definition": "Reinforcement Learning from Human Feedback — training a model to optimize a reward model trained on human preference comparisons."},
+      {"term": "Assistive agent", "definition": "An agent that works under human direction and review, doing subtasks but not making high-stakes decisions alone."}
+    ]
+  },
+  "chapters": [
+    {
+      "title": "Introduction: Why Software 2.0 now",
+      "startTime": 0.0,
+      "endTime": 600.0,
+      "summary": "Karpathy opens with the observation that 2012's ImageNet moment is not a fluke — it is a paradigm shift. He frames Software 2.0 as a peer to Software 1.0, not a tool inside it.",
+      "hasAds": false,
+      "deepRead": null
+    },
+    {
+      "title": "Software 2.0 vs. Software 1.0: a stack-level comparison",
+      "startTime": 600.0,
+      "endTime": 2400.0,
+      "summary": "Karpathy walks through the layers of the stack — interpreter, compiler, debugger, deployment — and shows how each layer has a Software 2.0 analog that is qualitatively different. He gives the example of Tesla's lane-keeping network as a 1.5-billion-parameter program that no human has read in full.",
+      "hasAds": false,
+      "deepRead": null
+    }
+  ],
+  "mindmap": {
+    "markdown": "# Karpathy on Software 2.0\n## What is Software 2.0\n### Data is the source code\n### Network is the interpreter\n### Gradient descent is the compiler\n## Stack comparison\n### Software 1.0 vs 2.0 layers\n### Debugging: symbolic vs statistical\n### Failure modes: brittle vs opaque\n## Agents\n### Assistive vs autonomous\n### RLHF vs RL from environment\n### The next 5 years",
+    "opml": null
+  },
+  "transcript": {
+    "paragraphs": [
+      {
+        "id": 1,
+        "speaker": "Lex Fridman",
+        "sentences": [
+          {
+            "id": "s1",
+            "text": "The following is a conversation with Andrej Karpathy.",
+            "words": [
+              {"id": "w0", "text": "The", "start": 0.0, "end": 0.2},
+              {"id": "w1", "text": "following", "start": 0.2, "end": 0.6}
+            ]
+          },
+          {
+            "id": "s2",
+            "text": "He's one of the most important researchers in AI and a founding team member of OpenAI.",
+            "words": []
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "speaker": "Andrej Karpathy",
+        "sentences": [
+          {
+            "id": "s3",
+            "text": "Thanks for having me, Lex.",
+            "words": []
+          },
+          {
+            "id": "s4",
+            "text": "I want to start with something I called Software 2.0 back in 2017.",
+            "words": []
+          }
+        ]
+      }
+    ],
+    "translations": {}
+  },
+  "keywords": [
+    {"key": "Software 2.0", "desc": "Programming paradigm where neural networks replace explicit code"},
+    {"key": "RLHF", "desc": "Reinforcement learning from human feedback — different from environment-reward RL"},
+    {"key": "Karpathy", "desc": "Andrej Karpathy, founding team member of OpenAI, ex-Tesla AI director"}
+  ],
+  "highlights": [
+    {
+      "time": 342.5,
+      "content": "Neural networks are the first programming paradigm where the source code is unreadable by humans.",
+      "cueId": "s4",
+      "note": null
+    },
+    {
+      "time": 1820.0,
+      "content": "Tesla's lane-keeping network is a 1.5-billion-parameter program no human has read in full.",
+      "cueId": null,
+      "note": null
+    }
+  ],
+  "qas": [
+    {
+      "question": "What is Software 2.0?",
+      "answer": "Karpathy defines it as a programming paradigm where instead of writing explicit instructions, you curate a dataset and a network architecture, and the program emerges from training. The source code is unreadable by humans; debugging is statistical.",
+      "questionSpeaker": "Lex Fridman",
+      "answerSpeaker": "Andrej Karpathy"
+    }
+  ],
+  "clips": [],
+  "article": {
+    "title": "Karpathy on Software 2.0: why the unreadable program is the next paradigm",
+    "content": "# Karpathy on Software 2.0: why the unreadable program is the next paradigm\n\nIn 2017, Andrej Karpathy wrote a blog post arguing that neural networks are not a tool inside the programmer's toolkit — they are a different kind of programming. Seven years later, sitting across from Lex Fridman, he was asked whether he still believed it. His answer was an immediate, unhesitating yes. What followed in the next two hours was the most complete articulation of the idea I have heard.\n\nThis is an attempt to capture the spine of the conversation — not as a recap, but as a self-contained read so you do not have to listen to the whole thing. The article is faithful to Karpathy's reasoning, not a paraphrase of his conclusions.\n\n## The argument from first principles\n\nKarpathy opens with a thought experiment. Imagine a programmer in 1985 being told that in forty years, the dominant way to write code would be to curate a dataset and let gradient descent write the program for you. What would they think?\n\n> 「神经网络的源码是给人读不了的。这是四十年来第一个不可读的编程范式。」\n> *\"The source code of a neural network is unreadable by humans. This is the first programming paradigm in forty years where the program is not legible to its author.\"*\n> —— Andrej Karpathy [05:42]\n\nThe key move in Karpathy's argument is that neural networks do not optimize for readability. They optimize for loss on a training set. Those are different objectives. A program that achieves 0.001 loss might do so via internal representations that no human would design — and the same model can be re-trained from scratch and produce a qualitatively different program. The 'code' is not an artifact you can pin down and review. It is a probability distribution over programs.\n\nThis has consequences for every layer of the stack Karpathy laid out. In Software 1.0, the editor is the human's primary surface. In Software 2.0, the dataset is. The compiler — gradient descent — is fixed, like a hardware ISA. The debugger is statistical, not symbolic. The deployment story is not 'install this binary' but 'serve this model from this checkpoint.'\n\n[... article continues ...]\n\n## 💡 值得记住的核心认知\n\n- Software 2.0 is not a tool — it is a peer paradigm to Software 1.0 with a different stack, different debugging, and different failure modes.\n- A neural network's source code is unreadable by design, not by accident. Opacity is the price of the paradigm.\n- RLHF optimizes a different signal than environment-reward RL; they are not interchangeable.\n\n## 📚 视频提及的书影音与工具\n\n- **The Annotated Transformer** by Sasha Rush et al. — the canonical line-by-line walkthrough of the original Transformer paper.\n- **Tesla's lane-keeping network** — referenced as a 1.5-billion-parameter Software 2.0 program no human has read in full.\n- **OpenAI** — co-founded by Karpathy, referenced throughout as the institutional context for his agent / RLHF views.\n\n## 🧭 延伸探索建议\n\n- Read Karpathy's original 2017 Software 2.0 post and compare his predictions to what actually happened in 2023–2025.\n- Look up \"neural network verification\" — the field trying to make Software 2.0 programs auditable end-to-end.\n- Trace the lineage from Software 2.0 to \"vibe coding\" — the 2025 practice of letting an LLM write Software 1.0 for you, on top of Software 2.0 the LLM itself is built on.",
+    "format": "markdown",
+    "lang": "zh",
+    "focus": null,
+    "generatedAt": "2026-10-18T11:00:00Z"
+  },
+  "shownotes": "Lex Fridman Podcast #324 with Andrej Karpathy. We discuss Software 2.0, the Transformer architecture, the future of agents, RLHF vs RL from environment, and what Karpathy learned building Tesla Autopilot.",
+  "isRead": false,
+  "tags": ["auto-processed", "ai", "agents", "karpathy"],
+  "collectionId": null,
+  "ownerId": null,
+  "visibility": "public"
+}
