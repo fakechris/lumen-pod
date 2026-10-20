@@ -84,6 +84,13 @@ ALTER TABLE episodes ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT '
 -- Migration: per-user chat messages
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT '';
 
+-- Migration: runtime-editable settings (admin panel); values override env defaults
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_episodes_source_url ON episodes(source_url);
 CREATE INDEX IF NOT EXISTS idx_episodes_created_at ON episodes(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_episodes_search ON episodes USING GIN(search_vector);

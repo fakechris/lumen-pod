@@ -918,6 +918,46 @@ impl Store {
             .collect())
     }
 
+    // ---- Settings (runtime-editable config; overrides env defaults) ----
+
+    pub async fn get_setting(&self, key: &str) -> PodResult<Option<String>> {
+        let row = sqlx::query("SELECT value FROM settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("value")))
+    }
+
+    pub async fn get_settings(&self) -> PodResult<std::collections::HashMap<String, String>> {
+        let rows = sqlx::query("SELECT key, value FROM settings")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<String, _>("key"), r.get::<String, _>("value")))
+            .collect())
+    }
+
+    pub async fn set_setting(&self, key: &str, value: &str) -> PodResult<()> {
+        sqlx::query(
+            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_setting(&self, key: &str) -> PodResult<()> {
+        sqlx::query("DELETE FROM settings WHERE key = $1")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     fn row_to_user(r: &sqlx::postgres::PgRow) -> User {
         let role = match r.get::<String, _>("role").as_str() {
             "admin" => UserRole::Admin,
@@ -1295,6 +1335,30 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn settings_roundtrip_and_reset() {
+        let store = test_store().await;
+        assert_eq!(store.get_setting("llm_model").await.unwrap(), None);
+
+        store.set_setting("llm_model", "MiniMax-M3.1-Flash").await.unwrap();
+        assert_eq!(
+            store.get_setting("llm_model").await.unwrap().as_deref(),
+            Some("MiniMax-M3.1-Flash")
+        );
+        // Upsert overwrites.
+        store.set_setting("llm_model", "next-gen-model").await.unwrap();
+        assert_eq!(
+            store.get_setting("llm_model").await.unwrap().as_deref(),
+            Some("next-gen-model")
+        );
+        let all = store.get_settings().await.unwrap();
+        assert_eq!(all.get("llm_model").map(String::as_str), Some("next-gen-model"));
+
+        // Delete resets to "no override".
+        store.delete_setting("llm_model").await.unwrap();
+        assert_eq!(store.get_setting("llm_model").await.unwrap(), None);
     }
 
     #[tokio::test]

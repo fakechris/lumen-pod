@@ -331,6 +331,27 @@ pub struct AppState {
     pub chapter_tasks: Arc<std::sync::Mutex<std::collections::HashMap<String, ArticleGenStatus>>>,
 }
 
+impl AppState {
+    /// LLM config with admin-editable DB settings overriding the env defaults
+    /// (`llm_model`, `llm_base_url`; empty or missing rows fall back to env).
+    pub async fn effective_llm(&self) -> crate::LlmConfig {
+        let mut cfg = self.llm.clone();
+        if let Ok(Some(v)) = self.store.get_setting("llm_model").await {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                cfg.model = v;
+            }
+        }
+        if let Ok(Some(v)) = self.store.get_setting("llm_base_url").await {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                cfg.base_url = v;
+            }
+        }
+        cfg
+    }
+}
+
 pub async fn google_login(State(state): State<AppState>) -> impl IntoResponse {
     let url = format!(
         "https://accounts.google.com/o/oauth2/v2/auth?\

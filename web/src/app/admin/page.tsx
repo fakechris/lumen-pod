@@ -25,19 +25,34 @@ interface Invite {
   accepted_at?: string;
 }
 
+interface SettingEntry {
+  value: string;
+  overridden: boolean;
+  default: string;
+}
+
+const SETTING_LABELS: Record<string, { label: string; hint: string }> = {
+  llm_model: { label: "LLM Model", hint: "模型名，保存后立即生效（下一次生成开始使用），无需重启" },
+  llm_base_url: { label: "LLM Base URL", hint: "Anthropic 兼容 API 地址；留空恢复部署默认" },
+};
+
 export default function AdminPage() {
   const { user, loading: authLoading } = useAuth();
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [invites, setInvites] = useState<Invite[]>([]);
+  const [settings, setSettings] = useState<Record<string, SettingEntry>>({});
+  const [settingDrafts, setSettingDrafts] = useState<Record<string, string>>({});
+  const [settingsSaving, setSettingsSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [inviteEmail, setInviteEmail] = useState("");
   const [message, setMessage] = useState<string | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
-      const [usersRes, invitesRes] = await Promise.all([
+      const [usersRes, invitesRes, settingsRes] = await Promise.all([
         fetch("/api/admin/users", { credentials: "include" }),
         fetch("/api/admin/invites", { credentials: "include" }),
+        fetch("/api/admin/settings", { credentials: "include" }),
       ]);
       if (usersRes.ok) {
         const data = await usersRes.json();
@@ -46,6 +61,12 @@ export default function AdminPage() {
       if (invitesRes.ok) {
         const data = await invitesRes.json();
         setInvites(data.invites || []);
+      }
+      if (settingsRes.ok) {
+        const data = await settingsRes.json();
+        const entries: Record<string, SettingEntry> = data.settings || {};
+        setSettings(entries);
+        setSettingDrafts(Object.fromEntries(Object.entries(entries).map(([k, v]) => [k, v.value])));
       }
     } catch (e) {
       console.error("Failed to fetch admin data", e);
@@ -59,6 +80,39 @@ export default function AdminPage() {
       fetchData();
     }
   }, [authLoading, user, fetchData]);
+
+  const saveSettings = async () => {
+    setSettingsSaving(true);
+    try {
+      const changed: Record<string, string> = {};
+      for (const [k, draft] of Object.entries(settingDrafts)) {
+        if (draft.trim() !== (settings[k]?.value ?? "")) changed[k] = draft.trim();
+      }
+      if (Object.keys(changed).length === 0) {
+        setMessage("设置没有变化");
+        return;
+      }
+      const res = await fetch("/api/admin/settings", {
+        method: "PATCH",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings: changed }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const entries: Record<string, SettingEntry> = data.settings || {};
+      setSettings(entries);
+      setSettingDrafts(Object.fromEntries(Object.entries(entries).map(([k, v]) => [k, v.value])));
+      setMessage("设置已保存，下一次生成立即生效");
+    } catch (e: any) {
+      setMessage(e.message || "保存失败");
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
 
   const approveUser = async (id: string) => {
     await fetch(`/api/admin/users/${id}`, {
@@ -172,6 +226,68 @@ export default function AdminPage() {
             </button>
           </div>
         )}
+
+        {/* Settings Section */}
+        <section>
+          <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 mb-4">
+            Settings
+          </h2>
+          <div className="p-4 rounded-lg bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 space-y-4">
+            {Object.entries(SETTING_LABELS).map(([key, meta]) => {
+              const entry = settings[key];
+              if (!entry) return null;
+              const dirty = (settingDrafts[key] ?? "").trim() !== entry.value;
+              return (
+                <div key={key}>
+                  <label className="flex items-center gap-2 text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                    {meta.label}
+                    <span
+                      className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${
+                        entry.overridden
+                          ? "bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-400"
+                          : "bg-zinc-100 dark:bg-zinc-800 text-zinc-500"
+                      }`}
+                    >
+                      {entry.overridden ? "自定义" : "部署默认"}
+                    </span>
+                    {dirty && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-400">
+                        未保存
+                      </span>
+                    )}
+                  </label>
+                  <input
+                    value={settingDrafts[key] ?? ""}
+                    onChange={(e) => setSettingDrafts((prev) => ({ ...prev, [key]: e.target.value }))}
+                    placeholder={entry.default}
+                    className="w-full px-3 py-2 rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 text-sm font-mono focus:ring-2 focus:ring-blue-500 outline-none"
+                  />
+                  <p className="text-xs text-zinc-400 mt-1">
+                    {meta.hint}。当前生效值：{entry.value}
+                  </p>
+                </div>
+              );
+            })}
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={saveSettings}
+                disabled={settingsSaving}
+                className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white transition-colors"
+              >
+                {settingsSaving ? "保存中…" : "保存设置"}
+              </button>
+              <button
+                onClick={() =>
+                  setSettingDrafts(Object.fromEntries(Object.keys(SETTING_LABELS).map((k) => [k, ""])))
+                }
+                className="px-4 py-2 text-sm rounded-lg border border-zinc-300 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+                title="清空所有自定义值（保存后回到部署默认）"
+              >
+                恢复部署默认
+              </button>
+            </div>
+          </div>
+        </section>
 
         {/* Invite Section */}
         <section>

@@ -179,6 +179,10 @@ async fn run_server(database_url: &str) {
             "/api/admin/invites",
             get(auth::list_invites).post(auth::create_invite),
         )
+        .route(
+            "/api/admin/settings",
+            get(get_admin_settings).patch(update_admin_settings),
+        )
         .route("/api/admin/users", get(auth::list_users))
         .route(
             "/api/admin/users/{id}",
@@ -867,6 +871,85 @@ fn list_part_urls(audio_dir: &str, id: &str) -> Vec<String> {
     names.into_iter().map(|name| format!("/audio/{name}")).collect()
 }
 
+// ---- Admin: Runtime Settings ----
+
+/// Keys an admin may edit at runtime; values override the env defaults.
+/// API keys stay env-only on purpose (secret, and provider-dependent).
+const EDITABLE_SETTINGS: &[&str] = &["llm_model", "llm_base_url"];
+
+async fn admin_settings_payload(state: &AppState) -> serde_json::Value {
+    let overrides = state.store.get_settings().await.unwrap_or_default();
+    let mut map = serde_json::Map::new();
+    for key in EDITABLE_SETTINGS {
+        let env_default = match *key {
+            "llm_model" => state.llm.model.clone(),
+            "llm_base_url" => state.llm.base_url.clone(),
+            _ => String::new(),
+        };
+        let overridden = overrides
+            .get(*key)
+            .is_some_and(|v| !v.trim().is_empty());
+        let value = if overridden {
+            overrides[*key].trim().to_string()
+        } else {
+            env_default.clone()
+        };
+        map.insert(
+            (*key).to_string(),
+            serde_json::json!({
+                "value": value,
+                "overridden": overridden,
+                "default": env_default,
+            }),
+        );
+    }
+    serde_json::json!({ "settings": map })
+}
+
+async fn get_admin_settings(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = auth::require_admin_viewer(&state, &headers).await {
+        return e;
+    }
+    (StatusCode::OK, Json(admin_settings_payload(&state).await)).into_response()
+}
+
+#[derive(Deserialize)]
+struct UpdateSettingsRequest {
+    /// key → new value; an empty string resets the key to its env default.
+    settings: std::collections::HashMap<String, String>,
+}
+
+async fn update_admin_settings(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<UpdateSettingsRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = auth::require_admin_viewer(&state, &headers).await {
+        return e;
+    }
+    for (key, value) in &req.settings {
+        if !EDITABLE_SETTINGS.contains(&key.as_str()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("unknown setting: {key}")})),
+            )
+                .into_response();
+        }
+        let result = if value.trim().is_empty() {
+            state.store.delete_setting(key).await
+        } else {
+            state.store.set_setting(key, value.trim()).await
+        };
+        if let Err(e) = result {
+            return err_500(e);
+        }
+    }
+    (StatusCode::OK, Json(admin_settings_payload(&state).await)).into_response()
+}
+
 fn detect_audio_ext(bytes: &[u8]) -> &'static str {
     if bytes.len() < 12 {
         return "mp3";
@@ -1232,7 +1315,8 @@ async fn create_chat_with_ai(
     }
     messages.push(serde_json::json!({"role": "user", "content": req.content}));
 
-    let assistant_content = match call_llm_anthropic(&state.llm, &system, &messages).await {
+    let llm = state.effective_llm().await;
+    let assistant_content = match call_llm_anthropic(&llm, &system, &messages).await {
         Ok(text) => text,
         Err(err) => {
             return (
@@ -1474,8 +1558,9 @@ async fn chapter_deep_read(
     let id_clone = id.clone();
     let task_key_clone = task_key.clone();
     tokio::spawn(async move {
+        let llm = state_clone.effective_llm().await;
         let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-        match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 24_576).await {
+        match call_llm_anthropic_with_tokens(&llm, &system, &messages, 24_576).await {
             Ok(content) => {
                 if let Err(e) = state_clone
                     .store
@@ -1870,8 +1955,9 @@ async fn episode_article(
     let id_clone = id.clone();
     let fallback_title = ep.source.title.clone();
     tokio::spawn(async move {
+        let llm = state_clone.effective_llm().await;
         let messages = vec![serde_json::json!({"role": "user", "content": user_prompt})];
-        match call_llm_anthropic_with_tokens(&state_clone.llm, &system, &messages, 40_960).await {
+        match call_llm_anthropic_with_tokens(&llm, &system, &messages, 40_960).await {
             Ok(raw_output) => {
                 let (title, content) = extract_markdown_title(&raw_output, &fallback_title);
                 let article = lumen_pod_core::episode::Article {
@@ -2154,9 +2240,10 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
         let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
 
         // Timeout: 10 minutes per chapter
+        let llm = state.effective_llm().await;
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(600),
-            call_llm_anthropic_with_tokens(&state.llm, &system, &messages, 24_576),
+            call_llm_anthropic_with_tokens(&llm, &system, &messages, 24_576),
         ).await;
 
         let is_ok = match result {
