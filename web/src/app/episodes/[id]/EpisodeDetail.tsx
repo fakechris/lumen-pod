@@ -809,34 +809,31 @@ export default function EpisodeDetail({ id }: { id: string }) {
 
       {/* Single-column layout — player on top, content below */}
       <div className="max-w-5xl mx-auto px-4 py-6 space-y-6">
-        {/* When on Article/Chapters/Transcript with audio: player + tab bar sticky together */}
         {(() => {
           const stickyPlayer = hasAudio && (activeTab === "Article" || activeTab === "Chapters" || activeTab === "Transcript");
           return (
             <>
-              {/* Sticky player + tab combo for Chapters/Transcript */}
-              {stickyPlayer && (
-                <div className="sticky top-0 z-20 bg-zinc-50 dark:bg-zinc-950 -mx-4 px-4 pt-2 pb-1 space-y-2 shadow-sm">
+              {/* Persistent player block — ONE instance for all tabs so playback
+                  and progress survive tab switches; only styling goes sticky. */}
+              {hasAudio && (
+                <div
+                  className={`space-y-2 ${
+                    stickyPlayer
+                      ? "sticky top-0 z-20 bg-zinc-50 dark:bg-zinc-950 -mx-4 px-4 pt-2 pb-1 shadow-sm"
+                      : "-mx-4 px-4 pb-1"
+                  }`}
+                >
                   <AudioPlayer sources={audioSources} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />
-                  <div className="flex gap-1 overflow-x-auto bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-1">
-                    {TABS.map((tab) => (
-                      <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 text-sm font-medium rounded-lg whitespace-nowrap transition-colors ${activeTab === tab ? "bg-blue-600 text-white shadow-sm" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}>
-                        {tab}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Normal player section (non-sticky, or for non-audio tabs) */}
-              {!stickyPlayer && hasPlayer && (
-                <div className="space-y-3">
-                  {hasAudio && <AudioPlayer sources={audioSources} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
-                  {!hasAudio && youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} autoActivate={ytAutoActivate} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
-                  {!hasAudio && bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
-                  {!hasAudio && tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
-
-                  {hasAudio && (youtubeId || bilibiliId || tweetId) && (
+                  {stickyPlayer && (
+                    <div className="flex gap-1 overflow-x-auto bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-1">
+                      {TABS.map((tab) => (
+                        <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 text-sm font-medium rounded-lg whitespace-nowrap transition-colors ${activeTab === tab ? "bg-blue-600 text-white shadow-sm" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}>
+                          {tab}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {(youtubeId || bilibiliId || tweetId) && (
                     <details className="text-sm">
                       <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">Show original embed</summary>
                       <div className="mt-2">
@@ -849,7 +846,16 @@ export default function EpisodeDetail({ id }: { id: string }) {
                 </div>
               )}
 
-              {/* Tab bar — standalone sticky when player is NOT sticky */}
+              {/* Embed-only players (no audio uploaded) */}
+              {!hasAudio && hasPlayer && (
+                <div className="space-y-3">
+                  {youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} autoActivate={ytAutoActivate} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
+                  {bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
+                  {tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
+                </div>
+              )}
+
+              {/* Tab bar — standalone sticky when player block isn't sticky */}
               {!stickyPlayer && (
                 <div className="sticky top-0 z-10 bg-zinc-50 dark:bg-zinc-950 pb-1 -mx-4 px-4">
                   <div className="flex gap-1 overflow-x-auto bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-1">
@@ -860,18 +866,6 @@ export default function EpisodeDetail({ id }: { id: string }) {
                     ))}
                   </div>
                 </div>
-              )}
-
-              {/* Embed shown below sticky player when on audio+Chapters/Transcript */}
-              {stickyPlayer && (youtubeId || bilibiliId || tweetId) && (
-                <details className="text-sm">
-                  <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">Show original embed</summary>
-                  <div className="mt-2">
-                    {youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} />}
-                    {bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
-                    {tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
-                  </div>
-                </details>
               )}
             </>
           );
