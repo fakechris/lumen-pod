@@ -20,7 +20,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash lumenpod && \
-    mkdir -p /data/audio && chown lumenpod:lumenpod /data/audio
+    mkdir -p /data/audio /data/static && \
+    chown lumenpod:lumenpod /data/audio /data/static
 
 COPY --from=builder /usr/local/bin/lumen-pod-server /usr/local/bin/lumen-pod-server
 
