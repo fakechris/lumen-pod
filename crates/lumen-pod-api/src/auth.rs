@@ -13,6 +13,7 @@ use axum::{
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use lumen_pod_core::episode::UserRole;
@@ -133,6 +134,42 @@ pub fn matches_api_token(auth: &AuthConfig, headers: &HeaderMap) -> bool {
         })
 }
 
+pub fn sha256_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Resolve an admin-capable viewer from a Bearer API token: issued tokens
+/// (hashed in the `api_tokens` table) first, then the `LUMEN_POD_API_TOKEN`
+/// env values as operator bootstrap tokens. Usage is NOT counted here —
+/// callers that own the request touch `viewer.api_token_id` exactly once
+/// (handlers may resolve the viewer repeatedly).
+pub async fn api_token_viewer(state: &AppState, headers: &HeaderMap) -> Option<ViewerContext> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))?;
+
+    if let Ok(Some(row)) = state.store.get_api_token_by_hash(&sha256_hex(bearer)).await {
+        let mut viewer = ViewerContext::api_token();
+        viewer.api_token_id = Some(row.id);
+        return Some(viewer);
+    }
+
+    matches_api_token(&state.auth, headers).then_some(ViewerContext::api_token())
+}
+
+/// Count one authenticated request for an issued token (fire-and-forget).
+pub fn touch_api_token_usage(state: &AppState, viewer: &ViewerContext) {
+    if let Some(id) = &viewer.api_token_id {
+        let store = state.store.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            let _ = store.touch_api_token(&id).await;
+        });
+    }
+}
+
 pub fn extract_claims(headers: &HeaderMap, jwt_secret: &str) -> Option<Claims> {
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
@@ -168,6 +205,9 @@ pub struct ViewerContext {
     pub can_delete: bool,
     pub can_publish_private: bool,
     pub is_api_token: bool,
+    /// `api_tokens.id` when authenticated via an issued (DB) token; None for
+    /// env tokens. Callers that own the request touch usage exactly once.
+    pub api_token_id: Option<String>,
 }
 
 impl ViewerContext {
@@ -181,6 +221,7 @@ impl ViewerContext {
             can_delete: true,
             can_publish_private: true,
             is_api_token: true,
+            api_token_id: None,
         }
     }
 
@@ -213,8 +254,8 @@ pub async fn resolve_viewer(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<ViewerContext, axum::response::Response> {
-    if matches_api_token(&state.auth, headers) {
-        return Ok(ViewerContext::api_token());
+    if let Some(viewer) = api_token_viewer(state, headers).await {
+        return Ok(viewer);
     }
 
     let Some(claims) = extract_claims(headers, &state.auth.jwt_secret) else {
@@ -242,6 +283,7 @@ pub async fn resolve_viewer(
             can_delete: is_admin || u.can_delete,
             can_publish_private: is_admin || u.can_publish_private,
             is_api_token: false,
+            api_token_id: None,
         }
     } else {
         let is_admin = claims.role == "admin";
@@ -254,6 +296,7 @@ pub async fn resolve_viewer(
             can_delete: is_admin,
             can_publish_private: is_admin,
             is_api_token: false,
+            api_token_id: None,
         }
     };
 
@@ -299,7 +342,10 @@ pub async fn require_auth(
 ) -> Result<axum::response::Response, axum::response::Response> {
     let headers = req.headers();
     match resolve_viewer(&state, headers).await {
-        Ok(_) => Ok(next.run(req).await),
+        Ok(viewer) => {
+            touch_api_token_usage(&state, &viewer);
+            Ok(next.run(req).await)
+        }
         Err(e) => Err(e),
     }
 }
@@ -527,7 +573,8 @@ pub async fn google_callback(
 /// Also accepts a Bearer API token so agents can validate their token here
 /// (returning 401 for a valid token reads as "rejected" to API clients).
 pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if matches_api_token(&state.auth, &headers) {
+    if let Some(viewer) = api_token_viewer(&state, &headers).await {
+        touch_api_token_usage(&state, &viewer);
         let viewer = ViewerContext::api_token();
         return (
             StatusCode::OK,

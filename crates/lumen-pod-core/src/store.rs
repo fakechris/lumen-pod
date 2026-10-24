@@ -2,7 +2,7 @@ use chrono::Utc;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use crate::episode::{Episode, Invite, User, UserRole};
+use crate::episode::{ApiToken, Episode, Invite, User, UserRole};
 use crate::error::{PodError, PodResult};
 
 pub struct Store {
@@ -958,6 +958,80 @@ impl Store {
         Ok(())
     }
 
+    // ---- Issued API tokens ----
+
+    pub async fn get_api_token_by_hash(&self, token_hash: &str) -> PodResult<Option<ApiToken>> {
+        let row = sqlx::query(
+            "SELECT id::text AS id, name, token_hash, token_hint, created_by, created_at,
+                    last_used_at, use_count, revoked_at
+             FROM api_tokens WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Self::row_to_api_token))
+    }
+
+    pub async fn list_api_tokens(&self) -> PodResult<Vec<ApiToken>> {
+        let rows = sqlx::query(
+            "SELECT id::text AS id, name, token_hash, token_hint, created_by, created_at,
+                    last_used_at, use_count, revoked_at
+             FROM api_tokens ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Self::row_to_api_token).collect())
+    }
+
+    pub async fn insert_api_token(&self, token: &ApiToken) -> PodResult<()> {
+        sqlx::query(
+            "INSERT INTO api_tokens (id, name, token_hash, token_hint, created_by, created_at)
+             VALUES ($1::uuid, $2, $3, $4, $5, $6)",
+        )
+        .bind(&token.id)
+        .bind(&token.name)
+        .bind(&token.token_hash)
+        .bind(&token.token_hint)
+        .bind(&token.created_by)
+        .bind(token.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn revoke_api_token(&self, id: &str) -> PodResult<bool> {
+        let result = sqlx::query(
+            "UPDATE api_tokens SET revoked_at = now() WHERE id = $1::uuid AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Usage bookkeeping — called fire-and-forget after a successful auth.
+    pub async fn touch_api_token(&self, id: &str) -> PodResult<()> {
+        sqlx::query("UPDATE api_tokens SET last_used_at = now(), use_count = use_count + 1 WHERE id = $1::uuid")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    fn row_to_api_token(r: sqlx::postgres::PgRow) -> ApiToken {
+        ApiToken {
+            id: r.get("id"),
+            name: r.get("name"),
+            token_hash: r.get("token_hash"),
+            token_hint: r.get("token_hint"),
+            created_by: r.get("created_by"),
+            created_at: r.get("created_at"),
+            last_used_at: r.get("last_used_at"),
+            use_count: r.get("use_count"),
+            revoked_at: r.get("revoked_at"),
+        }
+    }
+
     fn row_to_user(r: &sqlx::postgres::PgRow) -> User {
         let role = match r.get::<String, _>("role").as_str() {
             "admin" => UserRole::Admin,
@@ -1359,6 +1433,46 @@ mod tests {
         // Delete resets to "no override".
         store.delete_setting("llm_model").await.unwrap();
         assert_eq!(store.get_setting("llm_model").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn api_token_lifecycle() {
+        let store = test_store().await;
+        let hash = format!("hash-{}", uuid::Uuid::new_v4().simple());
+        let token = ApiToken {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "cue-download-expert".into(),
+            token_hash: hash.clone(),
+            token_hint: "lp_deadbeef".into(),
+            created_by: Some("admin-1".into()),
+            created_at: Utc::now(),
+            last_used_at: None,
+            use_count: 0,
+            revoked_at: None,
+        };
+        store.insert_api_token(&token).await.unwrap();
+
+        let found = store.get_api_token_by_hash(&hash).await.unwrap().unwrap();
+        assert_eq!(found.name, "cue-download-expert");
+        assert_eq!(found.use_count, 0);
+        assert!(found.revoked_at.is_none());
+        assert!(store.get_api_token_by_hash("wrong-hash").await.unwrap().is_none());
+
+        store.touch_api_token(&token.id).await.unwrap();
+        store.touch_api_token(&token.id).await.unwrap();
+        let found = store.get_api_token_by_hash(&hash).await.unwrap().unwrap();
+        assert_eq!(found.use_count, 2);
+        assert!(found.last_used_at.is_some());
+
+        assert!(store.revoke_api_token(&token.id).await.unwrap());
+        // Revoking twice is a no-op; revoked tokens no longer authenticate.
+        assert!(!store.revoke_api_token(&token.id).await.unwrap());
+        assert!(store.get_api_token_by_hash(&hash).await.unwrap().is_none());
+
+        let listed = store.list_api_tokens().await.unwrap();
+        let ours: Vec<_> = listed.iter().filter(|t| t.token_hash == hash).collect();
+        assert_eq!(ours.len(), 1);
+        assert!(ours[0].revoked_at.is_some());
     }
 
     #[tokio::test]

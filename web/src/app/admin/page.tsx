@@ -31,6 +31,17 @@ interface SettingEntry {
   default: string;
 }
 
+interface ApiTokenEntry {
+  id: string;
+  name: string;
+  tokenHint: string;
+  createdBy?: string | null;
+  createdAt: string;
+  lastUsedAt?: string | null;
+  useCount: number;
+  revokedAt?: string | null;
+}
+
 const SETTING_LABELS: Record<string, { label: string; hint: string }> = {
   llm_model: { label: "LLM Model", hint: "模型名，保存后立即生效（下一次生成开始使用），无需重启" },
   llm_base_url: { label: "LLM Base URL", hint: "Anthropic 兼容 API 地址；留空恢复部署默认" },
@@ -43,16 +54,22 @@ export default function AdminPage() {
   const [settings, setSettings] = useState<Record<string, SettingEntry>>({});
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string>>({});
   const [settingsSaving, setSettingsSaving] = useState(false);
+  const [tokens, setTokens] = useState<ApiTokenEntry[]>([]);
+  const [envTokenCount, setEnvTokenCount] = useState(0);
+  const [newTokenName, setNewTokenName] = useState("");
+  const [tokenCreating, setTokenCreating] = useState(false);
+  const [issuedToken, setIssuedToken] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [inviteEmail, setInviteEmail] = useState("");
   const [message, setMessage] = useState<string | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
-      const [usersRes, invitesRes, settingsRes] = await Promise.all([
+      const [usersRes, invitesRes, settingsRes, tokensRes] = await Promise.all([
         fetch("/api/admin/users", { credentials: "include" }),
         fetch("/api/admin/invites", { credentials: "include" }),
         fetch("/api/admin/settings", { credentials: "include" }),
+        fetch("/api/admin/tokens", { credentials: "include" }),
       ]);
       if (usersRes.ok) {
         const data = await usersRes.json();
@@ -68,6 +85,11 @@ export default function AdminPage() {
         setSettings(entries);
         setSettingDrafts(Object.fromEntries(Object.entries(entries).map(([k, v]) => [k, v.value])));
       }
+      if (tokensRes.ok) {
+        const data = await tokensRes.json();
+        setTokens(data.tokens || []);
+        setEnvTokenCount(data.envTokenCount || 0);
+      }
     } catch (e) {
       console.error("Failed to fetch admin data", e);
     } finally {
@@ -81,8 +103,7 @@ export default function AdminPage() {
     }
   }, [authLoading, user, fetchData]);
 
-  const saveSettings = async () => {
-    setSettingsSaving(true);
+  const saveSettings = async () => {    setSettingsSaving(true);
     try {
       const changed: Record<string, string> = {};
       for (const [k, draft] of Object.entries(settingDrafts)) {
@@ -111,6 +132,44 @@ export default function AdminPage() {
       setMessage(e.message || "保存失败");
     } finally {
       setSettingsSaving(false);
+    }
+  };
+
+  const createToken = async () => {
+    if (!newTokenName.trim()) return;
+    setTokenCreating(true);
+    try {
+      const res = await fetch("/api/admin/tokens", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: newTokenName.trim() }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setIssuedToken(data.token as string);
+      setNewTokenName("");
+      setMessage(`Token「${data.name}」已签发，明文只显示这一次`);
+      fetchData();
+    } catch (e: any) {
+      setMessage(e.message || "签发失败");
+    } finally {
+      setTokenCreating(false);
+    }
+  };
+
+  const revokeToken = async (token: ApiTokenEntry) => {
+    if (!confirm(`确定吊销 token「${token.name}」（${token.tokenHint}…）吗？使用它的客户端会立刻失效。`)) return;
+    try {
+      const res = await fetch(`/api/admin/tokens/${token.id}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setMessage(`Token「${token.name}」已吊销`);
+      fetchData();
+    } catch (e: any) {
+      setMessage(e.message || "吊销失败");
     }
   };
 
@@ -285,6 +344,97 @@ export default function AdminPage() {
               >
                 恢复部署默认
               </button>
+            </div>
+          </div>
+        </section>
+
+        {/* API Tokens Section */}
+        <section>
+          <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 mb-4">
+            API Tokens
+          </h2>
+          <div className="p-4 rounded-lg bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 space-y-4">
+            <div className="flex gap-2">
+              <input
+                value={newTokenName}
+                onChange={(e) => setNewTokenName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && createToken()}
+                placeholder="给 token 起个名字，如 cue-download-expert"
+                className="flex-1 px-3 py-2 rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+              />
+              <button
+                onClick={createToken}
+                disabled={tokenCreating || !newTokenName.trim()}
+                className="px-4 py-2 text-sm rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white transition-colors"
+              >
+                {tokenCreating ? "签发中…" : "签发 Token"}
+              </button>
+            </div>
+
+            {issuedToken && (
+              <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-300 dark:border-amber-700 space-y-2">
+                <p className="text-xs text-amber-700 dark:text-amber-400">
+                  ⚠️ 明文只显示这一次（服务器只存哈希），立即复制保存：
+                </p>
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 font-mono text-sm text-zinc-900 dark:text-zinc-100 break-all">
+                    {issuedToken}
+                  </code>
+                  <button
+                    onClick={() => navigator.clipboard.writeText(issuedToken)}
+                    className="px-3 py-1.5 text-xs rounded-lg bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900"
+                  >
+                    复制
+                  </button>
+                  <button
+                    onClick={() => setIssuedToken(null)}
+                    className="px-3 py-1.5 text-xs rounded-lg border border-zinc-300 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400"
+                  >
+                    我已保存
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              {tokens.map((t) => (
+                <div
+                  key={t.id}
+                  className="flex items-center gap-3 p-3 rounded-lg bg-zinc-50 dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{t.name}</span>
+                      {t.revokedAt ? (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-950 text-red-700 dark:text-red-400">已吊销</span>
+                      ) : (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 dark:bg-green-950 text-green-700 dark:text-green-400">有效</span>
+                      )}
+                    </div>
+                    <div className="text-xs text-zinc-400 font-mono">{t.tokenHint}…</div>
+                    <div className="text-xs text-zinc-400">
+                      创建 {new Date(t.createdAt).toLocaleDateString()} · 使用 {t.useCount} 次 · 最后使用{" "}
+                      {t.lastUsedAt ? new Date(t.lastUsedAt).toLocaleString() : "从未"}
+                    </div>
+                  </div>
+                  {!t.revokedAt && (
+                    <button
+                      onClick={() => revokeToken(t)}
+                      className="px-3 py-1.5 text-sm rounded-lg border border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950 transition-colors"
+                    >
+                      吊销
+                    </button>
+                  )}
+                </div>
+              ))}
+              {tokens.length === 0 && (
+                <p className="text-sm text-zinc-400">还没有签发过 token。</p>
+              )}
+              {envTokenCount > 0 && (
+                <p className="text-xs text-zinc-400">
+                  另有 {envTokenCount} 个环境变量（LUMEN_POD_API_TOKEN）静态 token 仍然有效，作为运维引导用途，修改需重启服务。
+                </p>
+              )}
             </div>
           </div>
         </section>

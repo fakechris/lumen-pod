@@ -193,6 +193,14 @@ async fn run_server(database_url: &str) {
             "/api/admin/settings",
             get(get_admin_settings).patch(update_admin_settings),
         )
+        .route(
+            "/api/admin/tokens",
+            get(list_admin_tokens).post(create_admin_token),
+        )
+        .route(
+            "/api/admin/tokens/{id}",
+            axum::routing::delete(revoke_admin_token),
+        )
         .route("/api/admin/users", get(auth::list_users))
         .route(
             "/api/admin/users/{id}",
@@ -978,6 +986,112 @@ fn detect_image_ext(bytes: &[u8]) -> Option<&'static str> {
         Some("webp")
     } else {
         None
+    }
+}
+
+// ---- Admin: API Token Management ----
+
+use lumen_pod_core::episode::ApiToken;
+
+fn token_payload(token: &ApiToken) -> serde_json::Value {
+    serde_json::json!({
+        "id": token.id,
+        "name": token.name,
+        "tokenHint": token.token_hint,
+        "createdBy": token.created_by,
+        "createdAt": token.created_at,
+        "lastUsedAt": token.last_used_at,
+        "useCount": token.use_count,
+        "revokedAt": token.revoked_at,
+    })
+}
+
+async fn list_admin_tokens(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = auth::require_admin_viewer(&state, &headers).await {
+        return e;
+    }
+    match state.store.list_api_tokens().await {
+        Ok(tokens) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "tokens": tokens.iter().map(token_payload).collect::<Vec<_>>(),
+                "envTokenCount": state.auth.api_tokens.len(),
+            })),
+        )
+            .into_response(),
+        Err(e) => err_500(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateTokenRequest {
+    /// Human label, e.g. "cue-download-expert".
+    name: String,
+}
+
+async fn create_admin_token(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CreateTokenRequest>,
+) -> impl IntoResponse {
+    let viewer = match auth::require_admin_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let name = req.name.trim().to_string();
+    if name.is_empty() || name.len() > 100 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "name must be 1-100 characters"})),
+        )
+            .into_response();
+    }
+
+    let plaintext = format!("lp_{}", uuid::Uuid::new_v4().simple());
+    let token = ApiToken {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        token_hash: auth::sha256_hex(&plaintext),
+        token_hint: plaintext.chars().take(12).collect(),
+        created_by: Some(viewer.user_id.clone()),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        use_count: 0,
+        revoked_at: None,
+    };
+    if let Err(e) = state.store.insert_api_token(&token).await {
+        return err_500(e);
+    }
+    tracing::info!(token_id = %token.id, name = %token.name, "api token issued");
+
+    // The plaintext is returned exactly once; only the SHA-256 hash is stored.
+    let mut body = token_payload(&token);
+    body["token"] = serde_json::Value::String(plaintext);
+    (StatusCode::CREATED, Json(body)).into_response()
+}
+
+async fn revoke_admin_token(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = auth::require_admin_viewer(&state, &headers).await {
+        return e;
+    }
+    let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
+        return err_404();
+    };
+    match state.store.revoke_api_token(&uuid.to_string()).await {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"revoked": true})),
+        )
+            .into_response(),
+        Ok(false) => err_404(),
+        Err(e) => err_500(e),
     }
 }
 
@@ -2925,6 +3039,7 @@ mod tests {
             can_delete: true,
             can_publish_private: true,
             is_api_token: false,
+            api_token_id: None,
         };
         let user_a = auth::ViewerContext {
             user_id: "u-a".into(),
@@ -2935,6 +3050,7 @@ mod tests {
             can_delete: false,
             can_publish_private: true,
             is_api_token: false,
+            api_token_id: None,
         };
         let user_b = auth::ViewerContext {
             user_id: "u-b".into(),
@@ -2945,6 +3061,7 @@ mod tests {
             can_delete: false,
             can_publish_private: false,
             is_api_token: false,
+            api_token_id: None,
         };
 
         let priv_ep = make_ep(Some("u-a"), "private");

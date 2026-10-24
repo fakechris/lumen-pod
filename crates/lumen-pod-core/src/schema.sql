@@ -91,6 +91,19 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Migration: issued API tokens (hashed at rest; env LUMEN_POD_API_TOKEN stays valid)
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    token_hint TEXT NOT NULL,
+    created_by TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ,
+    use_count BIGINT NOT NULL DEFAULT 0,
+    revoked_at TIMESTAMPTZ
+);
+
 CREATE INDEX IF NOT EXISTS idx_episodes_source_url ON episodes(source_url);
 CREATE INDEX IF NOT EXISTS idx_episodes_created_at ON episodes(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_episodes_search ON episodes USING GIN(search_vector);

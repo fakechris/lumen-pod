@@ -52,6 +52,25 @@ pub fn default_episode_visibility() -> String {
     "public".to_string()
 }
 
+// ---- Issued API tokens (admin panel management) ----
+
+/// An issued API token. The plaintext is shown once at creation; only the
+/// SHA-256 hash is stored. `LUMEN_POD_API_TOKEN` env values remain valid as
+/// operator bootstrap tokens and are not represented here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiToken {
+    pub id: String,
+    pub name: String,
+    pub token_hash: String,
+    pub token_hint: String,
+    pub created_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub use_count: i64,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
 // ---- Source metadata ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
