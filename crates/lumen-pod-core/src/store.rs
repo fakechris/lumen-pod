@@ -206,6 +206,107 @@ impl Store {
         Ok(episodes)
     }
 
+    /// Slim card variant of [`Self::list_episodes_for_user`] for list/search UIs:
+    /// skips transcript / article / mindmap / chapters / qas / clips / highlights /
+    /// keywords / shownotes so a 50-item page stays in the KB range instead of
+    /// shipping tens of MB of word-level transcript JSON.
+    pub async fn list_episode_cards_for_user(
+        &self,
+        limit: usize,
+        offset: usize,
+        user_id: Option<&str>,
+        is_admin: bool,
+    ) -> PodResult<Vec<Episode>> {
+        let rows = if is_admin {
+            sqlx::query(
+                "SELECT id, source, processing, summary,
+                        is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
+                 FROM episodes ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            )
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, source, processing, summary,
+                        is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
+                 FROM episodes
+                 WHERE visibility = 'public' OR owner_id = $3
+                 ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            )
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .bind(user_id.unwrap_or(""))
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        let mut episodes: Vec<Episode> = rows
+            .iter()
+            .map(Self::row_to_episode_card)
+            .collect::<PodResult<Vec<_>>>()?;
+
+        if let Some(uid) = user_id {
+            self.hydrate_episodes_read_state(&mut episodes, uid).await?;
+        }
+
+        Ok(episodes)
+    }
+
+    /// Slim card fetch by explicit ids (used by search: FTS returns ranked ids,
+    /// we only need card fields for the results page).
+    pub async fn get_episode_cards_by_ids(&self, ids: &[String]) -> PodResult<Vec<Episode>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, source, processing, summary,
+                    is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
+             FROM episodes WHERE id = ANY($1)",
+        )
+        .bind(ids.to_vec())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_episode_card).collect()
+    }
+
+    /// Map a card-only row (see [`Self::list_episode_cards_for_user`]) to an
+    /// Episode with the heavy AI-content sections left empty — the list card
+    /// and search result renderers never read them.
+    fn row_to_episode_card(row: &sqlx::postgres::PgRow) -> PodResult<Episode> {
+        Ok(Episode {
+            id: row.get("id"),
+            source: serde_json::from_value(row.get::<serde_json::Value, _>("source"))?,
+            processing: serde_json::from_value(row.get::<serde_json::Value, _>("processing"))?,
+            summary: row
+                .get::<Option<serde_json::Value>, _>("summary")
+                .and_then(|v| serde_json::from_value(v).ok()),
+            chapters: Vec::new(),
+            mindmap: None,
+            transcript: None,
+            keywords: Vec::new(),
+            highlights: Vec::new(),
+            qas: Vec::new(),
+            clips: Vec::new(),
+            article: None,
+            shownotes: None,
+            is_read: row.get("is_read"),
+            tags: row
+                .get::<Option<serde_json::Value>, _>("tags")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            collection_id: row.get("collection_id"),
+            owner_id: row.try_get("owner_id").unwrap_or(None),
+            visibility: row
+                .try_get::<String, _>("visibility")
+                .unwrap_or_else(|_| "public".to_string()),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+    }
+
     pub async fn set_user_episode_read(
         &self,
         user_id: &str,
