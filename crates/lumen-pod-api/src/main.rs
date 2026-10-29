@@ -12,6 +12,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -209,7 +210,10 @@ async fn run_server(database_url: &str) {
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
-        ));
+        ))
+        // gzip for JSON API responses only — transcripts/exports compress ~10x.
+        // audio/static ServeDir routes are deliberately excluded (Range + huge MP3s).
+        .layer(CompressionLayer::new());
 
     let app = public
         .merge(audio_serve)
@@ -550,7 +554,7 @@ async fn list_episodes(
     let offset = params.offset.unwrap_or(0);
     match state
         .store
-        .list_episodes_for_user(limit, offset, Some(&viewer.user_id), viewer.is_admin())
+        .list_episode_cards_for_user(limit, offset, Some(&viewer.user_id), viewer.is_admin())
         .await
     {
         Ok(episodes) => {
@@ -1432,14 +1436,23 @@ async fn search_episodes(
         .await
     {
         Ok(ids) => {
-            let mut episodes = Vec::new();
-            for id in &ids {
-                if let Ok(ep) = state.store.get_episode(id).await {
-                    if viewer.can_view_episode(&ep) {
-                        episodes.push(ep);
-                    }
-                }
-            }
+            // FTS gives ranked ids; fetch card fields in one query and restore
+            // relevance order. Full episodes would ship megabytes of transcript
+            // per search — the results page only renders card metadata.
+            let cards = state
+                .store
+                .get_episode_cards_by_ids(&ids)
+                .await
+                .unwrap_or_default();
+            let by_id: std::collections::HashMap<String, lumen_pod_core::episode::Episode> = cards
+                .into_iter()
+                .map(|ep| (ep.id.clone(), ep))
+                .collect();
+            let mut episodes: Vec<lumen_pod_core::episode::Episode> = ids
+                .iter()
+                .filter_map(|id| by_id.get(id).cloned())
+                .collect();
+            episodes.retain(|ep| viewer.can_view_episode(ep));
             let _ = state
                 .store
                 .hydrate_episodes_read_state(&mut episodes, &viewer.user_id)
