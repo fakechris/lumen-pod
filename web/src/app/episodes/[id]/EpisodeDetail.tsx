@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { getEpisode, updateEpisode, deleteEpisode, listCollections, createCollection, formatTimestamp, formatDuration, getExportUrl, sendChatMessage, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, type ChatMsg, type BatchStatus } from "@/lib/api";
+import { getEpisode, updateEpisode, deleteEpisode, listCollections, createCollection, formatTimestamp, formatDuration, formatDate, getExportUrl, sendChatMessage, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, type ChatMsg, type BatchStatus } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { Article, Collection, Episode } from "@/lib/types";
 
@@ -629,6 +629,8 @@ export default function EpisodeDetail({ id }: { id: string }) {
   if (!episode) return null;
 
   const icon = platformIcons[episode.source.platform] || platformIcons.default;
+  const publishDate = formatDate(episode.source.publishedAt);
+  const shownotesText = episode.shownotes || episode.source.description || "";
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -685,6 +687,8 @@ export default function EpisodeDetail({ id }: { id: string }) {
           <div className="flex items-center gap-2 mt-1.5 text-sm text-zinc-500 flex-wrap">
             <span>{icon} {episode.source.platform}</span>
             {episode.source.author && <><span>·</span><span>{episode.source.author}</span></>}
+            {episode.source.podcastName && episode.source.podcastName !== episode.source.author && <><span>·</span><span>📻 {episode.source.podcastName}</span></>}
+            {publishDate && <><span>·</span><span title="原发布时间">🗓️ 原发 {publishDate}</span></>}
             <span>·</span><span>{formatDuration(episode.source.duration)}</span>
             {episode.source.language && <><span>·</span><span>🌐 {episode.source.language.toUpperCase()}</span></>}
             {episode.processing.llmModel && <><span>·</span><span>🤖 {episode.processing.llmModel}</span></>}
@@ -707,6 +711,18 @@ export default function EpisodeDetail({ id }: { id: string }) {
             <a href={getExportUrl(id, "notion")} className="text-blue-500 hover:underline text-xs">📓 Notion</a>
             <a href={getExportUrl(id, "obsidian")} className="text-blue-500 hover:underline text-xs">🗄️ Obsidian</a>
           </div>
+
+          {/* Original platform description / show notes — collapsed by default */}
+          {shownotesText && (
+            <details className="mt-3 text-sm">
+              <summary className="text-zinc-500 dark:text-zinc-400 cursor-pointer hover:text-zinc-700 dark:hover:text-zinc-200 select-none">
+                📄 原始简介 / Show Notes
+              </summary>
+              <div className="mt-2 p-4 rounded-xl bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700 text-sm text-zinc-600 dark:text-zinc-300 leading-relaxed whitespace-pre-wrap max-h-96 overflow-y-auto">
+                {shownotesText}
+              </div>
+            </details>
+          )}
 
           {/* Podcast-level Tags / Collection / Visibility Editor (Requires can_edit) */}
           {canEdit && editingMeta && (

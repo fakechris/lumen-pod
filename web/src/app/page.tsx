@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { listEpisodes, formatDuration, getGoogleLoginUrl } from "@/lib/api";
+import { listEpisodes, formatDuration, formatDate, getGoogleLoginUrl } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { Episode } from "@/lib/types";
 
@@ -53,10 +53,16 @@ function EpisodeCard({ episode }: { episode: Episode }) {
               <span className="shrink-0 mt-1 w-2 h-2 rounded-full bg-blue-500" />
             )}
           </div>
-          <div className="flex items-center gap-2 mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+          <div className="flex items-center gap-2 mt-1 text-sm text-zinc-500 dark:text-zinc-400 flex-wrap">
             {episode.source.author && <span>{episode.source.author}</span>}
             {episode.source.author && <span>·</span>}
             <span>{icon} {episode.source.platform}</span>
+            {formatDate(episode.source.publishedAt) && (
+              <>
+                <span>·</span>
+                <span title="原发布时间">{formatDate(episode.source.publishedAt)}</span>
+              </>
+            )}
             {episode.source.duration > 0 && (
               <>
                 <span>·</span>

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { searchEpisodes, formatDuration } from "@/lib/api";
+import { searchEpisodes, formatDuration, formatDate } from "@/lib/api";
 import type { Episode } from "@/lib/types";
 
 export default function SearchPage() {
@@ -62,9 +62,15 @@ export default function SearchPage() {
             className="block p-4 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:border-blue-400 transition-colors"
           >
             <h3 className="font-semibold text-zinc-900 dark:text-zinc-100">{ep.source.title}</h3>
-            <div className="flex items-center gap-2 mt-1 text-sm text-zinc-500">
+            <div className="flex items-center gap-2 mt-1 text-sm text-zinc-500 flex-wrap">
               <span>{ep.source.author}</span>
               <span>·</span>
+              {formatDate(ep.source.publishedAt) && (
+                <>
+                  <span title="原发布时间">{formatDate(ep.source.publishedAt)}</span>
+                  <span>·</span>
+                </>
+              )}
               <span>{formatDuration(ep.source.duration)}</span>
             </div>
             {ep.summary && (
