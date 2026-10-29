@@ -2,7 +2,7 @@ use chrono::Utc;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use crate::episode::{ApiToken, Episode, Invite, User, UserRole};
+use crate::episode::{ApiToken, Chapter, Episode, Invite, User, UserRole};
 use crate::error::{PodError, PodResult};
 
 pub struct Store {
@@ -270,6 +270,20 @@ impl Store {
         .await?;
 
         rows.iter().map(Self::row_to_episode_card).collect()
+    }
+
+    /// Chapters only (with any persisted deep reads). Used by the batch
+    /// deep-read status endpoint to ship newly generated deep reads without
+    /// pulling the full episode — the transcript alone averages ~700KB/episode.
+    pub async fn get_episode_chapters(&self, id: &str) -> PodResult<Vec<Chapter>> {
+        let row = sqlx::query("SELECT chapters FROM episodes WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .and_then(|r| r.get::<Option<serde_json::Value>, _>("chapters"))
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default())
     }
 
     /// Map a card-only row (see [`Self::list_episode_cards_for_user`]) to an
@@ -1534,6 +1548,83 @@ mod tests {
         // Delete resets to "no override".
         store.delete_setting("llm_model").await.unwrap();
         assert_eq!(store.get_setting("llm_model").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn get_episode_chapters_roundtrip() {
+        let store = test_store().await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let ep = Episode {
+            id: id.clone(),
+            source: Source {
+                url: "https://example.com/v".into(),
+                platform: "youtube".into(),
+                title: "t".into(),
+                author: "a".into(),
+                published_at: None,
+                thumbnail_url: None,
+                duration: 0.0,
+                feed_url: None,
+                description: None,
+                podcast_name: None,
+                episode_cover_url: None,
+                language: None,
+                audio_path: None,
+                audio_paths: vec![],
+            },
+            processing: Processing {
+                status: ProcessingStatus::Done,
+                asr_engine: None,
+                llm_model: None,
+                processed_at: None,
+                agent_id: None,
+                error: None,
+            },
+            summary: None,
+            chapters: vec![Chapter {
+                title: "intro".into(),
+                start_time: 0.0,
+                end_time: 10.0,
+                summary: "s".into(),
+                has_ads: false,
+                deep_read: None,
+            }],
+            mindmap: None,
+            transcript: None,
+            keywords: vec![],
+            highlights: vec![],
+            qas: vec![],
+            clips: vec![],
+            article: None,
+            shownotes: None,
+            is_read: false,
+            tags: vec![],
+            collection_id: None,
+            owner_id: None,
+            visibility: "public".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.insert_episode(&ep).await.unwrap();
+
+        assert_eq!(store.get_episode_chapters(&id).await.unwrap().len(), 1);
+        assert!(
+            store.get_episode_chapters(&id).await.unwrap()[0]
+                .deep_read
+                .is_none()
+        );
+
+        store
+            .update_chapter_deep_read(&id, 0, "analysis")
+            .await
+            .unwrap();
+        let chapters = store.get_episode_chapters(&id).await.unwrap();
+        assert_eq!(chapters[0].deep_read.as_deref(), Some("analysis"));
+
+        // Unknown id yields empty (status endpoint is polled during races).
+        assert!(store.get_episode_chapters("no-such-id").await.unwrap().is_empty());
+
+        store.delete_episode(&id).await.unwrap();
     }
 
     #[tokio::test]
