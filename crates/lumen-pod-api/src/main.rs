@@ -2543,32 +2543,66 @@ fn build_chapter_transcript(ep: &lumen_pod_core::episode::Episode, chapter: &lum
     text
 }
 
+#[derive(Deserialize)]
+struct BatchStatusQuery {
+    /// Comma-separated chapter indexes the client already has deep reads for.
+    /// When present, the response carries a `deepReads` delta (only indexes
+    /// NOT in this list) so the poller never re-downloads the full episode.
+    have: Option<String>,
+}
+
 async fn batch_deep_read_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<BatchStatusQuery>,
 ) -> impl IntoResponse {
-    let tasks = state.batch_tasks.lock().unwrap();
-    match tasks.get(&id) {
-        Some(t) => {
-            let current = t.current_idx.load(Ordering::Relaxed);
-            let status = if t.cancelled.load(Ordering::Relaxed) {
-                "cancelled"
-            } else if current == usize::MAX {
-                "complete"
-            } else {
-                "running"
-            };
-            (StatusCode::OK, Json(serde_json::json!({
-                "status": status,
-                "currentIdx": if current == usize::MAX { serde_json::Value::Null } else { serde_json::json!(current) },
-                "total": t.total,
-                "completed": t.completed.load(Ordering::Relaxed),
-                "failed": t.failed.load(Ordering::Relaxed),
-                "elapsedMs": epoch_ms().saturating_sub(t.started_at_ms),
-            }))).into_response()
+    let mut reply = {
+        let tasks = state.batch_tasks.lock().unwrap();
+        match tasks.get(&id) {
+            Some(t) => {
+                let current = t.current_idx.load(Ordering::Relaxed);
+                let status = if t.cancelled.load(Ordering::Relaxed) {
+                    "cancelled"
+                } else if current == usize::MAX {
+                    "complete"
+                } else {
+                    "running"
+                };
+                serde_json::json!({
+                    "status": status,
+                    "currentIdx": if current == usize::MAX { serde_json::Value::Null } else { serde_json::json!(current) },
+                    "total": t.total,
+                    "completed": t.completed.load(Ordering::Relaxed),
+                    "failed": t.failed.load(Ordering::Relaxed),
+                    "elapsedMs": epoch_ms().saturating_sub(t.started_at_ms),
+                })
+            }
+            None => serde_json::json!({"status": "idle"}),
         }
-        None => (StatusCode::OK, Json(serde_json::json!({"status": "idle"}))).into_response(),
+    };
+
+    if let Some(have) = params.have.as_deref() {
+        let have_set: std::collections::HashSet<usize> = have
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect();
+        if let Ok(chapters) = state.store.get_episode_chapters(&id).await {
+            let deep_reads: Vec<serde_json::Value> = chapters
+                .iter()
+                .enumerate()
+                .filter(|(idx, ch)| ch.deep_read.is_some() && !have_set.contains(idx))
+                .map(|(idx, ch)| {
+                    serde_json::json!({
+                        "idx": idx,
+                        "content": ch.deep_read.clone().unwrap_or_default(),
+                    })
+                })
+                .collect();
+            reply["deepReads"] = serde_json::Value::from(deep_reads);
+        }
     }
+
+    (StatusCode::OK, Json(reply)).into_response()
 }
 
 async fn batch_deep_read_cancel(

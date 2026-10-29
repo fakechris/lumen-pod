@@ -236,6 +236,8 @@ export interface BatchStatus {
   failed?: number;
   elapsedMs?: number;
   pending?: number;
+  /** Deep reads generated since the client's last poll (delta, keyed by chapter index). */
+  deepReads?: { idx: number; content: string }[];
 }
 
 export async function startBatchDeepRead(episodeId: string, lang?: string): Promise<BatchStatus> {
@@ -243,8 +245,14 @@ export async function startBatchDeepRead(episodeId: string, lang?: string): Prom
   return apiFetch(`/api/episodes/${episodeId}/deep-read-all${qs}`, { method: "POST" });
 }
 
-export async function getBatchDeepReadStatus(episodeId: string): Promise<BatchStatus> {
-  return apiFetch(`/api/episodes/${episodeId}/deep-read-all`);
+export async function getBatchDeepReadStatus(
+  episodeId: string,
+  haveIndexes?: number[]
+): Promise<BatchStatus> {
+  // `have` = chapter indexes the client already has → server answers with a
+  // deepReads delta instead of the client re-downloading the full episode.
+  const qs = haveIndexes && haveIndexes.length > 0 ? `?have=${haveIndexes.join(",")}` : "";
+  return apiFetch(`/api/episodes/${episodeId}/deep-read-all${qs}`);
 }
 
 export async function cancelBatchDeepRead(episodeId: string): Promise<BatchStatus> {

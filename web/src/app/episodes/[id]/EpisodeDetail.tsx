@@ -1104,60 +1104,71 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
 }) {
   const [batch, setBatch] = useState<BatchStatus | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const lastCompletedRef = useRef(0);
+  const [starting, setStarting] = useState(false);
   const [deepReadLang, setDeepReadLang] = useState("zh");
 
-  // Poll batch status
+  // Mirror deepReads so the polling closure always reads fresh "have" indexes.
+  const deepReadsRef = useRef(deepReads);
+  useEffect(() => { deepReadsRef.current = deepReads; }, [deepReads]);
+
+  const pollStatus = useCallback(async (): Promise<BatchStatus | undefined> => {
+    try {
+      const s = await getBatchDeepReadStatus(episodeId, Object.keys(deepReadsRef.current).map(Number));
+      setBatch(s);
+      // Apply newly completed deep reads straight from the status delta —
+      // no full-episode refetch (that was a multi-MB download per chapter).
+      if (s.deepReads?.length) {
+        setDeepReads((p) => {
+          const next = { ...p };
+          for (const d of s.deepReads!) next[d.idx] = { loading: false, content: d.content };
+          return next;
+        });
+      }
+      if (s.status === "complete" || s.status === "cancelled" || s.status === "idle") {
+        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      }
+      return s;
+    } catch {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      setBatch(null);
+      return undefined;
+    }
+  }, [episodeId, setDeepReads]);
+
+  // Poll batch status — fetch once immediately so the progress UI shows
+  // without the initial 2.5s interval delay.
   const startPolling = useCallback(() => {
     if (pollRef.current) return;
-    lastCompletedRef.current = 0;
-    pollRef.current = setInterval(async () => {
-      try {
-        const s = await getBatchDeepReadStatus(episodeId);
-        setBatch(s);
-        // When new chapters completed, refresh deep reads from episode
-        const completed = s.completed ?? 0;
-        if (completed > lastCompletedRef.current) {
-          lastCompletedRef.current = completed;
-          const ep = await getEpisode(episodeId);
-          const restored: DeepReadState = {};
-          ep.chapters.forEach((ch, i) => {
-            if (ch.deepRead) restored[i] = { loading: false, content: ch.deepRead };
-          });
-          setDeepReads(restored);
-        }
-        if (s.status === "complete" || s.status === "cancelled" || s.status === "idle") {
-          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-        }
-      } catch {
-        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-        setBatch(null);
-      }
-    }, 2500);
-  }, [episodeId, setDeepReads]);
+    pollStatus();
+    pollRef.current = setInterval(pollStatus, 2500);
+  }, [pollStatus]);
 
   // Check for existing batch on mount
   useEffect(() => {
-    getBatchDeepReadStatus(episodeId).then((s) => {
-      if (s.status === "running" || s.status === "cancelling") { setBatch(s); startPolling(); }
-      else setBatch(null);
-    }).catch(() => {});
+    pollStatus().then((s) => {
+      if (s && (s.status === "started" || s.status === "running" || s.status === "cancelling")) startPolling();
+    });
     return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
-  }, [episodeId, startPolling]);
+  }, [episodeId, pollStatus, startPolling]);
 
   if (episode.chapters.length === 0) return <EmptyState text="No chapters available" />;
   const totalDuration = episode.source.duration || episode.chapters.at(-1)?.endTime || 1;
 
   const pendingCount = episode.chapters.filter((_, i) => !deepReads[i]?.content).length;
-  const batchRunning = batch?.status === "running" || batch?.status === "cancelling";
+  // "started" counts as running so the progress UI appears the moment the
+  // POST resolves instead of after the first poll (the old multi-second blank).
+  const batchRunning = batch?.status === "started" || batch?.status === "running" || batch?.status === "cancelling";
 
   const handleBatchStart = async () => {
+    setStarting(true);
     try {
       const res = await startBatchDeepRead(episodeId, deepReadLang);
       setBatch(res);
-      if (res.status === "started") startPolling();
+      if (res.status === "started" || res.status === "running") startPolling();
     } catch (e: any) {
       if (e.message?.includes("batch already running")) startPolling();
+    } finally {
+      setStarting(false);
     }
   };
 
@@ -1240,8 +1251,8 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
             {DEEP_READ_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
           </select>
           {!batchRunning && pendingCount > 0 && (
-            <button onClick={handleBatchStart} className="px-4 py-2 text-sm font-medium rounded-lg bg-purple-600 text-white hover:bg-purple-700 transition-colors">
-              📖 Deep Read All ({pendingCount} remaining)
+            <button onClick={handleBatchStart} disabled={starting} className="px-4 py-2 text-sm font-medium rounded-lg bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-60 transition-colors">
+              {starting ? "⏳ Starting..." : `📖 Deep Read All (${pendingCount} remaining)`}
             </button>
           )}
           {withContentCount > 0 && (
