@@ -484,7 +484,13 @@ function MermaidBlock({ chart }: { chart: string }) {
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
-          theme: "default",
+          // 跟随系统配色：暗色下用 mermaid 的 dark 主题，
+          // 否则浅底 SVG 贴在深色页面上非常刺眼。
+          theme:
+            typeof window !== "undefined" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "default",
           // mermaid 默认会把报错 SVG 插进 document.body，在页面上留一堆垃圾。
           // 这里关掉它，改由下面的 catch 统一回退成源码。
           suppressErrorRendering: true,
