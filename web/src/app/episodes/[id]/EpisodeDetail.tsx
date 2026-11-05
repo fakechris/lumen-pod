@@ -3,9 +3,12 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 import { getEpisode, updateEpisode, deleteEpisode, listCollections, createCollection, formatTimestamp, formatDuration, formatDate, getExportUrl, sendChatMessage, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, type ChatMsg, type BatchStatus } from "@/lib/api";
+import { normalizeMathDelimiters } from "@/lib/markdown";
 import { useAuth } from "@/lib/auth";
 import type { Article, Collection, Episode } from "@/lib/types";
 
@@ -461,6 +464,101 @@ function renderNodesWithTimestamps(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Mermaid 图表
+// ---------------------------------------------------------------------------
+
+/** mermaid 每次渲染都需要一个页面内唯一的 DOM id */
+let mermaidSeq = 0;
+
+function MermaidBlock({ chart }: { chart: string }) {
+  const [svg, setSvg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        // 动态 import：页面里没有 mermaid 图时，这块 JS 根本不会被下载。
+        const mermaid = (await import("mermaid")).default;
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "strict",
+          theme: "default",
+          // mermaid 默认会把报错 SVG 插进 document.body，在页面上留一堆垃圾。
+          // 这里关掉它，改由下面的 catch 统一回退成源码。
+          suppressErrorRendering: true,
+        });
+        const { svg } = await mermaid.render(`mermaid-${++mermaidSeq}`, chart);
+        if (!cancelled) setSvg(svg);
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message || String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [chart]);
+
+  // 语法有误时回退成源码，而不是让整篇文章渲染失败
+  if (error) {
+    return (
+      <div className="my-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-800/60 dark:bg-amber-950/30 dark:text-amber-300">
+        <div className="font-medium mb-1">mermaid 图表语法有误，已回退为源码：</div>
+        <pre className="whitespace-pre-wrap font-mono">{chart}</pre>
+      </div>
+    );
+  }
+  if (!svg) return <div className="my-2 text-xs text-zinc-400">图表渲染中…</div>;
+  return (
+    <div
+      className="my-3 flex justify-center overflow-x-auto"
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
+  );
+}
+
+/** 所有 markdown 渲染点共用的组件映射（正文、Article、AI 对话） */
+function buildMarkdownComponents(
+  seekTo?: (t: number) => void,
+  canSeek?: boolean,
+): Components {
+  return {
+    p: ({ children }) => <p>{renderNodesWithTimestamps(children, seekTo, canSeek)}</p>,
+    li: ({ children }) => <li>{renderNodesWithTimestamps(children, seekTo, canSeek)}</li>,
+    em: ({ children }) => <em>{renderNodesWithTimestamps(children, seekTo, canSeek)}</em>,
+    strong: ({ children }) => <strong>{renderNodesWithTimestamps(children, seekTo, canSeek)}</strong>,
+    code: ({ className, children, ...props }) => {
+      const text = typeof children === "string" ? children.trim() : "";
+      if (!className && TIMESTAMP_INNER_RE.test(text)) {
+        return <>{renderNodesWithTimestamps(text, seekTo, canSeek)}</>;
+      }
+      return (
+        <code className={className} {...props}>
+          {children}
+        </code>
+      );
+    },
+    // ```mermaid 代码块 → 图表；其余代码块保持原样
+    pre: ({ children, ...props }) => {
+      const child = React.Children.toArray(children)[0] as
+        | React.ReactElement<{ className?: string; children?: React.ReactNode }>
+        | undefined;
+      const lang = /language-([\w-]+)/.exec(child?.props?.className ?? "")?.[1];
+      if (lang === "mermaid") {
+        const raw = child?.props?.children;
+        const chart =
+          typeof raw === "string" ? raw : Array.isArray(raw) ? raw.join("") : "";
+        return <MermaidBlock chart={chart} />;
+      }
+      return <pre {...props}>{children}</pre>;
+    },
+  };
+}
+
+/** AI 对话里的 markdown 没有时间戳跳转，用一份固定的组件映射即可 */
+const CHAT_MARKDOWN_COMPONENTS = buildMarkdownComponents();
+
 function TimestampMarkdown({
   content,
   seekTo,
@@ -470,28 +568,19 @@ function TimestampMarkdown({
   seekTo?: (t: number) => void;
   canSeek?: boolean;
 }) {
+  // 组件映射必须保持引用稳定：批量生成时页面每 2.5s 重渲染一次，
+  // 每次新建映射会让整篇 markdown 子树跟着重渲染。
+  const components = useMemo(
+    () => buildMarkdownComponents(seekTo, canSeek),
+    [seekTo, canSeek],
+  );
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        p: ({ children }) => <p>{renderNodesWithTimestamps(children, seekTo, canSeek)}</p>,
-        li: ({ children }) => <li>{renderNodesWithTimestamps(children, seekTo, canSeek)}</li>,
-        em: ({ children }) => <em>{renderNodesWithTimestamps(children, seekTo, canSeek)}</em>,
-        strong: ({ children }) => <strong>{renderNodesWithTimestamps(children, seekTo, canSeek)}</strong>,
-        code: ({ className, children, ...props }) => {
-          const text = typeof children === "string" ? children.trim() : "";
-          if (!className && TIMESTAMP_INNER_RE.test(text)) {
-            return <>{renderNodesWithTimestamps(text, seekTo, canSeek)}</>;
-          }
-          return (
-            <code className={className} {...props}>
-              {children}
-            </code>
-          );
-        },
-      }}
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeKatex]}
+      components={components}
     >
-      {content}
+      {normalizeMathDelimiters(content)}
     </ReactMarkdown>
   );
 }
@@ -1684,7 +1773,13 @@ function ChatTab({ episodeId, episode }: { episodeId: string; episode: Episode }
             <div className={`max-w-[80%] px-4 py-3 rounded-2xl text-sm ${msg.role === "user" ? "bg-blue-600 text-white rounded-br-md whitespace-pre-wrap" : "bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700 rounded-bl-md"}`}>
               {msg.role === "assistant" ? (
                 <div className="prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-li:my-0.5 prose-headings:mt-3 prose-headings:mb-1">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm, remarkMath]}
+                    rehypePlugins={[rehypeKatex]}
+                    components={CHAT_MARKDOWN_COMPONENTS}
+                  >
+                    {normalizeMathDelimiters(msg.content)}
+                  </ReactMarkdown>
                 </div>
               ) : msg.content}
             </div>
