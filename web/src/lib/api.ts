@@ -20,7 +20,10 @@ async function apiFetch<T>(
   if (!res.ok) {
     if (res.status === 401 && typeof window !== "undefined" && !skipAuthRedirect) {
       window.location.href = getGoogleLoginUrl();
-      return new Promise(() => {});
+      // Reject instead of returning a never-settling promise: a pending promise
+      // leaves the caller's `await` hanging forever, so a polling loop would
+      // silently stop updating without ever surfacing an error.
+      throw new Error("未登录，正在跳转登录…");
     }
     const body = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(body.error || `API error: ${res.status}`);
@@ -247,12 +250,13 @@ export async function startBatchDeepRead(episodeId: string, lang?: string): Prom
 
 export async function getBatchDeepReadStatus(
   episodeId: string,
-  haveIndexes?: number[]
+  haveIndexes?: number[],
+  signal?: AbortSignal,
 ): Promise<BatchStatus> {
   // `have` = chapter indexes the client already has → server answers with a
   // deepReads delta instead of the client re-downloading the full episode.
   const qs = haveIndexes && haveIndexes.length > 0 ? `?have=${haveIndexes.join(",")}` : "";
-  return apiFetch(`/api/episodes/${episodeId}/deep-read-all${qs}`);
+  return apiFetch(`/api/episodes/${episodeId}/deep-read-all${qs}`, { signal });
 }
 
 export async function cancelBatchDeepRead(episodeId: string): Promise<BatchStatus> {
