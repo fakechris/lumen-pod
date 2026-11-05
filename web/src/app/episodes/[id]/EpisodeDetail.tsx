@@ -228,6 +228,39 @@ function AudioPlayer({ sources, onReady, onTimeUpdate }: {
 }
 
 // ---------------------------------------------------------------------------
+// YouTube IFrame API — one shared loader, kept off the critical path
+// ---------------------------------------------------------------------------
+
+let ytApiPromise: Promise<void> | null = null;
+
+/**
+ * Load `https://www.youtube.com/iframe_api` once per page.
+ *
+ * The embed iframe must NOT be created from this promise's callback. An iframe
+ * that reaches the DOM only after the click's user activation has expired
+ * makes YouTube's player initialise with `autoplay=1` into a dead black frame
+ * (playerState stays -1, nothing renders). So we insert the iframe
+ * synchronously inside the click handler and use this promise only to attach
+ * the JS API to the iframe afterwards.
+ */
+function loadYouTubeApi(): Promise<void> {
+  if (ytApiPromise) return ytApiPromise;
+  ytApiPromise = new Promise<void>((resolve) => {
+    if ((window as any).YT?.Player) { resolve(); return; }
+    const prev = (window as any).onYouTubeIframeAPIReady;
+    (window as any).onYouTubeIframeAPIReady = () => {
+      if (typeof prev === "function") prev();
+      resolve();
+    };
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    tag.async = true;
+    document.head.appendChild(tag);
+  });
+  return ytApiPromise;
+}
+
+// ---------------------------------------------------------------------------
 // YouTube Player — with imperative activate
 // ---------------------------------------------------------------------------
 
@@ -239,40 +272,36 @@ function YouTubePlayer({ videoId, thumbnailUrl, autoActivate, onReady, onTimeUpd
   onTimeUpdate?: (t: number) => void;
 }) {
   const [activated, setActivated] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const playerRef = useRef<any>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const thumb = thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
+  // Warm the API while the poster is still on screen, so that by the time the
+  // user clicks, the iframe can be inserted straight away.
+  useEffect(() => { void loadYouTubeApi(); }, []);
+
   useEffect(() => { if (autoActivate && !activated) setActivated(true); }, [autoActivate]);
 
+  // Attach the JS API to the iframe that is already in the DOM. `enablejsapi=1`
+  // is part of the iframe src, so the player attaches without reloading it.
   useEffect(() => {
     if (!activated) return;
     let cancelled = false;
-    function init() {
-      if (cancelled || !containerRef.current) return;
-      const div = document.createElement("div");
-      div.id = `yt-player-${videoId}-${Date.now()}`;
-      containerRef.current.innerHTML = "";
-      containerRef.current.appendChild(div);
-      playerRef.current = new (window as any).YT.Player(div.id, {
+    loadYouTubeApi().then(() => {
+      if (cancelled || !iframeRef.current) return;
+      playerRef.current = new (window as any).YT.Player(iframeRef.current, {
         videoId,
-        host: "https://www.youtube-nocookie.com",
-        playerVars: { autoplay: 1, rel: 0, modestbranding: 1, cc_load_policy: 0, origin: typeof window !== "undefined" ? window.location.origin : "" },
         events: {
           onReady: () => {
-            const handle: PlayerHandle = { seekTo: (t) => playerRef.current?.seekTo(t, true), getCurrentTime: () => playerRef.current?.getCurrentTime() ?? 0 };
+            const handle: PlayerHandle = { seekTo: (t) => { playerRef.current?.seekTo(t, true); }, getCurrentTime: () => playerRef.current?.getCurrentTime() ?? 0 };
             onReady?.(handle);
             intervalRef.current = setInterval(() => { if (playerRef.current?.getPlayerState?.() === 1) onTimeUpdate?.(playerRef.current.getCurrentTime()); }, 250);
           },
         },
       });
-    }
-    if ((window as any).YT?.Player) { init(); } else {
-      const tag = document.createElement("script"); tag.src = "https://www.youtube.com/iframe_api"; document.head.appendChild(tag);
-      (window as any).onYouTubeIframeAPIReady = init;
-    }
-    return () => { cancelled = true; if (intervalRef.current) clearInterval(intervalRef.current); playerRef.current?.destroy?.(); };
+    });
+    return () => { cancelled = true; if (intervalRef.current) clearInterval(intervalRef.current); playerRef.current?.destroy?.(); playerRef.current = null; };
   }, [activated, videoId]);
 
   if (!activated) {
@@ -288,7 +317,22 @@ function YouTubePlayer({ videoId, thumbnailUrl, autoActivate, onReady, onTimeUpd
       </div>
     );
   }
-  return <div ref={containerRef} className="w-full aspect-video rounded-xl overflow-hidden bg-black" />;
+
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const src = `https://www.youtube-nocookie.com/embed/${videoId}?enablejsapi=1&origin=${encodeURIComponent(origin)}&rel=0&modestbranding=1&cc_load_policy=0&autoplay=1`;
+  return (
+    <div className="w-full aspect-video rounded-xl overflow-hidden bg-black">
+      <iframe
+        ref={iframeRef}
+        title="YouTube player"
+        src={src}
+        className="w-full h-full border-0"
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+        referrerPolicy="strict-origin-when-cross-origin"
+        allowFullScreen
+      />
+    </div>
+  );
 }
 
 function BilibiliPlayer({ bvid }: { bvid: string }) {
