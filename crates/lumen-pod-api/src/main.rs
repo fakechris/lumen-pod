@@ -1664,6 +1664,39 @@ struct DeepReadParams {
     async_mode: Option<bool>,
 }
 
+/// Mermaid 图表产出约束 —— 章节深读与长文两套提示词共用。
+///
+/// 前端（INV-1620）已经把 ```mermaid 代码块渲染成 SVG 了，但没有任何内容会触发它：
+/// 提示词里若不明确要求，LLM 永远不会画图。所以这里把「何时该画」和「怎么画才渲染得过」
+/// 一次写清楚：
+///
+/// - **何时画**：只有内容本身存在流程 / 因果链 / 状态转移 / 层级关系时才画；
+/// - **画什么**：只认 `flowchart TD|LR` / `sequenceDiagram` / `stateDiagram-v2` 四种类型；
+/// - **怎么画**：标签必须加引号且不含语法敏感字符（否则 mermaid 解析失败，页面回退成源码框）；
+/// - **忠于原文**：节点标签必须是原文出现过的实体 / 概念，不臆造；
+/// - **图后必须有文字**：图是补充，不是替代。
+///
+/// `max_diagrams` 控制整篇允许的图数上限（章节深读 1 张，长文 3 张）。
+fn mermaid_diagram_instruction(max_diagrams: usize) -> String {
+    let noun = if max_diagrams == 1 { "diagram" } else { "diagrams" };
+    format!(
+        "**Mermaid Diagram Only When the Content Has a Real Structure (有真实结构才画图)**:\n\
+         - Draw at most {max_diagrams} mermaid {noun} in the whole piece. Draw one ONLY IF the passage genuinely contains an explicit flow, causal chain, state transition, or hierarchy that plain prose alone would make hard to follow. If there is no such structure, output NO diagram at all — never add one for decoration.\n\
+         - Use one of exactly these four diagram types: `flowchart TD`, `flowchart LR`, `sequenceDiagram`, `stateDiagram-v2`. Never use any other type.\n\
+         - Emit it as a standalone fenced code block tagged `mermaid`, on its own lines:\n\
+         \n\
+         ```mermaid\n\
+         flowchart TD\n\
+         A[\"First step\"] --> B[\"Second step\"]\n\
+         ```\n\
+         - Always double-quote every node label and keep it under 8 words: `A[\"Label text\"]`. The quotes are what make the label safe, so punctuation inside the quotes is fine (for example `A[\"指数衰减（年化）\"]`). Two things to avoid: an empty label, and a `\"` character inside the label.\n\
+         - Use at most 10 nodes. Connect them with `A --> B`; add an edge label only as `A -->|plain words| B`.\n\
+         - Every node label must name an entity, mechanism, or concept that the speaker actually described in this passage. Never invent a step that was not spoken.\n\
+         - Write ALL text inside the diagram (node labels and edge labels) in the same language as the body text.\n\
+         - Immediately AFTER the diagram, keep a normal prose paragraph explaining what it shows. The diagram supplements the explanation; it never replaces it."
+    )
+}
+
 fn deep_read_system_prompt(lang: &str) -> String {
     let lang_instruction = lang_instruction_for(lang);
     format!(
@@ -1683,7 +1716,9 @@ fn deep_read_system_prompt(lang: &str) -> String {
          7. **Unified Timestamp Format**:\n\
             - Under 1 hour (`< 60:00`): ALWAYS use `[MM:SS]` (e.g. `[05:14]`, `[11:33]`). NEVER add a leading zero hour such as `[0:11:33]` or `[00:11:33]`.\n\
             - 1 hour or later (`>= 1:00:00`): ALWAYS use `[H:MM:SS]` (e.g. `[1:02:15]`).\n\n\
-         {lang_instruction}"
+         8. {}\n\n\
+         {lang_instruction}",
+        mermaid_diagram_instruction(1)
     )
 }
 
@@ -1998,8 +2033,10 @@ fn article_system_prompt(lang: &str, focus: Option<&str>) -> String {
             - `## 🧭 延伸探索建议` (Further Exploration): 2–3 genuinely relevant follow-up topics, search queries, or questions for active learning.\n\
          9. **Clean Title**:\n\
             - Start the response with a single `# Title` line that is compelling and faithful to the core thesis (avoid clickbait), followed by the article body.\n\
+         10. {}\n\
          {focus_instruction}\n\
-         {lang_instruction}"
+         {lang_instruction}",
+        mermaid_diagram_instruction(3)
     )
 }
 
@@ -3067,6 +3104,46 @@ mod tests {
         assert!(chapter_prompt.contains("Scene-First Opening"));
         assert!(chapter_prompt.contains("Reasoning over Assertions"));
         assert!(chapter_prompt.contains("Tri-part Notable Quotes"));
+    }
+
+    #[test]
+    fn test_prompts_ask_for_mermaid_only_when_structure_exists() {
+        // 章节深读：至多 1 张图
+        let chapter_prompt = deep_read_system_prompt("zh");
+        assert!(chapter_prompt.contains("Mermaid Diagram Only When the Content Has a Real Structure"));
+        assert!(chapter_prompt.contains("at most 1 mermaid diagram in the whole piece"));
+        assert!(chapter_prompt.contains("```mermaid"));
+        // 只认这四种图类型
+        for t in ["flowchart TD", "flowchart LR", "sequenceDiagram", "stateDiagram-v2"] {
+            assert!(chapter_prompt.contains(t), "缺少图类型 {t}");
+        }
+        // 标签必须加引号（否则 mermaid 解析失败、页面回退成源码框）
+        assert!(chapter_prompt.contains("A[\"Label text\"]"));
+        // 忠于原文 + 图后必须有文字
+        assert!(chapter_prompt.contains("invent a step that was not spoken"));
+        assert!(chapter_prompt.contains("Immediately AFTER the diagram"));
+
+        // 长文：至多 3 张图
+        let article_prompt = article_system_prompt("zh", None);
+        assert!(article_prompt.contains("at most 3 mermaid diagrams in the whole piece"));
+        assert!(article_prompt.contains("Mermaid Diagram Only When the Content Has a Real Structure"));
+        // 长文原有的 9 条约束不能被挤掉
+        assert!(article_prompt.contains("值得记住的核心认知"));
+        assert!(article_prompt.contains("延伸探索建议"));
+    }
+
+    #[test]
+    #[ignore = "manual probe helper: dumps the real prompts for LLM/Mermaid verification"]
+    fn dump_prompts_for_manual_probe() {
+        let dir = std::env::var("PROMPT_DUMP_DIR").unwrap_or_else(|_| "/tmp/lp-mermaid".into());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(format!("{dir}/prompt_deep_read.txt"), deep_read_system_prompt("zh")).unwrap();
+        std::fs::write(format!("{dir}/prompt_article.txt"), article_system_prompt("zh", None)).unwrap();
+        std::fs::write(
+            format!("{dir}/mermaid_instruction.txt"),
+            mermaid_diagram_instruction(1),
+        )
+        .unwrap();
     }
 
     #[test]
