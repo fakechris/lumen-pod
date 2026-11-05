@@ -1362,9 +1362,14 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
           {episode.chapters.map((ch, i) => {
             const dr = deepReads[i];
             const isCurrent = visibleChapter === i;
+            // The chapter the batch worker is chewing on right now. Without this
+            // the TOC stayed uniformly grey for the whole run: a chapter being
+            // generated has no content yet, so it looked exactly like a chapter
+            // nobody had started.
+            const isGenerating = batchRunning && batch?.currentIdx === i && !dr?.content;
             return (
               <button key={i} onClick={() => scrollToChapter(i)} className={`w-full text-left px-2 py-1.5 rounded-lg flex items-start gap-2 transition-colors ${isCurrent ? "bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}>
-                <span className={`shrink-0 mt-1 w-2 h-2 rounded-full ${dr?.content ? "bg-purple-500" : dr?.loading ? "bg-amber-400 animate-pulse" : "bg-zinc-300 dark:bg-zinc-600"}`} />
+                <span className={`shrink-0 mt-1 w-2 h-2 rounded-full ${dr?.content ? "bg-purple-500" : dr?.loading || isGenerating ? "bg-amber-400 animate-pulse" : "bg-zinc-300 dark:bg-zinc-600"}`} />
                 <span className="line-clamp-1">{ch.title}</span>
               </button>
             );
