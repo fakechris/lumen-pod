@@ -245,6 +245,8 @@ pub struct BatchDeepReadTask {
     failed: Arc<AtomicUsize>,
     /// Epoch millis of last activity (chapter start or finish). Used for stale detection.
     last_heartbeat: Arc<AtomicU64>,
+    /// Last `completed` value already written to the log (u64::MAX = not yet).
+    last_logged_completed: Arc<AtomicU64>,
     started_at_ms: u64,
 }
 
@@ -2400,6 +2402,11 @@ async fn batch_deep_read_start(
             completed: Arc::new(AtomicUsize::new(0)),
             failed: Arc::new(AtomicUsize::new(0)),
             last_heartbeat: Arc::new(AtomicU64::new(now)),
+            // Last `completed` value already written to the log. The status
+            // endpoint is polled every few seconds, so it logs only on real
+            // progress — otherwise the log drowns in identical lines and a
+            // stalled batch is indistinguishable from a quiet one.
+            last_logged_completed: Arc::new(AtomicU64::new(u64::MAX)),
             started_at_ms: now,
         };
         tasks.insert(id.clone(), task);
@@ -2561,6 +2568,32 @@ async fn batch_deep_read_status(
         match tasks.get(&id) {
             Some(t) => {
                 let current = t.current_idx.load(Ordering::Relaxed);
+                let completed = t.completed.load(Ordering::Relaxed);
+                let failed = t.failed.load(Ordering::Relaxed);
+                // Log only real progress. The endpoint is polled every couple of
+                // seconds, so per-poll logging would drown the log and make a
+                // stalled batch indistinguishable from a quiet one.
+                let last_logged = t.last_logged_completed.load(Ordering::Relaxed);
+                if completed as u64 != last_logged
+                    && t.last_logged_completed
+                        .compare_exchange(
+                            last_logged,
+                            completed as u64,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    tracing::info!(
+                        %id,
+                        completed,
+                        failed,
+                        total = t.total,
+                        current_idx = if current == usize::MAX { None } else { Some(current) },
+                        elapsed_s = epoch_ms().saturating_sub(t.started_at_ms) / 1000,
+                        "batch deep read progress"
+                    );
+                }
                 let status = if t.cancelled.load(Ordering::Relaxed) {
                     "cancelled"
                 } else if current == usize::MAX {
@@ -2572,8 +2605,8 @@ async fn batch_deep_read_status(
                     "status": status,
                     "currentIdx": if current == usize::MAX { serde_json::Value::Null } else { serde_json::json!(current) },
                     "total": t.total,
-                    "completed": t.completed.load(Ordering::Relaxed),
-                    "failed": t.failed.load(Ordering::Relaxed),
+                    "completed": completed,
+                    "failed": failed,
                     "elapsedMs": epoch_ms().saturating_sub(t.started_at_ms),
                 })
             }
@@ -2581,25 +2614,33 @@ async fn batch_deep_read_status(
         }
     };
 
-    if let Some(have) = params.have.as_deref() {
-        let have_set: std::collections::HashSet<usize> = have
-            .split(',')
-            .filter_map(|s| s.trim().parse::<usize>().ok())
-            .collect();
-        if let Ok(chapters) = state.store.get_episode_chapters(&id).await {
-            let deep_reads: Vec<serde_json::Value> = chapters
-                .iter()
-                .enumerate()
-                .filter(|(idx, ch)| ch.deep_read.is_some() && !have_set.contains(idx))
-                .map(|(idx, ch)| {
-                    serde_json::json!({
-                        "idx": idx,
-                        "content": ch.deep_read.clone().unwrap_or_default(),
-                    })
+    // Always answer with the deep-read delta. `have` only tells the server which
+    // chapters the client already holds; when the parameter is absent (the
+    // client has no deep read yet — the first run of a batch on a fresh
+    // episode) the server used to skip the delta entirely, so the page never
+    // received the freshly generated content and only caught up after a reload.
+    let have_set: std::collections::HashSet<usize> = params
+        .have
+        .as_deref()
+        .map(|have| {
+            have.split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Ok(chapters) = state.store.get_episode_chapters(&id).await {
+        let deep_reads: Vec<serde_json::Value> = chapters
+            .iter()
+            .enumerate()
+            .filter(|(idx, ch)| ch.deep_read.is_some() && !have_set.contains(idx))
+            .map(|(idx, ch)| {
+                serde_json::json!({
+                    "idx": idx,
+                    "content": ch.deep_read.clone().unwrap_or_default(),
                 })
-                .collect();
-            reply["deepReads"] = serde_json::Value::from(deep_reads);
-        }
+            })
+            .collect();
+        reply["deepReads"] = serde_json::Value::from(deep_reads);
     }
 
     (StatusCode::OK, Json(reply)).into_response()

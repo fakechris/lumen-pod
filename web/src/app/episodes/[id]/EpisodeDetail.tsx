@@ -1158,7 +1158,7 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
   deepReads: DeepReadState; setDeepReads: React.Dispatch<React.SetStateAction<DeepReadState>>;
 }) {
   const [batch, setBatch] = useState<BatchStatus | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [pollError, setPollError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [deepReadLang, setDeepReadLang] = useState("zh");
 
@@ -1166,45 +1166,118 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
   const deepReadsRef = useRef(deepReads);
   useEffect(() => { deepReadsRef.current = deepReads; }, [deepReads]);
 
-  const pollStatus = useCallback(async (): Promise<BatchStatus | undefined> => {
+  // ---- Batch status polling ---------------------------------------------------
+  //
+  // The loop is *self-scheduling*: the next request is only armed after the
+  // previous one settled. The old `setInterval(poll, 2500)` fired regardless of
+  // whether the previous request had come back, so a slow API accumulated
+  // overlapping requests. The browser caps 6 concurrent connections per origin
+  // over HTTP/1.1, so the pile-up starved every later request — including the
+  // poll itself — and the progress bar froze while the server kept working.
+  //
+  // A transient failure now backs off and retries. It never kills the loop and
+  // it never wipes the last known progress off the screen; the UI shows a
+  // "reconnecting" hint instead.
+  const POLL_INTERVAL_MS = 2500;
+  const POLL_TIMEOUT_MS = 15000;
+  const POLL_MAX_BACKOFF_MS = 15000;
+
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollInFlightRef = useRef(false);
+  const wantPollRef = useRef(false);
+  const pollSeqRef = useRef(0);
+  const appliedSeqRef = useRef(0);
+  const backoffRef = useRef(0);
+  const idleSeenRef = useRef(0);
+  const runPollRef = useRef<(() => void) | null>(null);
+
+  const runPoll = useCallback(async () => {
+    if (pollInFlightRef.current) return; // never overlap requests
+    pollInFlightRef.current = true;
+    const seq = ++pollSeqRef.current;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), POLL_TIMEOUT_MS);
     try {
-      const s = await getBatchDeepReadStatus(episodeId, Object.keys(deepReadsRef.current).map(Number));
+      // `have` = chapters the client already holds *content* for. Chapters that
+      // are still loading (or failed) must NOT be claimed, or the server stops
+      // shipping their content and the page only catches up after a reload.
+      const have = Object.keys(deepReadsRef.current)
+        .filter((k) => deepReadsRef.current[Number(k)]?.content)
+        .map(Number);
+      const s = await getBatchDeepReadStatus(episodeId, have, controller.signal);
+      clearTimeout(timeoutId);
+      if (seq < appliedSeqRef.current) return; // a newer response already landed
+      appliedSeqRef.current = seq;
+      backoffRef.current = 0;
+      setPollError(null);
       setBatch(s);
       // Apply newly completed deep reads straight from the status delta —
       // no full-episode refetch (that was a multi-MB download per chapter).
       if (s.deepReads?.length) {
         setDeepReads((p) => {
           const next = { ...p };
-          for (const d of s.deepReads!) next[d.idx] = { loading: false, content: d.content };
+          for (const d of s.deepReads!) next[d.idx] = { loading: false, content: d.content, collapsed: false };
           return next;
         });
       }
-      if (s.status === "complete" || s.status === "cancelled" || s.status === "idle") {
-        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      if (s.status === "complete" || s.status === "cancelled") {
+        wantPollRef.current = false;
+        idleSeenRef.current = 0;
+      } else if (s.status === "idle") {
+        // "idle" is ambiguous: it means both "no batch" and "the batch task is
+        // gone". A poll issued *before* the batch was created also answers
+        // "idle", so only give up after two consecutive idles.
+        idleSeenRef.current += 1;
+        if (idleSeenRef.current >= 2) wantPollRef.current = false;
+      } else {
+        idleSeenRef.current = 0;
+        wantPollRef.current = true; // running/started/cancelling — keep following
       }
-      return s;
-    } catch {
-      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-      setBatch(null);
-      return undefined;
+    } catch (e: any) {
+      clearTimeout(timeoutId);
+      if (seq < appliedSeqRef.current) return;
+      appliedSeqRef.current = seq;
+      // Keep the last known state on screen; a blip must not wipe the UI.
+      backoffRef.current = Math.min(
+        backoffRef.current ? backoffRef.current * 2 : 1000,
+        POLL_MAX_BACKOFF_MS,
+      );
+      setPollError(
+        e?.name === "AbortError"
+          ? "连接超时，正在重连…"
+          : `连接中断，正在重连…（${e?.message || "network error"}）`,
+      );
+    } finally {
+      pollInFlightRef.current = false;
+      if (wantPollRef.current) {
+        if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = setTimeout(
+          () => runPollRef.current?.(),
+          POLL_INTERVAL_MS + backoffRef.current,
+        );
+      }
     }
   }, [episodeId, setDeepReads]);
 
-  // Poll batch status — fetch once immediately so the progress UI shows
-  // without the initial 2.5s interval delay.
-  const startPolling = useCallback(() => {
-    if (pollRef.current) return;
-    pollStatus();
-    pollRef.current = setInterval(pollStatus, 2500);
-  }, [pollStatus]);
+  useEffect(() => { runPollRef.current = () => { void runPoll(); }; }, [runPoll]);
 
-  // Check for existing batch on mount
+  // Follow an already running batch (e.g. the page was opened mid-generation).
+  const startPolling = useCallback(() => {
+    wantPollRef.current = true;
+    idleSeenRef.current = 0;
+    if (pollTimerRef.current) { clearTimeout(pollTimerRef.current); pollTimerRef.current = null; }
+    if (!pollInFlightRef.current) runPollRef.current?.();
+  }, []);
+
   useEffect(() => {
-    pollStatus().then((s) => {
-      if (s && (s.status === "started" || s.status === "running" || s.status === "cancelling")) startPolling();
-    });
-    return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
-  }, [episodeId, pollStatus, startPolling]);
+    // One probe on mount. If a batch is running the server says so and the
+    // loop keeps itself alive from there on.
+    runPollRef.current?.();
+    return () => {
+      wantPollRef.current = false;
+      if (pollTimerRef.current) { clearTimeout(pollTimerRef.current); pollTimerRef.current = null; }
+    };
+  }, [episodeId]);
 
   if (episode.chapters.length === 0) return <EmptyState text="No chapters available" />;
   const totalDuration = episode.source.duration || episode.chapters.at(-1)?.endTime || 1;
@@ -1335,6 +1408,7 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
                 <div className="text-xs text-zinc-400 mt-1">
                   {batch?.status === "cancelling" ? "⏳ Cancelling..." : batch?.currentIdx != null ? `Processing chapter ${batch.currentIdx + 1}...` : "Starting..."}
                   {batch?.elapsedMs ? ` · ${Math.round(batch.elapsedMs / 1000)}s elapsed` : ""}
+                  {pollError && <span className="text-amber-500 ml-2">⚠ {pollError}</span>}
                 </div>
               </div>
               {batch?.status !== "cancelling" && (
