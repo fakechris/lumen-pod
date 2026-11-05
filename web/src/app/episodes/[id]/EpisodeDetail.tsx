@@ -296,6 +296,11 @@ function YouTubePlayer({ videoId, thumbnailUrl, autoActivate, onReady, onTimeUpd
           onReady: () => {
             const handle: PlayerHandle = { seekTo: (t) => { playerRef.current?.seekTo(t, true); }, getCurrentTime: () => playerRef.current?.getCurrentTime() ?? 0 };
             onReady?.(handle);
+            // The click that revealed this player already gave the page user
+            // activation, so ask the player to start — otherwise the user has to
+            // click YouTube's own play button a second time. If the browser
+            // blocks it the player simply stays on its poster.
+            try { playerRef.current?.playVideo?.(); } catch { /* autoplay blocked — poster stays */ }
             intervalRef.current = setInterval(() => { if (playerRef.current?.getPlayerState?.() === 1) onTimeUpdate?.(playerRef.current.getCurrentTime()); }, 250);
           },
         },
@@ -319,7 +324,13 @@ function YouTubePlayer({ videoId, thumbnailUrl, autoActivate, onReady, onTimeUpd
   }
 
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  const src = `https://www.youtube-nocookie.com/embed/${videoId}?enablejsapi=1&origin=${encodeURIComponent(origin)}&rel=0&modestbranding=1&cc_load_policy=0&autoplay=1`;
+  // `www.youtube.com`, not `youtube-nocookie.com`: the nocookie host never sends
+  // YouTube cookies, so the embed is an anonymous request and YouTube's
+  // anti-bot check rejects it with "Video unavailable / This content isn't
+  // available." — measured side by side on the same page, same browser, same
+  // video: `www.youtube.com/embed` renders, `youtube-nocookie.com/embed` does
+  // not. `www.youtube.com` is also the host YouTube's own embed code uses.
+  const src = `https://www.youtube.com/embed/${videoId}?enablejsapi=1&origin=${encodeURIComponent(origin)}&rel=0&modestbranding=1&cc_load_policy=0&autoplay=1`;
   return (
     <div className="w-full aspect-video rounded-xl overflow-hidden bg-black">
       <iframe
