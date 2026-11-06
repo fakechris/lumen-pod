@@ -7,7 +7,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
-import { getEpisode, updateEpisode, deleteEpisode, listCollections, createCollection, formatTimestamp, formatDuration, formatDate, getExportUrl, sendChatMessage, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, setFavorite, setMyTags, reportEvents, type ChatMsg, type BatchStatus } from "@/lib/api";
+import { getEpisode, updateEpisode, deleteEpisode, listCollections, createCollection, formatTimestamp, formatDuration, formatDate, getExportUrl, sendChatMessage, listChatMessages, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, setFavorite, setMyTags, reportEvents, listChatSessions, createChatSession, listSessionMessages, sendSessionMessage, renameChatSession, deleteChatSession, type ChatMsg, type ChatAnchor, type ChatSession, type BatchStatus } from "@/lib/api";
 import { normalizeMathDelimiters } from "@/lib/markdown";
 import { useAuth } from "@/lib/auth";
 import type { Article, Collection, Episode } from "@/lib/types";
@@ -623,6 +623,40 @@ export default function EpisodeDetail({ id }: { id: string }) {
   // YouTube: trigger activation from chapter click
   const [ytAutoActivate, setYtAutoActivate] = useState(false);
 
+  // Anchored chat: a session to create as soon as ChatTab mounts/updates
+  // (started from a chapter card or a text selection in Article/Transcript).
+  const [pendingAnchorChat, setPendingAnchorChat] = useState<{ anchor: ChatAnchor; prefill?: string } | null>(null);
+  const startAnchoredChat = useCallback((anchor: ChatAnchor, prefill?: string) => {
+    setPendingAnchorChat({ anchor, prefill });
+    setActiveTab("Chat");
+  }, []);
+
+  // Floating "Ask AI" button over text selections in content tabs.
+  const [askSel, setAskSel] = useState<{ x: number; y: number; text: string; timeStart?: number } | null>(null);
+  useEffect(() => {
+    if (!["Article", "Chapters", "Transcript"].includes(activeTab)) {
+      setAskSel(null);
+      return;
+    }
+    const onMouseUp = (e: MouseEvent) => {
+      const sel = window.getSelection();
+      const text = sel?.toString().trim() ?? "";
+      if (!sel || sel.isCollapsed || text.length < 3 || text.length > 600) {
+        setAskSel(null);
+        return;
+      }
+      // If the selection sits inside a timestamped element (transcript
+      // sentences carry data-time), anchor the question to that moment too.
+      const node = sel.anchorNode;
+      const el = node?.nodeType === 1 ? (node as HTMLElement) : node?.parentElement ?? null;
+      const timeEl = el?.closest("[data-time]");
+      const parsed = timeEl ? parseFloat(timeEl.getAttribute("data-time") || "") : NaN;
+      setAskSel({ x: e.clientX, y: e.clientY, text, timeStart: isNaN(parsed) ? undefined : parsed });
+    };
+    document.addEventListener("mouseup", onMouseUp);
+    return () => document.removeEventListener("mouseup", onMouseUp);
+  }, [activeTab]);
+
   useEffect(() => {
     if (!id) return;
     getEpisode(id).then((ep) => {
@@ -1143,15 +1177,42 @@ export default function EpisodeDetail({ id }: { id: string }) {
               onArticleUpdated={(art) => setEpisode((prev) => (prev ? { ...prev, article: art } : prev))}
             />
           )}
-          {activeTab === "Chapters" && <ChaptersTab episode={episode} episodeId={id} currentTime={currentTime} seekTo={seekTo} canSeek={canSeek} deepReads={deepReads} setDeepReads={setDeepReads} />}
+          {activeTab === "Chapters" && <ChaptersTab episode={episode} episodeId={id} currentTime={currentTime} seekTo={seekTo} canSeek={canSeek} deepReads={deepReads} setDeepReads={setDeepReads} onAskChapter={(i, title) => startAnchoredChat({ type: "chapter", chapterIndex: i }, `关于「${title}」这一章：`)} />}
           {activeTab === "Mindmap" && <MindmapTab episode={episode} />}
           {activeTab === "Transcript" && <TranscriptTab episode={episode} translationLangs={translationLangs} currentTime={currentTime} seekTo={seekTo} canSeek={canSeek} />}
           {activeTab === "Keywords" && <KeywordsTab episode={episode} />}
           {activeTab === "Highlights" && <HighlightsTab episode={episode} seekTo={seekTo} canSeek={canSeek} />}
           {activeTab === "Q&A" && <QATab episode={episode} />}
-          {activeTab === "Chat" && <ChatTab episodeId={id} episode={episode} />}
+          {activeTab === "Chat" && (
+            <ChatTab
+              episodeId={id}
+              episode={episode}
+              seekTo={canSeek ? seekTo : undefined}
+              pendingAnchor={pendingAnchorChat}
+              onPendingAnchorConsumed={() => setPendingAnchorChat(null)}
+            />
+          )}
         </div>
       </div>
+
+      {/* Floating 💬 over text selections in Article/Chapters/Transcript */}
+      {askSel && (
+        <button
+          onMouseDown={(e) => e.preventDefault()} // keep the selection alive
+          onClick={() => {
+            startAnchoredChat(
+              { type: "quote", text: askSel.text, timeStart: askSel.timeStart },
+              `「${askSel.text.slice(0, 80)}${askSel.text.length > 80 ? "…" : ""}」\n\n关于这段内容：`
+            );
+            setAskSel(null);
+            window.getSelection()?.removeAllRanges();
+          }}
+          style={{ left: Math.min(askSel.x, window.innerWidth - 140), top: Math.max(askSel.y - 44, 8) }}
+          className="fixed z-50 px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white shadow-lg"
+        >
+          💬 Ask AI
+        </button>
+      )}
     </div>
   );
 }
@@ -1342,9 +1403,10 @@ const DEEP_READ_LANGS = [
   { code: "de", label: "Deutsch" },
 ];
 
-function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepReads, setDeepReads }: {
+function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepReads, setDeepReads, onAskChapter }: {
   episode: Episode; episodeId: string; currentTime: number; seekTo: (t: number) => void; canSeek: boolean;
   deepReads: DeepReadState; setDeepReads: React.Dispatch<React.SetStateAction<DeepReadState>>;
+  onAskChapter?: (chapterIndex: number, title: string) => void;
 }) {
   const [batch, setBatch] = useState<BatchStatus | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
@@ -1658,6 +1720,15 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
                   <button onClick={() => handleDeepRead(i)} disabled={dr?.loading || isBatchProcessing} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors disabled:opacity-50">
                     {dr?.loading || isBatchProcessing ? "⏳ Generating..." : dr?.content ? (dr.collapsed ? "📖 Expand" : "📖 Collapse") : "📖 Deep Read"}
                   </button>
+                  {onAskChapter && (
+                    <button
+                      onClick={() => onAskChapter(i, ch.title)}
+                      title={`就「${ch.title}」开启 AI 对话（带本章上下文）`}
+                      className="px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50 transition-colors"
+                    >
+                      💬 Ask AI
+                    </button>
+                  )}
                   {dr?.content && !dr.loading && !isBatchProcessing && (
                     <button onClick={() => handleDeepRead(i, true)} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 hover:text-amber-700 dark:hover:text-amber-400 transition-colors">
                       🔄 Regenerate
@@ -1756,6 +1827,7 @@ function TranscriptTab({ episode, translationLangs, currentTime, seekTo, canSeek
                 return (
                   <span
                     key={s.id || si}
+                    data-time={sStart}
                     onClick={(e) => { if (canSeek) { e.stopPropagation(); seekTo(sStart); } }}
                     className={`sentence-span transition-colors duration-200 ${isSentenceActive ? "bg-blue-200/80 dark:bg-blue-700/50 text-blue-900 dark:text-blue-100 font-medium rounded px-0.5 py-px" : ""}`}
                   >
@@ -1828,27 +1900,137 @@ function QATab({ episode }: { episode: Episode }) {
 // AI Chat
 // ---------------------------------------------------------------------------
 
-function ChatTab({ episodeId, episode }: { episodeId: string; episode: Episode }) {
+function ChatTab({
+  episodeId,
+  episode,
+  seekTo,
+  pendingAnchor,
+  onPendingAnchorConsumed,
+}: {
+  episodeId: string;
+  episode: Episode;
+  seekTo?: (t: number) => void;
+  /** When set: immediately create an anchored session, select it, prefill input. */
+  pendingAnchor?: { anchor: ChatAnchor; prefill?: string } | null;
+  onPendingAnchorConsumed?: () => void;
+}) {
+  // null = the legacy default conversation for this episode
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [defaultStats, setDefaultStats] = useState<{ messageCount: number; lastMessage: string | null }>({ messageCount: 0, lastMessage: null });
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(true);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const loadSessions = useCallback(async () => {
+    try {
+      const d = await listChatSessions(episodeId);
+      setSessions(d.sessions || []);
+      setDefaultStats(d.default || { messageCount: 0, lastMessage: null });
+    } catch { /* sidebar is best-effort */ }
+  }, [episodeId]);
+
+  const loadMessages = useCallback(async (sessionId: string | null) => {
+    setLoadingHistory(true);
+    try {
+      if (sessionId === null) {
+        const d = await listChatMessages(episodeId);
+        setMessages(d.messages || []);
+      } else {
+        const d = await listSessionMessages(sessionId);
+        setMessages(d.messages || []);
+      }
+    } catch {
+      setMessages([]);
+    } finally {
+      setLoadingHistory(false);
+    }
+  }, [episodeId]);
 
   useEffect(() => {
-    fetch(`/api/episodes/${episodeId}/chat`, { credentials: "include" })
-      .then((r) => r.json()).then((d) => setMessages(d.messages || [])).catch(() => {}).finally(() => setLoadingHistory(false));
+    loadSessions();
+    loadMessages(activeSessionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [episodeId]);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+
+  // Anchored session creation from chapter cards / text selections.
+  useEffect(() => {
+    if (!pendingAnchor) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const s = await createChatSession(episodeId, { anchor: pendingAnchor.anchor });
+        if (cancelled) return;
+        await loadSessions();
+        setActiveSessionId(s.id);
+        await loadMessages(s.id);
+        if (pendingAnchor.prefill) setInput(pendingAnchor.prefill);
+        setTimeout(() => inputRef.current?.focus(), 50);
+      } catch { /* leave the user on the current session */ }
+      onPendingAnchorConsumed?.();
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingAnchor]);
+
+  const handleNewSession = async () => {
+    try {
+      const s = await createChatSession(episodeId);
+      await loadSessions();
+      setActiveSessionId(s.id);
+      setMessages([]);
+      setLoadingHistory(false);
+      inputRef.current?.focus();
+    } catch { /* ignore */ }
+  };
+
+  const handleSelectSession = (sessionId: string | null) => {
+    if (sending) return;
+    setActiveSessionId(sessionId);
+    loadMessages(sessionId);
+  };
+
+  const handleRename = async (sessionId: string) => {
+    const title = renameValue.trim();
+    if (!title) { setRenamingId(null); return; }
+    setRenamingId(null);
+    setSessions((p) => p.map((s) => (s.id === sessionId ? { ...s, title } : s)));
+    try {
+      await renameChatSession(sessionId, title);
+    } catch {
+      loadSessions();
+    }
+  };
+
+  const handleDelete = async (sessionId: string) => {
+    if (!window.confirm("删除这个对话？其消息将一并删除（不影响其他对话）。")) return;
+    try {
+      await deleteChatSession(sessionId);
+      if (activeSessionId === sessionId) {
+        setActiveSessionId(null);
+        loadMessages(null);
+      }
+      loadSessions();
+    } catch { /* ignore */ }
+  };
 
   const handleSend = async () => {
     const text = input.trim(); if (!text || sending) return;
     const userMsg: ChatMsg = { id: `temp-${Date.now()}`, episodeId, role: "user", content: text, createdAt: new Date().toISOString() };
     setMessages((p) => [...p, userMsg]); setInput(""); setSending(true);
     try {
-      const res = await sendChatMessage(episodeId, text);
+      const res = activeSessionId === null
+        ? await sendChatMessage(episodeId, text)
+        : await sendSessionMessage(activeSessionId, text);
       setMessages((p) => { const u = p.filter((m) => m.id !== userMsg.id); return [...u, res.userMessage, res.assistantMessage]; });
+      loadSessions(); // refresh titles/counts (auto-title may have fired)
     } catch (e: any) {
       setMessages((p) => [...p, { id: `err-${Date.now()}`, episodeId, role: "assistant", content: `Error: ${e.message}`, createdAt: new Date().toISOString() }]);
     } finally { setSending(false); }
@@ -1856,41 +2038,138 @@ function ChatTab({ episodeId, episode }: { episodeId: string; episode: Episode }
 
   const suggestions = [`What is the main argument in "${episode.source.title}"?`, "Summarize the key points in 3 bullets", "What are the controversial claims made?", "What questions remain unanswered?"];
 
+  const anchorBadge = (s: ChatSession) => {
+    if (!s.anchor) return null;
+    const label = s.anchor.type === "chapter" ? `📖 第 ${(s.anchor.chapterIndex ?? 0) + 1} 章`
+      : s.anchor.type === "quote" ? "✂️ 划词"
+      : s.anchor.type === "article" ? "📄 长文" : null;
+    return label ? <span className="ml-1 text-[10px] text-blue-500 dark:text-blue-400">{label}</span> : null;
+  };
+
+  const markdownComponents = useMemo(
+    () => buildMarkdownComponents(seekTo, Boolean(seekTo)),
+    [seekTo]
+  );
+
   return (
-    <div className="flex flex-col h-[600px]">
+    <div className="flex flex-col h-[640px]">
       <div className="flex items-center justify-between px-3 py-1.5 mb-2 rounded-lg bg-zinc-100 dark:bg-zinc-800/60 text-xs text-zinc-500">
-        <span>💬 AI 深度追问</span>
+        <span>💬 AI 深度追问（可开多个对话，也可从章节/划词发起）</span>
         <span>🔒 个人独立对话历史（仅你可见）</span>
       </div>
-      <div className="flex-1 overflow-y-auto space-y-3 mb-4">
-        {loadingHistory ? <div className="text-center py-8 text-zinc-400">Loading chat history...</div> : messages.length === 0 ? (
-          <div className="space-y-4">
-            <div className="text-center py-8"><p className="text-zinc-400 mb-4">Ask AI about this episode</p></div>
-            <div className="grid gap-2 sm:grid-cols-2">{suggestions.map((q, i) => <button key={i} onClick={() => setInput(q)} className="text-left p-3 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 hover:border-blue-400 dark:hover:border-blue-600 text-zinc-600 dark:text-zinc-400 hover:text-blue-600 dark:hover:text-blue-400 transition-colors">{q}</button>)}</div>
-          </div>
-        ) : messages.map((msg) => (
-          <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-            <div className={`max-w-[80%] px-4 py-3 rounded-2xl text-sm ${msg.role === "user" ? "bg-blue-600 text-white rounded-br-md whitespace-pre-wrap" : "bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700 rounded-bl-md"}`}>
-              {msg.role === "assistant" ? (
-                <div className="prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-li:my-0.5 prose-headings:mt-3 prose-headings:mb-1">
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm, remarkMath]}
-                    rehypePlugins={[rehypeKatex]}
-                    components={CHAT_MARKDOWN_COMPONENTS}
+      <div className="flex flex-1 gap-3 min-h-0">
+        {/* Session sidebar */}
+        <div className="w-52 shrink-0 flex flex-col border border-zinc-200 dark:border-zinc-800 rounded-xl bg-white dark:bg-zinc-900 overflow-hidden">
+          <button
+            onClick={handleNewSession}
+            className="m-2 px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors"
+          >
+            ＋ 新对话
+          </button>
+          <div className="flex-1 overflow-y-auto px-2 pb-2 space-y-1">
+            <button
+              onClick={() => handleSelectSession(null)}
+              className={`w-full text-left px-2.5 py-2 rounded-lg text-xs transition-colors ${activeSessionId === null ? "bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
+              title="本节目的初始对话"
+            >
+              <span className="font-medium">💬 默认对话</span>
+              {defaultStats.messageCount > 0 && (
+                <span className="ml-1 text-[10px] text-zinc-400">{defaultStats.messageCount}</span>
+              )}
+              {defaultStats.lastMessage && (
+                <p className="mt-0.5 line-clamp-1 text-[10px] text-zinc-400">{defaultStats.lastMessage}</p>
+              )}
+            </button>
+            {sessions.map((s) => (
+              <div
+                key={s.id}
+                className={`group rounded-lg transition-colors ${activeSessionId === s.id ? "bg-blue-50 dark:bg-blue-950/50" : "hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
+              >
+                {renamingId === s.id ? (
+                  <input
+                    autoFocus
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onBlur={() => handleRename(s.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleRename(s.id);
+                      if (e.key === "Escape") setRenamingId(null);
+                    }}
+                    className="w-full px-2.5 py-2 text-xs bg-white dark:bg-zinc-900 border border-blue-400 rounded-lg outline-none text-zinc-900 dark:text-zinc-100"
+                  />
+                ) : (
+                  <button
+                    onClick={() => handleSelectSession(s.id)}
+                    onDoubleClick={() => { setRenamingId(s.id); setRenameValue(s.title); }}
+                    className={`w-full text-left px-2.5 py-2 text-xs ${activeSessionId === s.id ? "text-blue-700 dark:text-blue-300" : "text-zinc-600 dark:text-zinc-400"}`}
+                    title="单击切换，双击重命名"
                   >
-                    {normalizeMathDelimiters(msg.content)}
-                  </ReactMarkdown>
+                    <span className="font-medium line-clamp-1">{s.title}</span>{anchorBadge(s)}
+                    {s.lastMessage && <p className="mt-0.5 line-clamp-1 text-[10px] text-zinc-400">{s.lastMessage}</p>}
+                  </button>
+                )}
+                <div className="hidden group-hover:flex items-center gap-1 px-2 pb-1.5">
+                  <button
+                    onClick={() => { setRenamingId(s.id); setRenameValue(s.title); }}
+                    className="text-[10px] text-zinc-400 hover:text-blue-500"
+                  >
+                    重命名
+                  </button>
+                  <span className="text-[10px] text-zinc-300 dark:text-zinc-600">·</span>
+                  <button
+                    onClick={() => handleDelete(s.id)}
+                    className="text-[10px] text-zinc-400 hover:text-red-500"
+                  >
+                    删除
+                  </button>
                 </div>
-              ) : msg.content}
-            </div>
+              </div>
+            ))}
           </div>
-        ))}
-        {sending && <div className="flex justify-start"><div className="px-4 py-3 rounded-2xl rounded-bl-md bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700"><div className="flex gap-1"><span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" /><span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: "150ms" }} /><span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: "300ms" }} /></div></div></div>}
-        <div ref={chatEndRef} />
-      </div>
-      <div className="flex gap-2">
-        <input type="text" value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()} placeholder="Ask about this episode..." disabled={sending} className="flex-1 px-4 py-3 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 text-sm focus:ring-2 focus:ring-blue-500 outline-none disabled:opacity-50 placeholder:text-zinc-400" />
-        <button onClick={handleSend} disabled={!input.trim() || sending} className="px-4 py-3 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-zinc-300 dark:disabled:bg-zinc-700 text-white text-sm font-medium transition-colors">Send</button>
+        </div>
+
+        {/* Message stream */}
+        <div className="flex-1 flex flex-col min-w-0">
+          <div className="flex-1 overflow-y-auto space-y-3 mb-4">
+            {loadingHistory ? <div className="text-center py-8 text-zinc-400">Loading chat history...</div> : messages.length === 0 ? (
+              <div className="space-y-4">
+                <div className="text-center py-8"><p className="text-zinc-400 mb-4">Ask AI about this episode</p></div>
+                <div className="grid gap-2 sm:grid-cols-2">{suggestions.map((q, i) => <button key={i} onClick={() => setInput(q)} className="text-left p-3 text-sm rounded-lg border border-zinc-200 dark:border-zinc-700 hover:border-blue-400 dark:hover:border-blue-600 text-zinc-600 dark:text-zinc-400 hover:text-blue-600 dark:hover:text-blue-400 transition-colors">{q}</button>)}</div>
+              </div>
+            ) : messages.map((msg) => (
+              <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                <div className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm ${msg.role === "user" ? "bg-blue-600 text-white rounded-br-md whitespace-pre-wrap" : "bg-white dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700 rounded-bl-md"}`}>
+                  {msg.role === "assistant" ? (
+                    <div className="prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-li:my-0.5 prose-headings:mt-3 prose-headings:mb-1">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm, remarkMath]}
+                        rehypePlugins={[rehypeKatex]}
+                        components={markdownComponents}
+                      >
+                        {normalizeMathDelimiters(msg.content)}
+                      </ReactMarkdown>
+                    </div>
+                  ) : msg.content}
+                </div>
+              </div>
+            ))}
+            {sending && <div className="flex justify-start"><div className="px-4 py-3 rounded-2xl rounded-bl-md bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700"><div className="flex gap-1"><span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" /><span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: "150ms" }} /><span className="w-2 h-2 rounded-full bg-zinc-400 animate-bounce" style={{ animationDelay: "300ms" }} /></div></div></div>}
+            <div ref={chatEndRef} />
+          </div>
+          <div className="flex gap-2">
+            <input
+              ref={inputRef}
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}
+              placeholder={activeSessionId === null ? "Ask about this episode..." : "在这个对话中继续提问..."}
+              disabled={sending}
+              className="flex-1 px-4 py-3 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 text-sm focus:ring-2 focus:ring-blue-500 outline-none disabled:opacity-50 placeholder:text-zinc-400"
+            />
+            <button onClick={handleSend} disabled={!input.trim() || sending} className="px-4 py-3 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-zinc-300 dark:disabled:bg-zinc-700 text-white text-sm font-medium transition-colors">Send</button>
+          </div>
+        </div>
       </div>
     </div>
   );

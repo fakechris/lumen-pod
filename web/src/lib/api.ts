@@ -149,6 +149,24 @@ export interface ChatMsg {
   role: string;
   content: string;
   createdAt: string;
+  sessionId?: string;
+}
+
+export interface ChatAnchor {
+  type: "chapter" | "quote" | "article";
+  chapterIndex?: number;
+  text?: string;
+  timeStart?: number;
+}
+
+export interface ChatSession {
+  id: string;
+  title: string;
+  anchor?: ChatAnchor;
+  createdAt: string;
+  updatedAt: string;
+  messageCount?: number;
+  lastMessage?: string | null;
 }
 
 export async function sendChatMessage(
@@ -163,6 +181,52 @@ export async function sendChatMessage(
 
 export async function listChatMessages(episodeId: string): Promise<{ messages: ChatMsg[] }> {
   return apiFetch(`/api/episodes/${episodeId}/chat`);
+}
+
+export async function listChatSessions(
+  episodeId: string
+): Promise<{
+  default: { messageCount: number; lastMessage: string | null };
+  sessions: ChatSession[];
+}> {
+  return apiFetch(`/api/episodes/${episodeId}/chat/sessions`);
+}
+
+export async function createChatSession(
+  episodeId: string,
+  opts?: { title?: string; anchor?: ChatAnchor }
+): Promise<ChatSession> {
+  return apiFetch(`/api/episodes/${episodeId}/chat/sessions`, {
+    method: "POST",
+    body: JSON.stringify({ title: opts?.title, anchor: opts?.anchor }),
+  });
+}
+
+export async function listSessionMessages(
+  sessionId: string
+): Promise<{ session: ChatSession; messages: ChatMsg[] }> {
+  return apiFetch(`/api/chat/sessions/${sessionId}/messages`);
+}
+
+export async function sendSessionMessage(
+  sessionId: string,
+  content: string
+): Promise<{ userMessage: ChatMsg; assistantMessage: ChatMsg }> {
+  return apiFetch(`/api/chat/sessions/${sessionId}/chat`, {
+    method: "POST",
+    body: JSON.stringify({ role: "user", content }),
+  });
+}
+
+export async function renameChatSession(sessionId: string, title: string): Promise<void> {
+  await apiFetch(`/api/chat/sessions/${sessionId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ title }),
+  });
+}
+
+export async function deleteChatSession(sessionId: string): Promise<void> {
+  await apiFetch(`/api/chat/sessions/${sessionId}`, { method: "DELETE" });
 }
 
 // ---- Chapter Deep Read ----

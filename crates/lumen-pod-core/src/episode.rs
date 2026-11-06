@@ -340,6 +340,9 @@ pub struct ChatMessage {
     pub episode_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+    /// Owning conversation; NULL = the episode's legacy "default conversation".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub role: ChatRole,
     pub content: String,
     pub created_at: DateTime<Utc>,
@@ -350,6 +353,33 @@ pub struct ChatMessage {
 pub enum ChatRole {
     User,
     Assistant,
+}
+
+/// A named conversation under an episode, optionally anchored to a
+/// chapter / quote / article the user started it from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSession {
+    pub id: String,
+    pub user_id: String,
+    pub episode_id: String,
+    pub title: String,
+    /// {"type":"chapter","chapterIndex":2} | {"type":"quote","text":"…","timeStart":610}
+    /// | {"type":"article"} — injected into the session's system prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// ChatSession plus list-view stats (message count, last message excerpt).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSessionWithStats {
+    #[serde(flatten)]
+    pub session: ChatSession,
+    pub message_count: i64,
+    pub last_message: Option<String>,
 }
 
 // ---- Export records ----
