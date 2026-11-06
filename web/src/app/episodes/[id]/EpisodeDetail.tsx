@@ -636,6 +636,18 @@ export default function EpisodeDetail({ id }: { id: string }) {
     listCollections().then((res) => setCollections(res.collections || [])).catch(() => {});
   }, [id]);
 
+  // Auto-mark as read (per-user) on open — once per visit, so a manual
+  // "mark unread" toggle afterwards is respected.
+  const autoMarkedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!episode || !user || episode.isRead) return;
+    if (autoMarkedRef.current === episode.id) return;
+    autoMarkedRef.current = episode.id;
+    updateEpisode(id, { isRead: true })
+      .then((updated) => setEpisode(updated))
+      .catch(() => {});
+  }, [episode, user, id]);
+
   const handleToggleRead = async () => {
     if (!episode) return;
     try {
