@@ -852,6 +852,21 @@ export default function EpisodeDetail({ id }: { id: string }) {
   const hasPlayer = hasAudio || hasEmbed;
   const canSeek = hasAudio || !!youtubeId; // only audio & YouTube support programmatic seek
 
+  // Player block sticks on the three long-content tabs. Hoisted so the sticky
+  // styling, the compact context bar offset and the TOC scroll-margin all use
+  // the same truth.
+  const stickyPlayer = hasAudio && (activeTab === "Article" || activeTab === "Chapters" || activeTab === "Transcript");
+
+  // Compact context bar: once the user scrolls past the title/actions header,
+  // keep a truncated title + core actions + back-to-top pinned at the top.
+  const [showContextBar, setShowContextBar] = useState(false);
+  useEffect(() => {
+    const onScroll = () => setShowContextBar(window.scrollY > 240);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
   const translationLangs = useMemo(() => {
     if (!episode?.transcript?.translations) return [];
     return Object.keys(episode.transcript.translations);
@@ -1101,10 +1116,52 @@ export default function EpisodeDetail({ id }: { id: string }) {
         </div>
       </header>
 
+      {/* Compact context bar — title + core actions + back-to-top once the
+          real header has scrolled away. Sticky blocks below offset by its
+          height (top-11 = 2.75rem = 44px) so nothing overlaps. */}
+      {episode && showContextBar && (
+        <div className="fixed top-0 inset-x-0 z-30 h-11 bg-white/95 dark:bg-zinc-900/95 backdrop-blur border-b border-zinc-200 dark:border-zinc-800 shadow-sm">
+          <div className="max-w-5xl mx-auto px-4 h-full flex items-center gap-2">
+            <Link href="/" className="shrink-0 text-sm text-blue-600 hover:underline" title="返回列表">←</Link>
+            <span className="flex-1 min-w-0 truncate text-sm font-semibold text-zinc-900 dark:text-zinc-100" title={episode.source.title}>
+              {episode.source.title}
+            </span>
+            <button
+              onClick={handleToggleFavorite}
+              className={`shrink-0 px-2 py-1 text-xs font-medium rounded-lg border transition-colors ${
+                episode.isFavorite
+                  ? "bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800"
+                  : "bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700 hover:border-amber-400"
+              }`}
+              title={episode.isFavorite ? "取消收藏" : "收藏"}
+            >
+              {episode.isFavorite ? "★" : "☆"}
+            </button>
+            <button
+              onClick={handleToggleRead}
+              className={`shrink-0 px-2 py-1 text-xs font-medium rounded-lg border transition-colors ${
+                episode.isRead
+                  ? "bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800"
+                  : "bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700 hover:border-blue-400"
+              }`}
+              title={episode.isRead ? "标为未读" : "标为已读"}
+            >
+              {episode.isRead ? "✓ 已读" : "○ 未读"}
+            </button>
+            <button
+              onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+              className="shrink-0 px-2.5 py-1 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors"
+              title="回到顶部"
+            >
+              ↑ 顶部
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Single-column layout — player on top, content below */}
       <div className="max-w-5xl mx-auto px-4 py-6 space-y-6">
         {(() => {
-          const stickyPlayer = hasAudio && (activeTab === "Article" || activeTab === "Chapters" || activeTab === "Transcript");
           return (
             <>
               {/* Persistent player block — ONE instance for all tabs so playback
@@ -1113,7 +1170,7 @@ export default function EpisodeDetail({ id }: { id: string }) {
                 <div
                   className={`space-y-2 ${
                     stickyPlayer
-                      ? "sticky top-0 z-20 bg-zinc-50 dark:bg-zinc-950 -mx-4 px-4 pt-2 pb-1 shadow-sm"
+                      ? `sticky ${showContextBar ? "top-11" : "top-0"} z-20 bg-zinc-50 dark:bg-zinc-950 -mx-4 px-4 pt-2 pb-1 shadow-sm`
                       : "-mx-4 px-4 pb-1"
                   }`}
                 >
@@ -1151,7 +1208,7 @@ export default function EpisodeDetail({ id }: { id: string }) {
 
               {/* Tab bar — standalone sticky when player block isn't sticky */}
               {!stickyPlayer && (
-                <div className="sticky top-0 z-10 bg-zinc-50 dark:bg-zinc-950 pb-1 -mx-4 px-4">
+                <div className={`sticky ${showContextBar ? "top-11" : "top-0"} z-10 bg-zinc-50 dark:bg-zinc-950 pb-1 -mx-4 px-4`}>
                   <div className="flex gap-1 overflow-x-auto bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-1">
                     {TABS.map((tab) => (
                       <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 text-sm font-medium rounded-lg whitespace-nowrap transition-colors ${activeTab === tab ? "bg-blue-600 text-white shadow-sm" : "text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}>
@@ -1165,8 +1222,17 @@ export default function EpisodeDetail({ id }: { id: string }) {
           );
         })()}
 
-        {/* Tab Content */}
-        <div>
+        {/* Tab Content — children pick up --scroll-mt so in-page jumps
+            (chapter TOC) land below the sticky player/tab bar instead of
+            behind it. stickyPlayer block ≈152px; tab bar only ≈56px; the
+            compact context bar adds 44px when visible. */}
+        <div
+          style={
+            {
+              "--scroll-mt": `${(stickyPlayer ? 152 : 56) + (showContextBar ? 44 : 0)}px`,
+            } as React.CSSProperties
+          }
+        >
           {activeTab === "Summary" && <SummaryTab episode={episode} />}
           {activeTab === "Article" && (
             <ArticleTab
@@ -1701,7 +1767,7 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
             const isBatchProcessing = batchRunning && batch?.currentIdx === i;
             const isExpanded = dr?.content && !dr.collapsed;
             return (
-              <div key={i} ref={(el) => { chapterRefs.current[i] = el; }} data-ch-idx={i} className={`rounded-xl border transition-all scroll-mt-20 ${isActive ? "bg-blue-50 dark:bg-blue-950/50 border-blue-300 dark:border-blue-800 shadow-sm" : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 hover:border-blue-300 dark:hover:border-blue-700"}`}>
+              <div key={i} ref={(el) => { chapterRefs.current[i] = el; }} data-ch-idx={i} className={`rounded-xl border transition-all scroll-mt-[var(--scroll-mt,5rem)] ${isActive ? "bg-blue-50 dark:bg-blue-950/50 border-blue-300 dark:border-blue-800 shadow-sm" : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 hover:border-blue-300 dark:hover:border-blue-700"}`}>
                 <button onClick={() => canSeek && seekTo(ch.startTime)} className={`w-full text-left p-4 ${canSeek ? "cursor-pointer" : "cursor-default"}`}>
                   <div className="flex items-start gap-3">
                     <div className="shrink-0 w-16 text-center">
