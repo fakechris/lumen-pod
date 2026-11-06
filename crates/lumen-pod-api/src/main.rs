@@ -146,6 +146,11 @@ async fn run_server(database_url: &str) {
             "/api/episodes/{id}",
             get(get_episode).patch(update_episode).delete(delete_episode),
         )
+        .route("/api/episodes/{id}/favorite", axum::routing::put(set_favorite))
+        .route("/api/episodes/{id}/my-tags", axum::routing::put(set_my_tags))
+        .route("/api/me/favorites", get(list_favorites))
+        .route("/api/me/tags", get(list_my_tags))
+        .route("/api/events", axum::routing::post(record_events))
         .route(
             "/api/episodes/{id}/audio",
             axum::routing::post(upload_audio)
@@ -541,6 +546,13 @@ async fn call_llm_anthropic(
 struct ListParams {
     limit: Option<usize>,
     offset: Option<usize>,
+    /// `unread` — only episodes the viewer hasn't read; `favorites` — only
+    /// the viewer's favorites.
+    filter: Option<String>,
+    /// Filter by one of the viewer's personal tags.
+    tag: Option<String>,
+    /// `recent` (default, created_at DESC) or `unread` (unread first).
+    sort: Option<String>,
 }
 
 async fn list_episodes(
@@ -554,15 +566,20 @@ async fn list_episodes(
     };
     let limit = params.limit.unwrap_or(20).min(100);
     let offset = params.offset.unwrap_or(0);
+    let query = lumen_pod_core::store::EpisodeListQuery {
+        filter: params.filter,
+        tag: params.tag,
+        sort: params.sort,
+    };
     match state
         .store
-        .list_episode_cards_for_user(limit, offset, Some(&viewer.user_id), viewer.is_admin())
+        .list_episode_cards_for_user(limit, offset, Some(&viewer.user_id), viewer.is_admin(), &query)
         .await
     {
         Ok(episodes) => {
             let total = state
                 .store
-                .episode_count_for_user(Some(&viewer.user_id), viewer.is_admin())
+                .episode_count_for_user_filtered(Some(&viewer.user_id), viewer.is_admin(), &query)
                 .await
                 .unwrap_or(0);
             (
@@ -594,6 +611,16 @@ async fn get_episode(
                 .get_user_episode_read(&viewer.user_id, &id)
                 .await
                 .unwrap_or(false);
+            ep.is_favorite = state
+                .store
+                .get_user_favorite(&viewer.user_id, &id)
+                .await
+                .unwrap_or(false);
+            ep.my_tags = state
+                .store
+                .get_user_episode_tags(&viewer.user_id, &id)
+                .await
+                .unwrap_or_default();
             (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response()
         }
         Err(lumen_pod_core::error::PodError::NotFound(_)) => err_404(),
@@ -663,10 +690,43 @@ async fn update_episode(
         }
     }
 
+    // 1b. Per-user favorite state and personal tags follow the same pattern:
+    // any approved viewer manages their own, never the global row.
+    if let Some(v) = updates.get("isFavorite").or_else(|| updates.get("is_favorite")) {
+        let favorited = v.as_bool().unwrap_or(false);
+        if let Err(e) = state
+            .store
+            .set_user_favorite(&viewer.user_id, &id, favorited)
+            .await
+        {
+            return err_500(e);
+        }
+    }
+    if let Some(v) = updates.get("myTags").or_else(|| updates.get("my_tags")) {
+        let tags: Vec<String> = v
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Err(e) = state
+            .store
+            .set_user_episode_tags(&viewer.user_id, &id, &tags)
+            .await
+        {
+            return err_500(e);
+        }
+    }
+
     // 2. Check if there are any episode-level fields being modified
+    let per_user_keys = [
+        "isRead", "is_read", "isFavorite", "is_favorite", "myTags", "my_tags",
+    ];
     let has_episode_mutation = updates
         .as_object()
-        .map(|obj| obj.keys().any(|k| k != "isRead" && k != "is_read"))
+        .map(|obj| obj.keys().any(|k| !per_user_keys.contains(&k.as_str())))
         .unwrap_or(false);
 
     if has_episode_mutation {
@@ -678,11 +738,12 @@ async fn update_episode(
                 return err_403("需要管理员授权「发布私密视频」权限 (can_publish_private)");
             }
         }
-        // Strip isRead/is_read from episode table update so global row isn't polluted
+        // Strip per-user fields from episode table update so global row isn't polluted
         let mut clean_updates = updates.clone();
         if let Some(obj) = clean_updates.as_object_mut() {
-            obj.remove("isRead");
-            obj.remove("is_read");
+            for k in per_user_keys {
+                obj.remove(k);
+            }
             // If setting private and episode has no owner_id yet, assign current user
             if obj.get("visibility").and_then(|v| v.as_str()) == Some("private")
                 && ep.owner_id.is_none()
@@ -706,6 +767,16 @@ async fn update_episode(
         .get_user_episode_read(&viewer.user_id, &id)
         .await
         .unwrap_or(false);
+    ep.is_favorite = state
+        .store
+        .get_user_favorite(&viewer.user_id, &id)
+        .await
+        .unwrap_or(false);
+    ep.my_tags = state
+        .store
+        .get_user_episode_tags(&viewer.user_id, &id)
+        .await
+        .unwrap_or_default();
     (StatusCode::OK, Json(serde_json::to_value(ep).unwrap())).into_response()
 }
 
@@ -735,6 +806,204 @@ async fn delete_episode(
         Ok(false) => err_404(),
         Err(e) => err_500(e),
     }
+}
+
+// ---- Per-user favorites / personal tags / behavior events ----
+
+#[derive(Deserialize)]
+struct FavoriteRequest {
+    favorited: bool,
+}
+
+async fn set_favorite(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<FavoriteRequest>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
+    if let Err(e) = state
+        .store
+        .set_user_favorite(&viewer.user_id, &id, req.favorited)
+        .await
+    {
+        return err_500(e);
+    }
+    // Behavioral signal for future personalized ranking.
+    let _ = state
+        .store
+        .record_user_events(
+            &viewer.user_id,
+            &[(
+                id.clone(),
+                if req.favorited { "favorite" } else { "unfavorite" }.to_string(),
+                None,
+            )],
+        )
+        .await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "favorited": req.favorited })),
+    )
+        .into_response()
+}
+
+async fn list_favorites(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ids = match state.store.list_user_favorite_ids(&viewer.user_id).await {
+        Ok(ids) => ids,
+        Err(e) => return err_500(e),
+    };
+    let mut episodes = match state.store.get_episode_cards_by_ids(&ids).await {
+        Ok(eps) => eps,
+        Err(e) => return err_500(e),
+    };
+    // Preserve favorite order, enforce visibility, hydrate per-user state.
+    let mut ordered: Vec<lumen_pod_core::episode::Episode> = ids
+        .iter()
+        .filter_map(|id| episodes.iter().find(|e| &e.id == id).cloned())
+        .collect();
+    ordered.retain(|ep| viewer.can_view_episode(ep));
+    let _ = state
+        .store
+        .hydrate_episodes_user_state(&mut episodes, &viewer.user_id)
+        .await;
+    for ep in ordered.iter_mut() {
+        ep.is_favorite = true;
+        if let Some(full) = episodes.iter().find(|e| e.id == ep.id) {
+            ep.is_read = full.is_read;
+            ep.my_tags = full.my_tags.clone();
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "total": ordered.len(), "episodes": ordered })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct MyTagsRequest {
+    tags: Vec<String>,
+}
+
+async fn set_my_tags(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<MyTagsRequest>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let ep = match state.store.get_episode(&id).await {
+        Ok(ep) => ep,
+        Err(lumen_pod_core::error::PodError::NotFound(_)) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+    if !viewer.can_view_episode(&ep) {
+        return err_404();
+    }
+    match state
+        .store
+        .set_user_episode_tags(&viewer.user_id, &id, &req.tags)
+        .await
+    {
+        Ok(tags) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "tags": tags })),
+        )
+            .into_response(),
+        Err(e) => err_500(e),
+    }
+}
+
+async fn list_my_tags(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match state.store.list_user_tags(&viewer.user_id).await {
+        Ok(tags) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "tags": tags })),
+        )
+            .into_response(),
+        Err(e) => err_500(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventItem {
+    episode_id: String,
+    #[serde(rename = "type")]
+    event_type: String,
+    payload: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct EventsRequest {
+    events: Vec<EventItem>,
+}
+
+async fn record_events(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<EventsRequest>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut rows: Vec<(String, String, Option<serde_json::Value>)> = Vec::new();
+    let mut opened: Vec<String> = Vec::new();
+    for ev in req.events.iter().take(50) {
+        // Validate event_type to keep the stream clean.
+        const ALLOWED: [&str; 5] = ["view", "play_progress", "play_complete", "chat_send", "search_click"];
+        if !ALLOWED.contains(&ev.event_type.as_str()) {
+            continue;
+        }
+        rows.push((ev.episode_id.clone(), ev.event_type.clone(), ev.payload.clone()));
+        if ev.event_type == "view" {
+            opened.push(ev.episode_id.clone());
+        }
+    }
+    if let Err(e) = state.store.record_user_events(&viewer.user_id, &rows).await {
+        return err_500(e);
+    }
+    for id in opened {
+        let _ = state
+            .store
+            .mark_user_episode_opened(&viewer.user_id, &id)
+            .await;
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "recorded": rows.len() })),
+    )
+        .into_response()
 }
 
 // ---- Audio Upload ----
@@ -1288,6 +1557,8 @@ async fn submit_url(
         article: None,
         shownotes: None,
         is_read: false,
+        is_favorite: false,
+        my_tags: vec![],
         tags: vec!["pending".to_string()],
         collection_id: None,
         owner_id: if viewer.is_api_token {
@@ -1457,7 +1728,7 @@ async fn search_episodes(
             episodes.retain(|ep| viewer.can_view_episode(ep));
             let _ = state
                 .store
-                .hydrate_episodes_read_state(&mut episodes, &viewer.user_id)
+                .hydrate_episodes_user_state(&mut episodes, &viewer.user_id)
                 .await;
             (
                 StatusCode::OK,
@@ -3187,6 +3458,8 @@ mod tests {
             article: None,
             shownotes: None,
             is_read: false,
+            is_favorite: false,
+            my_tags: vec![],
             tags: vec![],
             collection_id: None,
             owner_id: owner.map(String::from),

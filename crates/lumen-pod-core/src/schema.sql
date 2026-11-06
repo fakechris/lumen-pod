@@ -33,6 +33,37 @@ CREATE TABLE IF NOT EXISTS user_episode_reads (
     PRIMARY KEY (user_id, episode_id)
 );
 
+-- Migration: last-opened timestamp for recently-opened ordering
+ALTER TABLE user_episode_reads ADD COLUMN IF NOT EXISTS last_opened_at TIMESTAMPTZ;
+
+-- Per-user favorites
+CREATE TABLE IF NOT EXISTS user_favorites (
+    user_id TEXT NOT NULL,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, episode_id)
+);
+
+-- Per-user personal tags (independent from the shared episodes.tags column)
+CREATE TABLE IF NOT EXISTS user_episode_tags (
+    user_id TEXT NOT NULL,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, episode_id, tag)
+);
+
+-- Per-user behavioral event stream (view / play_progress / favorite / ...),
+-- write-only this milestone — feeds future personalized ranking.
+CREATE TABLE IF NOT EXISTS user_events (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS collections (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -110,6 +141,9 @@ CREATE INDEX IF NOT EXISTS idx_episodes_search ON episodes USING GIN(search_vect
 CREATE INDEX IF NOT EXISTS idx_episodes_collection ON episodes(collection_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_owner_visibility ON episodes(owner_id, visibility);
 CREATE INDEX IF NOT EXISTS idx_user_episode_reads_user ON user_episode_reads(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_favorites_user ON user_favorites(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_episode_tags_user_tag ON user_episode_tags(user_id, tag);
+CREATE INDEX IF NOT EXISTS idx_user_events_user ON user_events(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_chat_episode ON chat_messages(episode_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_episode_user ON chat_messages(episode_id, user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email);

@@ -13,6 +13,10 @@ export interface Episode {
   article?: Article;
   shownotes?: string;
   isRead: boolean;
+  /** Per-user favorite state (hydrated for the current viewer). */
+  isFavorite: boolean;
+  /** Per-user personal tags (hydrated for the current viewer). */
+  myTags: string[];
   tags: string[];
   collectionId?: string;
   ownerId?: string;

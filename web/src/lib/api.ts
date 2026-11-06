@@ -42,9 +42,14 @@ export async function getMe(): Promise<User> {
 
 export async function listEpisodes(
   limit = 20,
-  offset = 0
+  offset = 0,
+  opts?: { filter?: "unread" | "favorites"; tag?: string; sort?: "recent" | "unread" }
 ): Promise<{ total: number; episodes: Episode[] }> {
-  return apiFetch(`/api/episodes?limit=${limit}&offset=${offset}`, { skipAuthRedirect: true });
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  if (opts?.filter) params.set("filter", opts.filter);
+  if (opts?.tag) params.set("tag", opts.tag);
+  if (opts?.sort) params.set("sort", opts.sort);
+  return apiFetch(`/api/episodes?${params.toString()}`, { skipAuthRedirect: true });
 }
 
 export async function getEpisode(id: string): Promise<Episode> {
@@ -84,6 +89,56 @@ export async function createCollection(
     method: "POST",
     body: JSON.stringify({ name, description }),
   });
+}
+
+// ---- Per-user favorites / personal tags / behavior events ----
+
+export async function setFavorite(
+  id: string,
+  favorited: boolean
+): Promise<{ favorited: boolean }> {
+  return apiFetch(`/api/episodes/${id}/favorite`, {
+    method: "PUT",
+    body: JSON.stringify({ favorited }),
+  });
+}
+
+export async function listMyTags(): Promise<{ tags: [string, number][] }> {
+  return apiFetch("/api/me/tags");
+}
+
+export async function setMyTags(
+  id: string,
+  tags: string[]
+): Promise<{ tags: string[] }> {
+  return apiFetch(`/api/episodes/${id}/my-tags`, {
+    method: "PUT",
+    body: JSON.stringify({ tags }),
+  });
+}
+
+export interface TrackEvent {
+  episodeId: string;
+  type: "view" | "play_progress" | "play_complete" | "chat_send" | "search_click";
+  payload?: Record<string, unknown>;
+}
+
+/** Fire-and-forget behavioral events for future personalized ranking. */
+export async function reportEvents(events: TrackEvent[]): Promise<void> {
+  try {
+    await apiFetch("/api/events", {
+      method: "POST",
+      body: JSON.stringify({
+        events: events.map((e) => ({
+          episodeId: e.episodeId,
+          type: e.type,
+          payload: e.payload,
+        })),
+      }),
+    });
+  } catch {
+    // Behavioral telemetry must never break the UX.
+  }
 }
 
 // ---- Chat ----

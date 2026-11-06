@@ -7,7 +7,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
-import { getEpisode, updateEpisode, deleteEpisode, listCollections, createCollection, formatTimestamp, formatDuration, formatDate, getExportUrl, sendChatMessage, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, type ChatMsg, type BatchStatus } from "@/lib/api";
+import { getEpisode, updateEpisode, deleteEpisode, listCollections, createCollection, formatTimestamp, formatDuration, formatDate, getExportUrl, sendChatMessage, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, setFavorite, setMyTags, reportEvents, type ChatMsg, type BatchStatus } from "@/lib/api";
 import { normalizeMathDelimiters } from "@/lib/markdown";
 import { useAuth } from "@/lib/auth";
 import type { Article, Collection, Episode } from "@/lib/types";
@@ -608,6 +608,7 @@ export default function EpisodeDetail({ id }: { id: string }) {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [editingMeta, setEditingMeta] = useState(false);
   const [newTagInput, setNewTagInput] = useState("");
+  const [myTagInput, setMyTagInput] = useState("");
   const [newCollectionName, setNewCollectionName] = useState("");
   const [metaSaving, setMetaSaving] = useState(false);
   const [activeTab, setActiveTab] = useState<TabName>("Summary");
@@ -626,6 +627,8 @@ export default function EpisodeDetail({ id }: { id: string }) {
     if (!id) return;
     getEpisode(id).then((ep) => {
       setEpisode(ep);
+      // Behavioral signal: detail page opened.
+      reportEvents([{ episodeId: id, type: "view" }]);
       // Restore persisted deep reads from chapter data
       const restored: DeepReadState = {};
       ep.chapters.forEach((ch, i) => {
@@ -635,6 +638,19 @@ export default function EpisodeDetail({ id }: { id: string }) {
     }).catch((e) => setError(e.message)).finally(() => setLoading(false));
     listCollections().then((res) => setCollections(res.collections || [])).catch(() => {});
   }, [id]);
+
+  // Behavioral signal: play progress, throttled to one ping per 30s of playback.
+  const lastProgressRef = useRef(0);
+  useEffect(() => {
+    if (currentTime - lastProgressRef.current < 30) return;
+    lastProgressRef.current = currentTime;
+    const duration = episode?.source.duration ?? 0;
+    reportEvents([{
+      episodeId: id,
+      type: "play_progress",
+      payload: duration > 0 ? { progressPct: Math.round((currentTime / duration) * 100) } : undefined,
+    }]);
+  }, [currentTime, episode, id]);
 
   // Auto-mark as read (per-user) on open — once per visit, so a manual
   // "mark unread" toggle afterwards is respected.
@@ -655,6 +671,27 @@ export default function EpisodeDetail({ id }: { id: string }) {
       setEpisode(updated);
     } catch (e: any) {
       alert(e.message || "更新已读状态失败");
+    }
+  };
+
+  const handleToggleFavorite = async () => {
+    if (!episode) return;
+    const next = !episode.isFavorite;
+    setEpisode({ ...episode, isFavorite: next }); // optimistic
+    try {
+      await setFavorite(id, next);
+    } catch (e: any) {
+      setEpisode((prev) => (prev ? { ...prev, isFavorite: !next } : prev));
+      alert(e.message || "更新收藏状态失败");
+    }
+  };
+
+  const handleSaveMyTags = async (tags: string[]) => {
+    try {
+      await setMyTags(id, tags);
+      setEpisode((prev) => (prev ? { ...prev, myTags: tags } : prev));
+    } catch (e: any) {
+      alert(e.message || "更新个人标签失败");
     }
   };
 
@@ -815,6 +852,19 @@ export default function EpisodeDetail({ id }: { id: string }) {
                 {episode.isRead ? "✓ 已读 (个人)" : "○ 标为已读"}
               </button>
 
+              {/* Personal Favorite Toggle (Any approved user) */}
+              <button
+                onClick={handleToggleFavorite}
+                className={`px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors ${
+                  episode.isFavorite
+                    ? "bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800"
+                    : "bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700 hover:border-amber-400"
+                }`}
+                title="个人收藏（仅对你自己生效）"
+              >
+                {episode.isFavorite ? "★ 已收藏" : "☆ 收藏"}
+              </button>
+
               {canEdit && (
                 <button
                   onClick={() => setEditingMeta((v) => !v)}
@@ -863,8 +913,40 @@ export default function EpisodeDetail({ id }: { id: string }) {
               ) : null;
             })()}
             {episode.tags.length > 0 && episode.tags.map((t) => (
-              <span key={t} className="px-2 py-0.5 text-xs rounded-full bg-zinc-100 dark:bg-zinc-800">{t}</span>
+              <span key={t} title="共享标签" className="px-2 py-0.5 text-xs rounded-full bg-zinc-100 dark:bg-zinc-800">{t}</span>
             ))}
+            {episode.myTags.map((t) => (
+              <span
+                key={`my-${t}`}
+                title={`我的标签：${t}（点击移除）`}
+                className="inline-flex items-center gap-0.5 pl-2 pr-1 py-0.5 text-xs rounded-full bg-blue-50 dark:bg-blue-950/50 text-blue-600 dark:text-blue-300 border border-blue-200 dark:border-blue-900"
+              >
+                {t}
+                <button
+                  aria-label={`移除个人标签 ${t}`}
+                  onClick={() => handleSaveMyTags(episode.myTags.filter((x) => x !== t))}
+                  className="w-3.5 h-3.5 flex items-center justify-center rounded-full text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-800 leading-none"
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            <span className="inline-flex items-center gap-1">
+              <input
+                type="text"
+                value={myTagInput}
+                onChange={(e) => setMyTagInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && myTagInput.trim()) {
+                    const next = Array.from(new Set([...episode.myTags, myTagInput.trim()]));
+                    handleSaveMyTags(next);
+                    setMyTagInput("");
+                  }
+                }}
+                placeholder="+ 我的标签"
+                className="w-24 px-2 py-0.5 text-xs rounded-full border border-dashed border-zinc-300 dark:border-zinc-600 bg-transparent text-zinc-600 dark:text-zinc-300 outline-none focus:border-blue-400 focus:w-32 transition-all"
+              />
+            </span>
             <a href={episode.source.url} target="_blank" rel="noopener" className="text-blue-500 hover:underline ml-1">Source ↗</a>
             <span className="text-zinc-300 dark:text-zinc-600">|</span>
             <a href={getExportUrl(id, "markdown")} className="text-blue-500 hover:underline text-xs">📝 MD</a>
