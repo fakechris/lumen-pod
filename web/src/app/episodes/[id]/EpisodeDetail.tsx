@@ -1653,6 +1653,8 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
   // Track which chapter is in viewport for TOC highlight
   const [visibleChapter, setVisibleChapter] = useState(0);
   const chapterRefs = useRef<(HTMLDivElement | null)[]>([]);
+  // Whole-card seek guard: mousedown position, to distinguish a click from a drag-selection.
+  const chapterMouseDownRef = useRef<{ x: number; y: number } | null>(null);
   useEffect(() => {
     const observer = new IntersectionObserver((entries) => {
       for (const entry of entries) {
@@ -1767,8 +1769,28 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
             const isBatchProcessing = batchRunning && batch?.currentIdx === i;
             const isExpanded = dr?.content && !dr.collapsed;
             return (
-              <div key={i} ref={(el) => { chapterRefs.current[i] = el; }} data-ch-idx={i} className={`rounded-xl border transition-all scroll-mt-[var(--scroll-mt,5rem)] ${isActive ? "bg-blue-50 dark:bg-blue-950/50 border-blue-300 dark:border-blue-800 shadow-sm" : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 hover:border-blue-300 dark:hover:border-blue-700"}`}>
-                <button onClick={() => canSeek && seekTo(ch.startTime)} className={`w-full text-left p-4 ${canSeek ? "cursor-pointer" : "cursor-default"}`}>
+              <div
+                key={i}
+                ref={(el) => { chapterRefs.current[i] = el; }}
+                data-ch-idx={i}
+                // Whole-card seek: after deep-read expands, the header strip is
+                // only a small fraction of the card — make every non-interactive
+                // spot jump to the chapter start. Guards keep inner buttons,
+                // timestamp chips, links and text selection working as-is.
+                onMouseDown={(e) => { chapterMouseDownRef.current = { x: e.clientX, y: e.clientY }; }}
+                onClick={(e) => {
+                  if (!canSeek) return;
+                  const t = e.target as HTMLElement;
+                  if (t.closest("button, a, input, textarea, select")) return;
+                  if (window.getSelection()?.toString()) return;
+                  const d = chapterMouseDownRef.current;
+                  if (!d || Math.abs(d.x - e.clientX) + Math.abs(d.y - e.clientY) > 6) return;
+                  seekTo(ch.startTime);
+                }}
+                title={canSeek ? `跳转到本章（${formatTimestamp(ch.startTime)}）` : undefined}
+                className={`rounded-xl border transition-all scroll-mt-[var(--scroll-mt,5rem)] ${canSeek ? "cursor-pointer" : ""} ${isActive ? "bg-blue-50 dark:bg-blue-950/50 border-blue-300 dark:border-blue-800 shadow-sm" : "bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 hover:border-blue-300 dark:hover:border-blue-700"}`}
+              >
+                <div className="w-full text-left p-4">
                   <div className="flex items-start gap-3">
                     <div className="shrink-0 w-16 text-center">
                       <span className="font-mono text-sm text-blue-600 dark:text-blue-400">{formatTimestamp(ch.startTime)}</span>
@@ -1781,7 +1803,7 @@ function ChaptersTab({ episode, episodeId, currentTime, seekTo, canSeek, deepRea
                     {ch.hasAds && <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">AD</span>}
                     {isBatchProcessing && <span className="text-xs px-2 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 animate-pulse">Generating...</span>}
                   </div>
-                </button>
+                </div>
                 <div className="px-4 pb-3 flex items-center gap-2">
                   <button onClick={() => handleDeepRead(i)} disabled={dr?.loading || isBatchProcessing} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors disabled:opacity-50">
                     {dr?.loading || isBatchProcessing ? "⏳ Generating..." : dr?.content ? (dr.collapsed ? "📖 Expand" : "📖 Collapse") : "📖 Deep Read"}
