@@ -2444,7 +2444,16 @@ async fn chapter_deep_read(
         }
     }
 
-    let transcript_excerpt = build_chapter_transcript(&ep, chapter);
+    let (transcript_section, covered) = chapter_transcript_section(&ep, chapter);
+    if !covered {
+        tracing::warn!(
+            episode = %id,
+            chapter = idx,
+            start = chapter.start_time,
+            end = chapter.end_time,
+            "deep-read: no transcript coverage for chapter, falling back to summary-only"
+        );
+    }
     let system = deep_read_system_prompt(&lang);
 
     let prompt = format!(
@@ -2458,7 +2467,7 @@ async fn chapter_deep_read(
         fmt_dur(chapter.start_time),
         fmt_dur(chapter.end_time),
         chapter.summary,
-        truncate_utf8_chars(&transcript_excerpt, 24_000)
+        truncate_utf8_chars(&transcript_section, 16_000)
     );
 
     let now_ms = epoch_ms();
@@ -3151,7 +3160,16 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
         if idx >= ep.chapters.len() { continue; }
 
         let chapter = &ep.chapters[idx];
-        let transcript_excerpt = build_chapter_transcript(&ep, chapter);
+        let (transcript_section, covered) = chapter_transcript_section(&ep, chapter);
+        if !covered {
+            tracing::warn!(
+                episode = %episode_id,
+                chapter = idx,
+                start = chapter.start_time,
+                end = chapter.end_time,
+                "batch deep-read: no transcript coverage for chapter, falling back to summary-only"
+            );
+        }
 
         let prompt = format!(
             "Write a self-contained deep-read analysis of this chapter:\n\n\
@@ -3164,7 +3182,7 @@ async fn batch_deep_read_worker(state: AppState, episode_id: String, pending: Ve
             fmt_dur(chapter.start_time),
             fmt_dur(chapter.end_time),
             chapter.summary,
-            truncate_utf8_chars(&transcript_excerpt, 16_000)
+            truncate_utf8_chars(&transcript_section, 16_000)
         );
 
         let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
@@ -3234,6 +3252,57 @@ fn build_chapter_transcript(ep: &lumen_pod_core::episode::Episode, chapter: &lum
         }
     }
     text
+}
+
+/// Time range the episode's transcript actually covers: first paragraph
+/// start to last paragraph end. None when there is no transcript at all.
+fn transcript_time_range(ep: &lumen_pod_core::episode::Episode) -> Option<(f64, f64)> {
+    let t = ep.transcript.as_ref()?;
+    let start = t
+        .paragraphs
+        .first()
+        .and_then(|p| p.sentences.first())
+        .and_then(|s| s.words.first())
+        .map(|w| w.start)?;
+    let end = t
+        .paragraphs
+        .last()
+        .and_then(|p| p.sentences.last())
+        .and_then(|s| s.words.last())
+        .map(|w| w.end)?;
+    Some((start, end))
+}
+
+/// The "Transcript (with timestamps)" section of a deep-read prompt.
+///
+/// When the chapter's time range has no transcript overlap (e.g. the ASR
+/// output was cut short while chapters span the full video), the raw builder
+/// returns an empty string — and an empty transcript section makes the model
+/// correctly refuse to invent content, which then gets cached as the deep
+/// read. Instead, tell the model explicitly what is missing and degrade to a
+/// clearly-disclaimed summary-based analysis.
+fn chapter_transcript_section(
+    ep: &lumen_pod_core::episode::Episode,
+    chapter: &lumen_pod_core::episode::Chapter,
+) -> (String, bool) {
+    let excerpt = build_chapter_transcript(ep, chapter);
+    if !excerpt.trim().is_empty() {
+        return (excerpt, true);
+    }
+    let coverage_note = match transcript_time_range(ep) {
+        Some((s, e)) => format!("（现有转写仅覆盖 [{} — {}]）", fmt_dur(s), fmt_dur(e)),
+        None => "（本节目没有可用转写）".to_string(),
+    };
+    let section = format!(
+        "⚠️ 本章时间范围 [{} — {}] 内没有可用转写内容{coverage_note}。\n\
+         请仅基于上方的章节标题与 Original Summary 撰写深读：\n\
+         - 开头第一行注明：「本章转写缺失，以下分析基于章节摘要。」\n\
+         - 严禁编造引文、说话人姓名、时间戳、案例细节或演示画面。\n\
+         - 其余结构与深度要求保持不变。",
+        fmt_dur(chapter.start_time),
+        fmt_dur(chapter.end_time)
+    );
+    (section, false)
 }
 
 #[derive(Deserialize)]
@@ -3709,6 +3778,85 @@ fn err_500(e: impl std::fmt::Display) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_chapter_transcript_section_overlap_missing_and_absent() {
+        use lumen_pod_core::episode::{
+            Chapter, Episode, Paragraph, Sentence, Source, Transcript, Word,
+        };
+
+        fn word(text: &str, start: f64, end: f64) -> Word {
+            Word { id: format!("w-{start}"), text: text.into(), start, end }
+        }
+        fn para(id: u32, texts: &[(&str, f64, f64)]) -> Paragraph {
+            Paragraph {
+                id,
+                speaker: Some("Host".into()),
+                sentences: texts
+                    .iter()
+                    .map(|(t, s, e)| Sentence {
+                        id: format!("s-{s}"),
+                        text: (*t).into(),
+                        words: vec![word(t, *s, *e)],
+                    })
+                    .collect(),
+            }
+        }
+        fn chapter(title: &str, start: f64, end: f64) -> Chapter {
+            Chapter { title: title.into(), start_time: start, end_time: end, summary: "s".into(), has_ads: false, deep_read: None }
+        }
+
+        let mut ep = Episode {
+            id: "ep-1".into(),
+            source: Source {
+                url: "https://x.com/1".into(), platform: "youtube".into(), title: "T".into(),
+                author: "A".into(), published_at: None, thumbnail_url: None, duration: 120.0,
+                feed_url: None, description: None, podcast_name: None, episode_cover_url: None,
+                language: None, audio_path: None, audio_paths: vec![],
+            },
+            processing: lumen_pod_core::episode::Processing {
+                status: lumen_pod_core::episode::ProcessingStatus::Done,
+                asr_engine: None, llm_model: None, processed_at: None, agent_id: None, error: None,
+            },
+            summary: None,
+            chapters: vec![],
+            mindmap: None,
+            // Transcript covers [0, 100): two paragraphs.
+            transcript: Some(Transcript {
+                paragraphs: vec![
+                    para(0, &[("hello world", 0.0, 10.0)]),
+                    para(1, &[("the end of asr", 90.0, 100.0)]),
+                ],
+                translations: Default::default(),
+            }),
+            keywords: vec![], highlights: vec![], qas: vec![], clips: vec![],
+            article: None, shownotes: None,
+            is_read: false, is_favorite: false, my_tags: vec![], tags: vec![],
+            collection_id: None, owner_id: None, visibility: "public".into(),
+            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+        };
+
+        // 1. Chapter overlapping the transcript → real excerpt, covered = true.
+        let (section, covered) = chapter_transcript_section(&ep, &chapter("c1", 5.0, 50.0));
+        assert!(covered);
+        assert!(section.contains("hello world"));
+        assert!(!section.contains("没有可用转写"));
+
+        // 2. Chapter beyond transcript coverage (the prod failure mode:
+        //    ASR output cut at 100s while chapters span to 120s+).
+        let (section, covered) = chapter_transcript_section(&ep, &chapter("last", 3390.0, 4931.0));
+        assert!(!covered);
+        assert!(section.contains("没有可用转写内容"));
+        assert!(section.contains("仅覆盖"), "must disclose actual transcript coverage");
+        assert!(section.contains("基于章节摘要"), "must instruct summary-based fallback");
+        assert!(section.contains("严禁编造引文"));
+
+        // 3. No transcript at all.
+        ep.transcript = None;
+        let (section, covered) = chapter_transcript_section(&ep, &chapter("c2", 0.0, 10.0));
+        assert!(!covered);
+        assert!(section.contains("本节目没有可用转写"));
+    }
 
     #[test]
     fn test_truncate_utf8_chars_handles_multibyte_and_emoji_safely() {
