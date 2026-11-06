@@ -33,6 +33,15 @@ pub struct Episode {
     // ---- User interaction & Access Control ----
     #[serde(default)]
     pub is_read: bool,
+    /// Per-user favorite state (hydrated from user_favorites; not stored on
+    /// the episode row itself).
+    #[serde(default)]
+    pub is_favorite: bool,
+    /// Per-user personal tags (hydrated from user_episode_tags). Distinct
+    /// from the shared `tags` column, which stays global for the processing
+    /// pipeline and team-wide classification.
+    #[serde(default)]
+    pub my_tags: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]

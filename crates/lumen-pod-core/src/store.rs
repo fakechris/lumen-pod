@@ -5,6 +5,23 @@ use sqlx::{PgPool, Row};
 use crate::episode::{ApiToken, Chapter, Episode, Invite, User, UserRole};
 use crate::error::{PodError, PodResult};
 
+/// Per-user list filtering/ordering for episode card queries.
+#[derive(Debug, Default, Clone)]
+pub struct EpisodeListQuery {
+    /// `Some("unread")` — only episodes the user hasn't read;
+    /// `Some("favorites")` — only the user's favorites.
+    pub filter: Option<String>,
+    /// Only episodes carrying this personal tag for the user.
+    pub tag: Option<String>,
+    /// `Some("unread")` — unread first; default `recent` (created_at DESC).
+    pub sort: Option<String>,
+}
+
+/// Runtime bind value for dynamically-built card queries (all binds are text).
+enum BindVal {
+    S(String),
+}
+
 pub struct Store {
     pool: PgPool,
     episode_locks: std::sync::Arc<
@@ -200,7 +217,7 @@ impl Store {
             .collect::<PodResult<Vec<_>>>()?;
 
         if let Some(uid) = user_id {
-            self.hydrate_episodes_read_state(&mut episodes, uid).await?;
+            self.hydrate_episodes_user_state(&mut episodes, uid).await?;
         }
 
         Ok(episodes)
@@ -210,48 +227,125 @@ impl Store {
     /// skips transcript / article / mindmap / chapters / qas / clips / highlights /
     /// keywords / shownotes so a 50-item page stays in the KB range instead of
     /// shipping tens of MB of word-level transcript JSON.
+    ///
+    /// Supports per-user filtering (`unread` / `favorites` / personal `tag`)
+    /// and ordering (`recent` default / `unread` first).
     pub async fn list_episode_cards_for_user(
         &self,
         limit: usize,
         offset: usize,
         user_id: Option<&str>,
         is_admin: bool,
+        query: &EpisodeListQuery,
     ) -> PodResult<Vec<Episode>> {
-        let rows = if is_admin {
-            sqlx::query(
-                "SELECT id, source, processing, summary,
-                        is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
-                 FROM episodes ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-            )
-            .bind(limit as i64)
-            .bind(offset as i64)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT id, source, processing, summary,
-                        is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
-                 FROM episodes
-                 WHERE visibility = 'public' OR owner_id = $3
-                 ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-            )
-            .bind(limit as i64)
-            .bind(offset as i64)
-            .bind(user_id.unwrap_or(""))
-            .fetch_all(&self.pool)
-            .await?
-        };
+        let uid = user_id.unwrap_or("");
+        let (where_sql, binds) = Self::episode_filter_sql(uid, is_admin, query);
+        let order_sql = Self::episode_order_sql(query);
+
+        let sql = format!(
+            "SELECT e.id AS id, e.source AS source, e.processing AS processing,
+                    e.summary AS summary, e.is_read AS is_read, e.tags AS tags,
+                    e.collection_id AS collection_id, e.owner_id AS owner_id,
+                    e.visibility AS visibility, e.created_at AS created_at,
+                    e.updated_at AS updated_at
+             FROM episodes e
+             LEFT JOIN user_episode_reads r ON r.episode_id = e.id AND r.user_id = $1
+             {where_sql}
+             ORDER BY {order_sql}
+             LIMIT {limit} OFFSET {offset}"
+        );
+
+        let mut q = sqlx::query(&sql).bind(uid.to_string());
+        for v in binds {
+            q = match v {
+                BindVal::S(s) => q.bind(s),
+            };
+        }
+        let rows = q.fetch_all(&self.pool).await?;
 
         let mut episodes: Vec<Episode> = rows
             .iter()
             .map(Self::row_to_episode_card)
             .collect::<PodResult<Vec<_>>>()?;
 
-        if let Some(uid) = user_id {
-            self.hydrate_episodes_read_state(&mut episodes, uid).await?;
+        if !uid.is_empty() {
+            self.hydrate_episodes_user_state(&mut episodes, uid).await?;
         }
 
         Ok(episodes)
+    }
+
+    /// Row count matching the same filters as
+    /// [`Self::list_episode_cards_for_user`] so list pagination stays correct
+    /// when filters narrow the result set.
+    pub async fn episode_count_for_user_filtered(
+        &self,
+        user_id: Option<&str>,
+        is_admin: bool,
+        query: &EpisodeListQuery,
+    ) -> PodResult<usize> {
+        let uid = user_id.unwrap_or("");
+        let (where_sql, binds) = Self::episode_filter_sql(uid, is_admin, query);
+        let sql = format!(
+            "SELECT COUNT(*) AS cnt FROM episodes e
+             LEFT JOIN user_episode_reads r ON r.episode_id = e.id AND r.user_id = $1
+             {where_sql}"
+        );
+        let mut q = sqlx::query(&sql).bind(uid.to_string());
+        for v in binds {
+            q = match v {
+                BindVal::S(s) => q.bind(s),
+            };
+        }
+        let row = q.fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("cnt") as usize)
+    }
+
+    /// Build the WHERE clause shared by list/count card queries. The caller
+    /// must bind `$1` = user_id (the read-state join) before the returned
+    /// extra binds, in order.
+    fn episode_filter_sql(user_id: &str, is_admin: bool, query: &EpisodeListQuery) -> (String, Vec<BindVal>) {
+        let mut binds = Vec::new();
+        let mut wheres: Vec<String> = Vec::new();
+
+        if !is_admin {
+            binds.push(BindVal::S(user_id.to_string()));
+            let n = binds.len() + 1; // +1: $1 is reserved for the reads join
+            wheres.push(format!("(e.visibility = 'public' OR e.owner_id = ${n})"));
+        }
+        match query.filter.as_deref() {
+            Some("unread") => wheres.push("NOT COALESCE(r.is_read, FALSE)".to_string()),
+            Some("favorites") => {
+                binds.push(BindVal::S(user_id.to_string()));
+                let n = binds.len() + 1;
+                wheres.push(format!(
+                    "EXISTS (SELECT 1 FROM user_favorites f WHERE f.episode_id = e.id AND f.user_id = ${n})"
+                ));
+            }
+            _ => {}
+        }
+        if let Some(tag) = query.tag.as_deref().filter(|t| !t.is_empty()) {
+            binds.push(BindVal::S(tag.to_string()));
+            let n = binds.len() + 1;
+            wheres.push(format!(
+                "EXISTS (SELECT 1 FROM user_episode_tags t \
+                 WHERE t.episode_id = e.id AND t.user_id = $1 AND t.tag = ${n})"
+            ));
+        }
+
+        let where_sql = if wheres.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", wheres.join(" AND "))
+        };
+        (where_sql, binds)
+    }
+
+    fn episode_order_sql(query: &EpisodeListQuery) -> &'static str {
+        match query.sort.as_deref() {
+            Some("unread") => "COALESCE(r.is_read, FALSE) ASC, e.created_at DESC",
+            _ => "e.created_at DESC",
+        }
     }
 
     /// Slim card fetch by explicit ids (used by search: FTS returns ranked ids,
@@ -307,6 +401,8 @@ impl Store {
             article: None,
             shownotes: None,
             is_read: row.get("is_read"),
+            is_favorite: false,
+            my_tags: Vec::new(),
             tags: row
                 .get::<Option<serde_json::Value>, _>("tags")
                 .and_then(|v| serde_json::from_value(v).ok())
@@ -385,6 +481,224 @@ impl Store {
         for ep in episodes.iter_mut() {
             ep.is_read = *read_map.get(&ep.id).unwrap_or(&false);
         }
+        Ok(())
+    }
+
+    /// Hydrate all per-user state on a batch of episodes in one pass:
+    /// read flags, favorite flags and personal tags.
+    pub async fn hydrate_episodes_user_state(
+        &self,
+        episodes: &mut [Episode],
+        user_id: &str,
+    ) -> PodResult<()> {
+        if episodes.is_empty() || user_id.is_empty() {
+            return Ok(());
+        }
+        self.hydrate_episodes_read_state(episodes, user_id).await?;
+
+        let ids: Vec<String> = episodes.iter().map(|e| e.id.clone()).collect();
+
+        let fav_rows = sqlx::query(
+            "SELECT episode_id FROM user_favorites
+             WHERE user_id = $1 AND episode_id = ANY($2)",
+        )
+        .bind(user_id)
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let fav_set: std::collections::HashSet<String> = fav_rows
+            .iter()
+            .map(|r| r.get::<String, _>("episode_id"))
+            .collect();
+
+        let tag_rows = sqlx::query(
+            "SELECT episode_id, tag FROM user_episode_tags
+             WHERE user_id = $1 AND episode_id = ANY($2)
+             ORDER BY created_at ASC",
+        )
+        .bind(user_id)
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut tag_map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in tag_rows {
+            let ep_id: String = r.get("episode_id");
+            let tag: String = r.get("tag");
+            tag_map.entry(ep_id).or_default().push(tag);
+        }
+
+        for ep in episodes.iter_mut() {
+            ep.is_favorite = fav_set.contains(&ep.id);
+            ep.my_tags = tag_map.remove(&ep.id).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    // ---- Per-user favorites ----
+
+    pub async fn set_user_favorite(
+        &self,
+        user_id: &str,
+        episode_id: &str,
+        favorited: bool,
+    ) -> PodResult<()> {
+        if favorited {
+            sqlx::query(
+                "INSERT INTO user_favorites (user_id, episode_id)
+                 VALUES ($1, $2)
+                 ON CONFLICT (user_id, episode_id) DO NOTHING",
+            )
+            .bind(user_id)
+            .bind(episode_id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM user_favorites WHERE user_id = $1 AND episode_id = $2")
+                .bind(user_id)
+                .bind(episode_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_user_favorite(&self, user_id: &str, episode_id: &str) -> PodResult<bool> {
+        let row = sqlx::query(
+            "SELECT 1 AS one FROM user_favorites WHERE user_id = $1 AND episode_id = $2",
+        )
+        .bind(user_id)
+        .bind(episode_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Favorite episode ids for a user, newest first.
+    pub async fn list_user_favorite_ids(&self, user_id: &str) -> PodResult<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT episode_id FROM user_favorites WHERE user_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("episode_id")).collect())
+    }
+
+    // ---- Per-user personal tags ----
+
+    /// Replace the user's personal tag set on an episode (full replace).
+    pub async fn set_user_episode_tags(
+        &self,
+        user_id: &str,
+        episode_id: &str,
+        tags: &[String],
+    ) -> PodResult<Vec<String>> {
+        let mut clean: Vec<String> = tags
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect();
+        clean.sort();
+        clean.dedup();
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM user_episode_tags WHERE user_id = $1 AND episode_id = $2")
+            .bind(user_id)
+            .bind(episode_id)
+            .execute(&mut *tx)
+            .await?;
+        for tag in &clean {
+            sqlx::query(
+                "INSERT INTO user_episode_tags (user_id, episode_id, tag)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (user_id, episode_id, tag) DO NOTHING",
+            )
+            .bind(user_id)
+            .bind(episode_id)
+            .bind(tag)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(clean)
+    }
+
+    pub async fn get_user_episode_tags(
+        &self,
+        user_id: &str,
+        episode_id: &str,
+    ) -> PodResult<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT tag FROM user_episode_tags
+             WHERE user_id = $1 AND episode_id = $2
+             ORDER BY created_at ASC",
+        )
+        .bind(user_id)
+        .bind(episode_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("tag")).collect())
+    }
+
+    /// The user's personal tag cloud: (tag, usage count), most used first.
+    pub async fn list_user_tags(&self, user_id: &str) -> PodResult<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT tag, COUNT(*) AS cnt FROM user_episode_tags
+             WHERE user_id = $1
+             GROUP BY tag
+             ORDER BY cnt DESC, tag ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<String, _>("tag"), r.get::<i64, _>("cnt")))
+            .collect())
+    }
+
+    // ---- Per-user behavioral events ----
+
+    /// Record opened-at on the per-user read row (does not flip is_read).
+    pub async fn mark_user_episode_opened(&self, user_id: &str, episode_id: &str) -> PodResult<()> {
+        sqlx::query(
+            "INSERT INTO user_episode_reads (user_id, episode_id, is_read, last_opened_at)
+             VALUES ($1, $2, TRUE, NOW())
+             ON CONFLICT (user_id, episode_id) DO UPDATE SET last_opened_at = NOW()",
+        )
+        .bind(user_id)
+        .bind(episode_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Append a batch of behavioral events for the user.
+    pub async fn record_user_events(
+        &self,
+        user_id: &str,
+        events: &[(String, String, Option<serde_json::Value>)], // (episode_id, event_type, payload)
+    ) -> PodResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for (episode_id, event_type, payload) in events {
+            sqlx::query(
+                "INSERT INTO user_events (user_id, episode_id, event_type, payload)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(user_id)
+            .bind(episode_id)
+            .bind(event_type)
+            .bind(payload)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1381,6 +1695,8 @@ impl Store {
                 .and_then(|v| serde_json::from_value(v).ok()),
             shownotes: row.get("shownotes"),
             is_read: row.get("is_read"),
+            is_favorite: false,
+            my_tags: Vec::new(),
             tags: row
                 .get::<Option<serde_json::Value>, _>("tags")
                 .and_then(|v| serde_json::from_value(v).ok())
@@ -1404,7 +1720,39 @@ mod tests {
     async fn test_store() -> Store {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://lumenpod:lumenpod@127.0.0.1:5488/lumenpod".into());
+        // Per-test database isolation: parallel tests each get a private
+        // database so exact-count assertions stay valid. Falls back to the
+        // shared database when the user cannot CREATE DATABASE (locked-down
+        // dev DB); leftover lumenpod_test_* databases on throwaway test
+        // containers are harmless.
+        if let Some(server) = server_base_url(&url) {
+            let db_name = format!("lumenpod_test_{}", uuid::Uuid::new_v4().simple());
+            if let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&server)
+                .await
+            {
+                let created = sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+                    .execute(&pool)
+                    .await
+                    .is_ok();
+                pool.close().await;
+                if created {
+                    return Store::new(&format!("{server}/{db_name}")).await.unwrap();
+                }
+            }
+        }
         Store::new(&url).await.unwrap()
+    }
+
+    /// `postgres://user:pass@host:port/dbname?params` → `postgres://user:pass@host:port`
+    fn server_base_url(url: &str) -> Option<String> {
+        let no_query = url.split('?').next().unwrap_or(url);
+        let (server, _) = no_query.rsplit_once('/')?;
+        if !server.contains("://") {
+            return None;
+        }
+        Some(server.to_string())
     }
 
     fn sample_episode() -> Episode {
@@ -1526,6 +1874,8 @@ mod tests {
             article: None,
             shownotes: Some("Original show notes from the podcast feed".into()),
             is_read: false,
+            is_favorite: false,
+            my_tags: vec![],
             tags: vec!["ai".into(), "tech".into()],
             collection_id: None,
             owner_id: None,
@@ -1607,6 +1957,8 @@ mod tests {
             article: None,
             shownotes: None,
             is_read: false,
+            is_favorite: false,
+            my_tags: vec![],
             tags: vec![],
             collection_id: None,
             owner_id: None,
@@ -1887,6 +2239,233 @@ mod tests {
             final_ep.article.as_ref().map(|a| a.title.as_str()),
             Some("Concurrent Article")
         );
+
+        store.delete_episode(&ep.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn favorites_and_personal_tags_are_per_user() {
+        let store = test_store().await;
+        let ep = sample_episode();
+        store.insert_episode(&ep).await.unwrap();
+
+        let user_a = format!("ua-{}", uuid::Uuid::new_v4());
+        let user_b = format!("ub-{}", uuid::Uuid::new_v4());
+
+        // A favorites and tags; B stays untouched.
+        store.set_user_favorite(&user_a, &ep.id, true).await.unwrap();
+        store
+            .set_user_episode_tags(&user_a, &ep.id, &["machine-learning".into(), " ".into(), "rl".into()])
+            .await
+            .unwrap();
+
+        assert!(store.get_user_favorite(&user_a, &ep.id).await.unwrap());
+        assert!(!store.get_user_favorite(&user_b, &ep.id).await.unwrap());
+        assert_eq!(
+            store.get_user_episode_tags(&user_a, &ep.id).await.unwrap(),
+            vec!["machine-learning".to_string(), "rl".to_string()]
+        );
+        assert!(store.get_user_episode_tags(&user_b, &ep.id).await.unwrap().is_empty());
+
+        // A's tag cloud has counts; B's is empty.
+        let a_tags = store.list_user_tags(&user_a).await.unwrap();
+        assert!(a_tags.contains(&("machine-learning".to_string(), 1)));
+        assert!(store.list_user_tags(&user_b).await.unwrap().is_empty());
+
+        // Full replace: A sets a new tag set; old tags gone.
+        store
+            .set_user_episode_tags(&user_a, &ep.id, &["llm".into(), "llm".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_user_episode_tags(&user_a, &ep.id).await.unwrap(),
+            vec!["llm".to_string()]
+        );
+
+        // Unfavorite.
+        store.set_user_favorite(&user_a, &ep.id, false).await.unwrap();
+        assert!(!store.get_user_favorite(&user_a, &ep.id).await.unwrap());
+        assert!(store.list_user_favorite_ids(&user_a).await.unwrap().is_empty());
+
+        // Hydration fills per-user fields for A only.
+        let mut eps = vec![store.get_episode(&ep.id).await.unwrap()];
+        store.set_user_favorite(&user_a, &ep.id, true).await.unwrap();
+        store
+            .set_user_episode_tags(&user_a, &ep.id, &["llm".into()])
+            .await
+            .unwrap();
+        store.hydrate_episodes_user_state(&mut eps, &user_a).await.unwrap();
+        assert!(eps[0].is_favorite);
+        assert_eq!(eps[0].my_tags, vec!["llm".to_string()]);
+        let mut eps_b = vec![store.get_episode(&ep.id).await.unwrap()];
+        store.hydrate_episodes_user_state(&mut eps_b, &user_b).await.unwrap();
+        assert!(!eps_b[0].is_favorite);
+        assert!(eps_b[0].my_tags.is_empty());
+
+        store.delete_episode(&ep.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_cards_filter_and_sort() {
+        let store = test_store().await;
+        let user = format!("u-{}", uuid::Uuid::new_v4());
+
+        // ep_old: created first, UNREAD, favorited, personal-tagged.
+        // ep_new: created later, READ. This makes default (recent) order and
+        // unread-first order differ, so both can be asserted.
+        let mut ep_old = sample_episode();
+        ep_old.id = uuid::Uuid::new_v4().to_string();
+        ep_old.source.url = format!("https://x.example/{}", ep_old.id);
+        let mut ep_new = sample_episode();
+        ep_new.id = uuid::Uuid::new_v4().to_string();
+        ep_new.source.url = format!("https://x.example/{}", ep_new.id);
+        store.insert_episode(&ep_old).await.unwrap();
+        // Ensure distinct created_at ordering.
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        store.insert_episode(&ep_new).await.unwrap();
+
+        store.set_user_episode_read(&user, &ep_new.id, true).await.unwrap();
+        store.set_user_favorite(&user, &ep_old.id, true).await.unwrap();
+        store
+            .set_user_episode_tags(&user, &ep_old.id, &["deep-dive".into()])
+            .await
+            .unwrap();
+
+        let q = EpisodeListQuery::default();
+        let all = store
+            .list_episode_cards_for_user(10, 0, Some(&user), false, &q)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        // Default: recent first, and per-user state hydrated.
+        assert_eq!(all[0].id, ep_new.id);
+        assert!(!all[0].is_favorite && all[0].my_tags.is_empty());
+        assert!(all[1].is_favorite && all[1].my_tags == vec!["deep-dive".to_string()]);
+        assert_eq!(
+            store.episode_count_for_user_filtered(Some(&user), false, &q).await.unwrap(),
+            2
+        );
+
+        // filter=unread → only ep_old; count follows.
+        let unread = EpisodeListQuery {
+            filter: Some("unread".into()),
+            ..Default::default()
+        };
+        let got = store
+            .list_episode_cards_for_user(10, 0, Some(&user), false, &unread)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, ep_old.id);
+        assert_eq!(
+            store.episode_count_for_user_filtered(Some(&user), false, &unread).await.unwrap(),
+            1
+        );
+
+        // filter=favorites → only ep_old.
+        let favs = EpisodeListQuery {
+            filter: Some("favorites".into()),
+            ..Default::default()
+        };
+        let got = store
+            .list_episode_cards_for_user(10, 0, Some(&user), false, &favs)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, ep_old.id);
+
+        // tag=deep-dive → only ep_old; unknown tag → empty.
+        let by_tag = EpisodeListQuery {
+            tag: Some("deep-dive".into()),
+            ..Default::default()
+        };
+        let got = store
+            .list_episode_cards_for_user(10, 0, Some(&user), false, &by_tag)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, ep_old.id);
+        let by_tag = EpisodeListQuery {
+            tag: Some("nope".into()),
+            ..Default::default()
+        };
+        assert!(store
+            .list_episode_cards_for_user(10, 0, Some(&user), false, &by_tag)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // sort=unread → ep_old (older but unread) jumps ahead of ep_new.
+        let unread_sort = EpisodeListQuery {
+            sort: Some("unread".into()),
+            ..Default::default()
+        };
+        let got = store
+            .list_episode_cards_for_user(10, 0, Some(&user), false, &unread_sort)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, ep_old.id, "unread episode must sort first");
+
+        // Pagination offset still applies with filters.
+        let page = store
+            .list_episode_cards_for_user(1, 1, Some(&user), false, &q)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, ep_old.id);
+
+        store.delete_episode(&ep_old.id).await.unwrap();
+        store.delete_episode(&ep_new.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn user_events_and_opened_at() {
+        let store = test_store().await;
+        let ep = sample_episode();
+        store.insert_episode(&ep).await.unwrap();
+        let user = format!("u-{}", uuid::Uuid::new_v4());
+
+        // Events land in the stream with payloads.
+        store
+            .record_user_events(
+                &user,
+                &[
+                    (
+                        ep.id.clone(),
+                        "view".into(),
+                        None,
+                    ),
+                    (
+                        ep.id.clone(),
+                        "play_progress".into(),
+                        Some(serde_json::json!({ "progressPct": 42 })),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // "view" side effect: last_opened_at set on the reads row (is_read untouched).
+        store.mark_user_episode_opened(&user, &ep.id).await.unwrap();
+        let opened = sqlx::query(
+            "SELECT is_read, last_opened_at IS NOT NULL AS has_opened
+             FROM user_episode_reads WHERE user_id = $1 AND episode_id = $2",
+        )
+        .bind(&user)
+        .bind(&ep.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(opened.get::<bool, _>("has_opened"));
+        assert!(opened.get::<bool, _>("is_read"));
+
+        let cnt = sqlx::query("SELECT COUNT(*) AS c FROM user_events WHERE user_id = $1")
+            .bind(&user)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(cnt.get::<i64, _>("c"), 2);
 
         store.delete_episode(&ep.id).await.unwrap();
     }

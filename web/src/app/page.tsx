@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { listEpisodes, formatDuration, formatDate, getGoogleLoginUrl } from "@/lib/api";
+import { listEpisodes, listMyTags, setFavorite, setMyTags, formatDuration, formatDate, getGoogleLoginUrl } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { Episode } from "@/lib/types";
 
@@ -23,15 +23,39 @@ const statusColors: Record<string, string> = {
   error: "bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400",
 };
 
-function EpisodeCard({ episode }: { episode: Episode }) {
+function EpisodeCard({
+  episode,
+  onToggleFavorite,
+  onRemoveMyTag,
+}: {
+  episode: Episode;
+  onToggleFavorite: (id: string, favorited: boolean) => void;
+  onRemoveMyTag: (id: string, tag: string) => void;
+}) {
   const icon = platformIcons[episode.source.platform] || platformIcons.default;
   const isPending = episode.processing.status === "pending";
 
   return (
-    <Link
-      href={`/episodes/${episode.id}`}
-      className="group block rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:border-blue-400 dark:hover:border-blue-600 transition-all hover:shadow-lg overflow-hidden"
+    <div
+      className="group relative rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 hover:border-blue-400 dark:hover:border-blue-600 transition-all hover:shadow-lg overflow-hidden"
     >
+      <button
+        aria-label={episode.isFavorite ? "取消收藏" : "收藏"}
+        title={episode.isFavorite ? "取消收藏" : "收藏"}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onToggleFavorite(episode.id, !episode.isFavorite);
+        }}
+        className={`absolute top-3 right-3 z-10 w-7 h-7 flex items-center justify-center rounded-full text-base leading-none transition-all ${
+          episode.isFavorite
+            ? "text-amber-400 opacity-100"
+            : "text-zinc-300 dark:text-zinc-600 opacity-0 group-hover:opacity-100 hover:text-amber-400"
+        }`}
+      >
+        {episode.isFavorite ? "★" : "☆"}
+      </button>
+      <Link href={`/episodes/${episode.id}`} className="block">
       <div className="flex gap-4 p-4">
         {episode.source.thumbnailUrl ? (
           <img
@@ -45,7 +69,7 @@ function EpisodeCard({ episode }: { episode: Episode }) {
           </div>
         )}
         <div className="flex-1 min-w-0">
-          <div className="flex items-start gap-2">
+          <div className="flex items-start gap-2 pr-8">
             <h2 className="font-semibold text-zinc-900 dark:text-zinc-100 line-clamp-2 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
               {episode.source.title}
             </h2>
@@ -93,11 +117,32 @@ function EpisodeCard({ episode }: { episode: Episode }) {
               Awaiting agent processing — use MCP or skill to process this episode
             </p>
           )}
-          {episode.tags.length > 0 && (
+          {(episode.tags.length > 0 || episode.myTags.length > 0) && (
             <div className="mt-2 flex gap-1 flex-wrap">
+              {episode.myTags.slice(0, 5).map((tag) => (
+                <span
+                  key={`my-${tag}`}
+                  title={`我的标签：${tag}（点击移除）`}
+                  className="group/mytag inline-flex items-center gap-0.5 pl-2 pr-1 py-0.5 text-xs rounded-full bg-blue-50 dark:bg-blue-950/50 text-blue-600 dark:text-blue-300 border border-blue-200 dark:border-blue-900"
+                >
+                  {tag}
+                  <button
+                    aria-label={`移除个人标签 ${tag}`}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onRemoveMyTag(episode.id, tag);
+                    }}
+                    className="w-3.5 h-3.5 flex items-center justify-center rounded-full text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-800 leading-none"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
               {episode.tags.slice(0, 5).map((tag) => (
                 <span
                   key={tag}
+                  title="共享标签"
                   className="px-2 py-0.5 text-xs rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400"
                 >
                   {tag}
@@ -107,7 +152,8 @@ function EpisodeCard({ episode }: { episode: Episode }) {
           )}
         </div>
       </div>
-    </Link>
+      </Link>
+    </div>
   );
 }
 
@@ -211,31 +257,82 @@ export default function Home() {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [filterMode, setFilterMode] = useState<"all" | "unread" | "favorites">("all");
+  const [sortMode, setSortMode] = useState<"recent" | "unread">("recent");
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [myTagCloud, setMyTagCloud] = useState<[string, number][]>([]);
 
-  const fetchEpisodes = useCallback(() => {
-    listEpisodes(50, 0)
-      .then((data) => {
-        setEpisodes(data.episodes);
-        setTotal(data.total);
-        setError(null);
+  const fetchEpisodes = useCallback(
+    (opts?: { filter?: "unread" | "favorites"; tag?: string | null; sort?: "recent" | "unread" }) => {
+      const filter = opts?.filter ?? filterMode;
+      const tag = opts ? opts.tag : tagFilter;
+      const sort = opts?.sort ?? sortMode;
+      listEpisodes(50, 0, {
+        filter: filter === "all" ? undefined : filter,
+        tag: tag ?? undefined,
+        sort,
       })
-      .catch((e) => {
-        if (e.message?.includes("401")) {
+        .then((data) => {
+          setEpisodes(data.episodes);
+          setTotal(data.total);
           setError(null);
-        } else {
-          setError(e.message);
-        }
-      })
-      .finally(() => setLoading(false));
+        })
+        .catch((e) => {
+          if (e.message?.includes("401")) {
+            setError(null);
+          } else {
+            setError(e.message);
+          }
+        })
+        .finally(() => setLoading(false));
+    },
+    [filterMode, tagFilter, sortMode]
+  );
+
+  const refreshTagCloud = useCallback(() => {
+    listMyTags()
+      .then((res) => setMyTagCloud(res.tags || []))
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
     if (!authLoading && user) {
       fetchEpisodes();
+      refreshTagCloud();
     } else if (!authLoading) {
       setLoading(false);
     }
-  }, [authLoading, user, fetchEpisodes]);
+  }, [authLoading, user, fetchEpisodes, refreshTagCloud, filterMode, tagFilter, sortMode]);
+
+  const handleToggleFavorite = useCallback(
+    (id: string, favorited: boolean) => {
+      setEpisodes((prev) =>
+        prev.map((ep) => (ep.id === id ? { ...ep, isFavorite: favorited } : ep))
+      );
+      setFavorite(id, favorited).catch(() => {
+        // revert on failure
+        setEpisodes((prev) =>
+          prev.map((ep) => (ep.id === id ? { ...ep, isFavorite: !favorited } : ep))
+        );
+      });
+    },
+    []
+  );
+
+  const handleRemoveMyTag = useCallback(
+    (id: string, tag: string) => {
+      const target = episodes.find((ep) => ep.id === id);
+      if (!target) return;
+      const next = target.myTags.filter((t) => t !== tag);
+      setEpisodes((prev) =>
+        prev.map((ep) => (ep.id === id ? { ...ep, myTags: next } : ep))
+      );
+      setMyTags(id, next)
+        .then(() => refreshTagCloud())
+        .catch(() => fetchEpisodes());
+    },
+    [episodes, fetchEpisodes, refreshTagCloud]
+  );
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
@@ -327,21 +424,77 @@ export default function Home() {
         {!loading && !error && episodes.length === 0 && (
           <div className="text-center py-20">
             <p className="text-4xl mb-4">🎙️</p>
-            <p className="text-zinc-400 text-lg">No episodes yet</p>
-            {user ? (
+            <p className="text-zinc-400 text-lg">
+              {filterMode === "favorites"
+                ? "还没有收藏"
+                : filterMode === "unread"
+                  ? "没有未读的节目"
+                  : tagFilter
+                    ? `没有标签为「${tagFilter}」的节目`
+                    : "No episodes yet"}
+            </p>
+            {user && !filterMode && !tagFilter && (
               <p className="text-zinc-500 text-sm mt-2">
                 Paste a URL above, or use the MCP agent to process your first podcast.
               </p>
-            ) : (
+            )}
+            {!user && (
               <p className="text-zinc-500 text-sm mt-2">
                 Sign in to add your first podcast.
               </p>
             )}
           </div>
         )}
+        {user && (
+          <div className="mb-4 flex items-center gap-2 flex-wrap text-sm">
+            {([
+              ["all", "全部"],
+              ["unread", "未读"],
+              ["favorites", "⭐ 收藏"],
+            ] as const).map(([mode, label]) => (
+              <button
+                key={mode}
+                onClick={() => setFilterMode(mode)}
+                className={`px-3 py-1.5 rounded-lg transition-colors ${
+                  filterMode === mode
+                    ? "bg-blue-600 text-white"
+                    : "bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+            <select
+              value={tagFilter ?? ""}
+              onChange={(e) => setTagFilter(e.target.value || null)}
+              className="px-2.5 py-1.5 rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-200 outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <option value="">我的标签：全部</option>
+              {myTagCloud.map(([tag, count]) => (
+                <option key={tag} value={tag}>
+                  {tag} ({count})
+                </option>
+              ))}
+            </select>
+            <select
+              value={sortMode}
+              onChange={(e) => setSortMode(e.target.value as "recent" | "unread")}
+              className="px-2.5 py-1.5 rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-200 outline-none focus:ring-2 focus:ring-blue-500"
+              title="排序方式"
+            >
+              <option value="recent">最新优先</option>
+              <option value="unread">未读优先</option>
+            </select>
+          </div>
+        )}
         <div className="space-y-3">
           {episodes.map((ep) => (
-            <EpisodeCard key={ep.id} episode={ep} />
+            <EpisodeCard
+              key={ep.id}
+              episode={ep}
+              onToggleFavorite={handleToggleFavorite}
+              onRemoveMyTag={handleRemoveMyTag}
+            />
           ))}
         </div>
       </main>
