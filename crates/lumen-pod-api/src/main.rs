@@ -166,6 +166,19 @@ async fn run_server(database_url: &str) {
             get(list_chat).post(create_chat_with_ai),
         )
         .route(
+            "/api/episodes/{id}/chat/sessions",
+            get(list_chat_sessions).post(create_chat_session),
+        )
+        .route(
+            "/api/chat/sessions/{sid}",
+            axum::routing::patch(rename_chat_session).delete(delete_chat_session),
+        )
+        .route(
+            "/api/chat/sessions/{sid}/messages",
+            get(get_chat_session_messages),
+        )
+        .route("/api/chat/sessions/{sid}/chat", axum::routing::post(send_session_chat))
+        .route(
             "/api/episodes/{id}/chapters/{idx}/deep-read",
             axum::routing::post(chapter_deep_read).get(chapter_deep_read_status),
         )
@@ -1815,6 +1828,8 @@ async fn create_chat_with_ai(
     let system = build_chat_system_prompt(&ep);
 
     // Build message history for Anthropic format
+    // History (last 20) already contains the just-persisted user message —
+    // do not append it twice.
     let mut messages = Vec::new();
     for msg in history.iter().rev().take(20).collect::<Vec<_>>().into_iter().rev() {
         let role = match msg.role {
@@ -1823,7 +1838,6 @@ async fn create_chat_with_ai(
         };
         messages.push(serde_json::json!({"role": role, "content": msg.content}));
     }
-    messages.push(serde_json::json!({"role": "user", "content": req.content}));
 
     let llm = state.effective_llm().await;
     let assistant_content = match call_llm_anthropic(&llm, &system, &messages).await {
@@ -1854,6 +1868,370 @@ async fn create_chat_with_ai(
         })),
     )
         .into_response()
+}
+
+// ---- Chat sessions (multi-conversation with anchor context) ----
+
+#[derive(Deserialize)]
+struct CreateSessionRequest {
+    title: Option<String>,
+    anchor: Option<serde_json::Value>,
+}
+
+async fn list_chat_sessions(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Ok(ep) = state.store.get_episode(&id).await {
+        if !viewer.can_view_episode(&ep) {
+            return err_404();
+        }
+    }
+    let sessions = match state.store.list_chat_sessions(&viewer.user_id, &id).await {
+        Ok(s) => s,
+        Err(e) => return err_500(e),
+    };
+    // Default (legacy) conversation stats: per-user messages without a session.
+    let default_stats = match state
+        .store
+        .list_user_chat_messages(&id, &viewer.user_id)
+        .await
+    {
+        Ok(msgs) => {
+            let count = msgs.len();
+            let last = msgs.last().map(|m| {
+                let mut t = m.content.chars().take(80).collect::<String>();
+                if m.content.chars().count() > 80 {
+                    t.push('…');
+                }
+                t
+            });
+            serde_json::json!({ "messageCount": count, "lastMessage": last })
+        }
+        Err(_) => serde_json::json!({ "messageCount": 0, "lastMessage": null }),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "default": default_stats, "sessions": sessions })),
+    )
+        .into_response()
+}
+
+async fn create_chat_session(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<CreateSessionRequest>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if let Ok(ep) = state.store.get_episode(&id).await {
+        if !viewer.can_view_episode(&ep) {
+            return err_404();
+        }
+    }
+    let title: String = match req.title {
+        Some(t) => {
+            let t: String = t.trim().chars().take(60).collect();
+            if t.is_empty() { "新对话".to_string() } else { t }
+        }
+        None => "新对话".to_string(),
+    };
+    match state
+        .store
+        .create_chat_session(&viewer.user_id, &id, &title, req.anchor.as_ref())
+        .await
+    {
+        Ok(session) => (StatusCode::CREATED, Json(serde_json::to_value(session).unwrap())).into_response(),
+        Err(e) => err_500(e),
+    }
+}
+
+async fn get_chat_session_messages(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(sid): Path<String>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let session = match state.store.get_chat_session_owned(&sid, &viewer.user_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+    match state.store.list_session_chat_messages(&sid).await {
+        Ok(messages) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "session": session, "messages": messages })),
+        )
+            .into_response(),
+        Err(e) => err_500(e),
+    }
+}
+
+async fn send_session_chat(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(sid): Path<String>,
+    Json(req): Json<ChatRequest>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let session = match state.store.get_chat_session_owned(&sid, &viewer.user_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return err_404(),
+        Err(e) => return err_500(e),
+    };
+    let ep = match state.store.get_episode(&session.episode_id).await {
+        Ok(ep) => {
+            if !viewer.can_view_episode(&ep) {
+                return err_404();
+            }
+            ep
+        }
+        Err(_) => return err_404(),
+    };
+
+    let user_msg = match state
+        .store
+        .add_session_chat_message(&sid, &viewer.user_id, &ep.id, "user", &req.content)
+        .await
+    {
+        Ok(msg) => msg,
+        Err(e) => return err_500(e),
+    };
+
+    // Auto-title from the first question while the title is still default.
+    if session.title == "新对话" {
+        let t: String = req.content.trim().chars().take(20).collect();
+        let _ = state
+            .store
+            .rename_chat_session(&sid, &viewer.user_id, &t)
+            .await;
+    }
+
+    let history = state
+        .store
+        .list_session_chat_messages(&sid)
+        .await
+        .unwrap_or_default();
+
+    // Same system prompt as the default conversation, plus anchor context.
+    let system = build_chat_system_prompt(&ep);
+    let system = match &session.anchor {
+        Some(anchor) => format!("{system}\n\n{}", build_chat_anchor_context(&ep, anchor)),
+        None => system,
+    };
+
+    // History (last 20) already contains the just-persisted user message —
+    // do not append it twice.
+    let mut messages = Vec::new();
+    for msg in history.iter().rev().take(20).collect::<Vec<_>>().into_iter().rev() {
+        let role = match msg.role {
+            lumen_pod_core::episode::ChatRole::User => "user",
+            lumen_pod_core::episode::ChatRole::Assistant => "assistant",
+        };
+        messages.push(serde_json::json!({"role": role, "content": msg.content}));
+    }
+
+    let llm = state.effective_llm().await;
+    let assistant_content = match call_llm_anthropic(&llm, &system, &messages).await {
+        Ok(text) => text,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response()
+        }
+    };
+
+    let assistant_msg = match state
+        .store
+        .add_session_chat_message(&sid, &viewer.user_id, &ep.id, "assistant", &assistant_content)
+        .await
+    {
+        Ok(msg) => msg,
+        Err(e) => return err_500(e),
+    };
+    let _ = state.store.touch_chat_session(&sid).await;
+    // Behavioral signal.
+    let _ = state
+        .store
+        .record_user_events(
+            &viewer.user_id,
+            &[(ep.id.clone(), "chat_send".to_string(), None)],
+        )
+        .await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "userMessage": user_msg,
+            "assistantMessage": assistant_msg,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct RenameSessionRequest {
+    title: String,
+}
+
+async fn rename_chat_session(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(sid): Path<String>,
+    Json(req): Json<RenameSessionRequest>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let title: String = req.title.trim().chars().take(60).collect();
+    if title.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "title cannot be empty"})),
+        )
+            .into_response();
+    }
+    match state
+        .store
+        .rename_chat_session(&sid, &viewer.user_id, &title)
+        .await
+    {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "title": title })),
+        )
+            .into_response(),
+        Ok(false) => err_404(),
+        Err(e) => err_500(e),
+    }
+}
+
+async fn delete_chat_session(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(sid): Path<String>,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match state.store.delete_chat_session(&sid, &viewer.user_id).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response(),
+        Ok(false) => err_404(),
+        Err(e) => err_500(e),
+    }
+}
+
+/// Extra system-prompt context for a session started from an anchor
+/// (chapter / quote / article). The model answers grounded in that segment.
+fn build_chat_anchor_context(
+    ep: &lumen_pod_core::episode::Episode,
+    anchor: &serde_json::Value,
+) -> String {
+    let anchor_type = anchor.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match anchor_type {
+        "chapter" => {
+            let idx = anchor
+                .get("chapterIndex")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let Some(ch) = ep.chapters.get(idx) else {
+                return String::new();
+            };
+            let mut ctx = format!(
+                "\n--- Anchored chapter #{}: [{}] {}\nSummary: {}\n",
+                idx + 1,
+                fmt_dur(ch.start_time),
+                ch.title,
+                ch.summary
+            );
+            if let Some(deep) = &ch.deep_read {
+                ctx.push_str(&format!("\nChapter deep-read analysis:\n{}\n", truncate_chars(deep, 4_000)));
+            }
+            if let Some(t) = &ep.transcript {
+                let mut seg = String::new();
+                'outer: for para in &t.paragraphs {
+                    for sent in &para.sentences {
+                        let end = sent.words.last().map(|w| w.end).unwrap_or(0.0);
+                        let start = sent.words.first().map(|w| w.start).unwrap_or(0.0);
+                        if end < ch.start_time {
+                            continue;
+                        }
+                        if start > ch.end_time {
+                            break 'outer;
+                        }
+                        seg.push_str(&sent.text);
+                        seg.push(' ');
+                        if seg.len() > 8_000 {
+                            break 'outer;
+                        }
+                    }
+                    seg.push('\n');
+                }
+                if !seg.is_empty() {
+                    ctx.push_str(&format!("\nChapter transcript segment:\n{}", truncate_chars(&seg, 8_000)));
+                }
+            }
+            ctx.push_str("\nFocus your answer on this chapter unless asked otherwise.");
+            ctx
+        }
+        "quote" => {
+            let text = anchor
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if text.is_empty() {
+                return String::new();
+            }
+            let time_note = anchor
+                .get("timeStart")
+                .and_then(|v| v.as_f64())
+                .map(|t| format!(" (at {})", fmt_dur(t)))
+                .unwrap_or_default();
+            format!(
+                "\n--- Anchored quote{} the user selected:\n\"{}\"\nFocus your answer on this selected passage unless asked otherwise.",
+                time_note,
+                truncate_chars(text, 2_000)
+            )
+        }
+        "article" => {
+            let Some(article) = &ep.article else {
+                return String::new();
+            };
+            format!(
+                "\n--- Anchored article: {}\n{}\nFocus your answer on this article unless asked otherwise.",
+                article.title,
+                truncate_chars(&article.content, 20_000)
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max_chars).collect();
+    t.push('…');
+    t
 }
 
 fn build_chat_system_prompt(ep: &lumen_pod_core::episode::Episode) -> String {

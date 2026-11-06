@@ -1527,6 +1527,7 @@ impl Store {
             id: row.get("id"),
             episode_id: row.get("episode_id"),
             user_id: if uid.is_empty() { None } else { Some(uid) },
+            session_id: None,
             role: match row.get::<String, _>("role").as_str() {
                 "assistant" => crate::episode::ChatRole::Assistant,
                 _ => crate::episode::ChatRole::User,
@@ -1549,8 +1550,9 @@ impl Store {
         user_id: &str,
     ) -> PodResult<Vec<crate::episode::ChatMessage>> {
         let rows = sqlx::query(
-            "SELECT id, episode_id, user_id, role, content, created_at
+            "SELECT id, episode_id, user_id, session_id, role, content, created_at
              FROM chat_messages WHERE episode_id = $1 AND user_id = $2
+               AND session_id IS NULL
              ORDER BY created_at ASC",
         )
         .bind(episode_id)
@@ -1566,6 +1568,7 @@ impl Store {
                     id: r.get("id"),
                     episode_id: r.get("episode_id"),
                     user_id: if uid.is_empty() { None } else { Some(uid) },
+                    session_id: r.get("session_id"),
                     role: match r.get::<String, _>("role").as_str() {
                         "assistant" => crate::episode::ChatRole::Assistant,
                         _ => crate::episode::ChatRole::User,
@@ -1575,6 +1578,201 @@ impl Store {
                 }
             })
             .collect())
+    }
+
+    // ---- Chat sessions (multi-conversation per episode) ----
+
+    pub async fn create_chat_session(
+        &self,
+        user_id: &str,
+        episode_id: &str,
+        title: &str,
+        anchor: Option<&serde_json::Value>,
+    ) -> PodResult<crate::episode::ChatSession> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = sqlx::query(
+            "INSERT INTO chat_sessions (id, user_id, episode_id, title, anchor, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+             RETURNING id, user_id, episode_id, title, anchor, created_at, updated_at",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(episode_id)
+        .bind(title)
+        .bind(anchor)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Self::row_to_chat_session(&row))
+    }
+
+    /// Sessions for a user under an episode, newest activity first, with
+    /// message counts and last-message excerpts for the sidebar list.
+    pub async fn list_chat_sessions(
+        &self,
+        user_id: &str,
+        episode_id: &str,
+    ) -> PodResult<Vec<crate::episode::ChatSessionWithStats>> {
+        let rows = sqlx::query(
+            "SELECT s.id, s.user_id, s.episode_id, s.title, s.anchor, s.created_at, s.updated_at,
+                    COALESCE(m.cnt, 0) AS message_count,
+                    m.last_content AS last_message
+             FROM chat_sessions s
+             LEFT JOIN (
+                 SELECT session_id, COUNT(*) AS cnt,
+                        (array_agg(content ORDER BY created_at DESC))[1] AS last_content
+                 FROM chat_messages
+                 WHERE session_id IS NOT NULL
+                 GROUP BY session_id
+             ) m ON m.session_id = s.id
+             WHERE s.user_id = $1 AND s.episode_id = $2
+             ORDER BY s.updated_at DESC",
+        )
+        .bind(user_id)
+        .bind(episode_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::episode::ChatSessionWithStats {
+                session: Self::row_to_chat_session(r),
+                message_count: r.get("message_count"),
+                last_message: r.get("last_message"),
+            })
+            .collect())
+    }
+
+    /// Fetch a session owned by the given user (None otherwise).
+    pub async fn get_chat_session_owned(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> PodResult<Option<crate::episode::ChatSession>> {
+        let row = sqlx::query(
+            "SELECT id, user_id, episode_id, title, anchor, created_at, updated_at
+             FROM chat_sessions WHERE id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(Self::row_to_chat_session))
+    }
+
+    pub async fn rename_chat_session(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        title: &str,
+    ) -> PodResult<bool> {
+        let res = sqlx::query(
+            "UPDATE chat_sessions SET title = $3, updated_at = NOW()
+             WHERE id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(title)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Delete a session and only its own messages. Other sessions and the
+    /// legacy default conversation are untouched.
+    pub async fn delete_chat_session(&self, session_id: &str, user_id: &str) -> PodResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        let del_msgs = sqlx::query(
+            "DELETE FROM chat_messages WHERE session_id = $1 AND user_id = $2",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        let del_sess = sqlx::query("DELETE FROM chat_sessions WHERE id = $1 AND user_id = $2")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(del_sess.rows_affected() > 0 || del_msgs.rows_affected() > 0)
+    }
+
+    fn row_to_chat_session(row: &sqlx::postgres::PgRow) -> crate::episode::ChatSession {
+        crate::episode::ChatSession {
+            id: row.get("id"),
+            user_id: row.get("user_id"),
+            episode_id: row.get("episode_id"),
+            title: row.get("title"),
+            anchor: row.get("anchor"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        }
+    }
+
+    /// Append a message to a specific chat session.
+    pub async fn add_session_chat_message(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        episode_id: &str,
+        role: &str,
+        content: &str,
+    ) -> PodResult<crate::episode::ChatMessage> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = sqlx::query(
+            "INSERT INTO chat_messages (id, episode_id, user_id, session_id, role, content, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW())
+             RETURNING id, episode_id, user_id, session_id, role, content, created_at",
+        )
+        .bind(&id)
+        .bind(episode_id)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(role)
+        .bind(content)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Self::row_to_chat_message(&row))
+    }
+
+    pub async fn list_session_chat_messages(
+        &self,
+        session_id: &str,
+    ) -> PodResult<Vec<crate::episode::ChatMessage>> {
+        let rows = sqlx::query(
+            "SELECT id, episode_id, user_id, session_id, role, content, created_at
+             FROM chat_messages WHERE session_id = $1
+             ORDER BY created_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(Self::row_to_chat_message).collect())
+    }
+
+    /// Bump a session's updated_at so the sidebar ordering reflects activity.
+    pub async fn touch_chat_session(&self, session_id: &str) -> PodResult<()> {
+        sqlx::query("UPDATE chat_sessions SET updated_at = NOW() WHERE id = $1")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    fn row_to_chat_message(row: &sqlx::postgres::PgRow) -> crate::episode::ChatMessage {
+        let uid: String = row.get("user_id");
+        crate::episode::ChatMessage {
+            id: row.get("id"),
+            episode_id: row.get("episode_id"),
+            user_id: if uid.is_empty() { None } else { Some(uid) },
+            session_id: row.get("session_id"),
+            role: match row.get::<String, _>("role").as_str() {
+                "assistant" => crate::episode::ChatRole::Assistant,
+                _ => crate::episode::ChatRole::User,
+            },
+            content: row.get("content"),
+            created_at: row.get("created_at"),
+        }
     }
 
     // ---- Collections ----
@@ -2417,6 +2615,94 @@ mod tests {
 
         store.delete_episode(&ep_old.id).await.unwrap();
         store.delete_episode(&ep_new.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_sessions_lifecycle() {
+        let store = test_store().await;
+        let ep = sample_episode();
+        store.insert_episode(&ep).await.unwrap();
+        let user = format!("u-{}", uuid::Uuid::new_v4());
+        let other = format!("o-{}", uuid::Uuid::new_v4());
+
+        // Legacy default conversation stays separate from named sessions.
+        store
+            .add_user_chat_message(&ep.id, &user, "user", "legacy question")
+            .await
+            .unwrap();
+        store
+            .add_user_chat_message(&ep.id, &user, "assistant", "legacy answer")
+            .await
+            .unwrap();
+
+        let s1 = store
+            .create_chat_session(
+                &user,
+                &ep.id,
+                "新对话",
+                Some(&serde_json::json!({"type": "chapter", "chapterIndex": 0})),
+            )
+            .await
+            .unwrap();
+        store
+            .add_session_chat_message(&s1.id, &user, &ep.id, "user", "q1")
+            .await
+            .unwrap();
+        store
+            .add_session_chat_message(&s1.id, &user, &ep.id, "assistant", "a1")
+            .await
+            .unwrap();
+        store.touch_chat_session(&s1.id).await.unwrap();
+
+        let s2 = store
+            .create_chat_session(&other, &ep.id, "theirs", None)
+            .await
+            .unwrap();
+
+        // List with stats, per-user isolated.
+        let list = store.list_chat_sessions(&user, &ep.id).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].session.id, s1.id);
+        assert_eq!(list[0].message_count, 2);
+        assert_eq!(list[0].last_message.as_deref(), Some("a1"));
+        assert!(list[0]
+            .session
+            .anchor
+            .as_ref()
+            .and_then(|a| a.get("type"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t == "chapter"));
+
+        // Ownership checks.
+        assert!(store.get_chat_session_owned(&s1.id, &user).await.unwrap().is_some());
+        assert!(store.get_chat_session_owned(&s1.id, &other).await.unwrap().is_none());
+
+        // Rename.
+        assert!(store
+            .rename_chat_session(&s1.id, &user, "chapter deep dive")
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get_chat_session_owned(&s1.id, &user).await.unwrap().unwrap().title,
+            "chapter deep dive"
+        );
+
+        // Legacy stream untouched by session messages and vice versa.
+        let legacy = store.list_user_chat_messages(&ep.id, &user).await.unwrap();
+        assert_eq!(legacy.len(), 2);
+        assert!(legacy.iter().all(|m| m.session_id.is_none()));
+        let sess_msgs = store.list_session_chat_messages(&s1.id).await.unwrap();
+        assert_eq!(sess_msgs.len(), 2);
+        assert!(sess_msgs.iter().all(|m| m.session_id.as_deref() == Some(s1.id.as_str())));
+
+        // Delete s1 → only its own messages go; legacy + other users untouched.
+        assert!(store.delete_chat_session(&s1.id, &user).await.unwrap());
+        assert!(store.list_session_chat_messages(&s1.id).await.unwrap().is_empty());
+        assert!(store.get_chat_session_owned(&s1.id, &user).await.unwrap().is_none());
+        assert_eq!(store.list_user_chat_messages(&ep.id, &user).await.unwrap().len(), 2);
+        assert!(store.get_chat_session_owned(&s2.id, &other).await.unwrap().is_some());
+
+        store.delete_episode(&ep.id).await.unwrap();
     }
 
     #[tokio::test]

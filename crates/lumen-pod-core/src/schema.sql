@@ -115,6 +115,22 @@ ALTER TABLE episodes ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT '
 -- Migration: per-user chat messages
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT '';
 
+-- Migration: multi-session chat. NULL session_id = the episode's legacy
+-- "default conversation" (existing per-user messages stay visible as-is).
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS session_id TEXT;
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT '新对话',
+    -- Anchor context the session was started from:
+    -- {"type":"chapter","chapterIndex":2} | {"type":"quote","text":"...","timeStart":610}
+    -- | {"type":"article"}
+    anchor JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Migration: runtime-editable settings (admin panel); values override env defaults
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -146,4 +162,6 @@ CREATE INDEX IF NOT EXISTS idx_user_episode_tags_user_tag ON user_episode_tags(u
 CREATE INDEX IF NOT EXISTS idx_user_events_user ON user_events(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_chat_episode ON chat_messages(episode_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_episode_user ON chat_messages(episode_id, user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_session_msgs ON chat_messages(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_episode ON chat_sessions(user_id, episode_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email);
