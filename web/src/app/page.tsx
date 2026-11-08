@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { listEpisodes, listMyTags, setFavorite, setMyTags, formatDuration, formatDate, getGoogleLoginUrl } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -15,6 +15,8 @@ const platformIcons: Record<string, string> = {
   xiaoyuzhou: "🎧",
   default: "🎙️",
 };
+
+const PAGE_SIZE = 50;
 
 const statusColors: Record<string, string> = {
   pending: "bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400",
@@ -256,35 +258,65 @@ export default function Home() {
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filterMode, setFilterMode] = useState<"all" | "unread" | "favorites">("all");
   const [sortMode, setSortMode] = useState<"recent" | "unread">("recent");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [myTagCloud, setMyTagCloud] = useState<[string, number][]>([]);
+  const offsetRef = useRef(0);
+  const reqSeqRef = useRef(0);
+  const loadingMoreRef = useRef(false);
 
+  // mode "reset"：回到第一页整体替换（初始加载/筛选切换/提交新节目）；
+  // mode "more"：从 offsetRef 续拉下一页，追加去重后并入列表。
   const fetchEpisodes = useCallback(
-    (opts?: { filter?: "unread" | "favorites"; tag?: string | null; sort?: "recent" | "unread" }) => {
-      const filter = opts?.filter ?? filterMode;
-      const tag = opts ? opts.tag : tagFilter;
-      const sort = opts?.sort ?? sortMode;
-      listEpisodes(50, 0, {
-        filter: filter === "all" ? undefined : filter,
-        tag: tag ?? undefined,
-        sort,
+    (mode: "reset" | "more" = "reset") => {
+      const seq = ++reqSeqRef.current;
+      if (mode === "more") {
+        if (loadingMoreRef.current) return;
+        loadingMoreRef.current = true;
+        setLoadingMore(true);
+      } else {
+        offsetRef.current = 0;
+        setLoading(true);
+      }
+      listEpisodes(PAGE_SIZE, mode === "more" ? offsetRef.current : 0, {
+        filter: filterMode === "all" ? undefined : filterMode,
+        tag: tagFilter ?? undefined,
+        sort: sortMode,
       })
         .then((data) => {
-          setEpisodes(data.episodes);
+          if (seq !== reqSeqRef.current) return;
           setTotal(data.total);
           setError(null);
+          if (mode === "more") {
+            offsetRef.current += data.episodes.length;
+            setEpisodes((prev) => {
+              const seen = new Set(prev.map((ep) => ep.id));
+              return [...prev, ...data.episodes.filter((ep) => !seen.has(ep.id))];
+            });
+          } else {
+            offsetRef.current = data.episodes.length;
+            setEpisodes(data.episodes);
+          }
         })
         .catch((e) => {
+          if (seq !== reqSeqRef.current) return;
           if (e.message?.includes("401")) {
             setError(null);
           } else {
             setError(e.message);
           }
         })
-        .finally(() => setLoading(false));
+        .finally(() => {
+          if (mode === "more") {
+            loadingMoreRef.current = false;
+            setLoadingMore(false);
+          } else {
+            setLoading(false);
+          }
+        });
     },
     [filterMode, tagFilter, sortMode]
   );
@@ -297,7 +329,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!authLoading && user) {
-      fetchEpisodes();
+      fetchEpisodes("reset");
       refreshTagCloud();
     } else if (!authLoading) {
       setLoading(false);
@@ -329,7 +361,7 @@ export default function Home() {
       );
       setMyTags(id, next)
         .then(() => refreshTagCloud())
-        .catch(() => fetchEpisodes());
+        .catch(() => fetchEpisodes("reset"));
     },
     [episodes, fetchEpisodes, refreshTagCloud]
   );
@@ -497,6 +529,17 @@ export default function Home() {
             />
           ))}
         </div>
+        {!loading && !error && episodes.length > 0 && episodes.length < total && (
+          <div className="mt-6 text-center">
+            <button
+              onClick={() => fetchEpisodes("more")}
+              disabled={loadingMore}
+              className="px-5 py-2.5 text-sm font-medium rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50 transition-colors"
+            >
+              {loadingMore ? "加载中…" : `加载更多（剩余 ${total - episodes.length}）`}
+            </button>
+          </div>
+        )}
       </main>
     </div>
   );
