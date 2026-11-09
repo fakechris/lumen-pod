@@ -172,8 +172,8 @@ Generate a single markdown article that is so thorough the reader does not need 
 6. **High-bar visual referrals**: only when words cannot replace the visual — `🎬 [MM:SS 建议回看原片画面：具体原因]`.
 7. **Structured post-article curations** at the end:
    - `## 💡 值得记住的核心认知` (3–5 takeaways)
-   - `## 📚 视频提及的书影音与工具`
-   - `## 🧭 延伸探索建议` (2–3 follow-up topics)
+   - `## 📚 视频提及的书影音与工具` — 每条名称必须是可点的外链（原文/官网/权威条目页；不确定 URL 就给搜索链接，**禁止编造 URL**）
+   - `## 🧭 延伸探索建议` (2–3 follow-up topics；推荐的具体文章/书/视频同样带外链)
 8. **Timestamps**: `[MM:SS]` under 1 hour, `[H:MM:SS]` at or over 1 hour. Never `[0:11:33]`.
 
 Set `article.format = "markdown"`, `article.lang = "zh"` (or whatever the user prefers), `article.generatedAt = <ISO-8601 now>`.

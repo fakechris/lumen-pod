@@ -96,9 +96,17 @@ Always end the article with these three sections in this order:
 
 A structured list of every book, paper, film, product, tool, or notable figure mentioned in the episode. Original names (with original-language author/title for books and papers), and one short sentence of context for each. If the episode mentioned nothing notable, write "本期未提及具体书影音或工具。" (or the language-equivalent).
 
+**Every entry's title must be a clickable external link** — the reader should be able to open it, not search for it. Link targets, in order of preference:
+
+1. Original publication page (article → the site that published it; paper → arXiv / DOI / publisher)
+2. Official site (product, tool, podcast, company)
+3. A reputable catalog or profile page (book → publisher or Goodreads/Douban; film → IMDb/Douban; person → homepage or an authoritative profile)
+
+**Never fabricate a URL.** If you are not confident of the exact address, link a search query instead: `[Paul Graham《Keep Your Identity Small》](https://www.google.com/search?q=Paul+Graham+Keep+Your+Identity+Small)` — an honest search link beats a made-up 404.
+
 #### `## 🧭 延伸探索建议`
 
-2–3 genuinely relevant follow-up topics, search queries, or questions for active learning. **Not** "go read more about the same thing" — actually point at adjacent territory the curious reader would want to enter.
+2–3 genuinely relevant follow-up topics, search queries, or questions for active learning. **Not** "go read more about the same thing" — actually point at adjacent territory the curious reader would want to enter. When a suggestion names a specific article, book, or video, make its title a clickable external link under the same rule as the curations section (exact URL when confident, search-query link otherwise).
 
 ## Structural skeleton (do not deviate)
 
@@ -123,7 +131,7 @@ A structured list of every book, paper, film, product, tool, or notable figure m
 - ...
 
 ## 📚 视频提及的书影音与工具
-- **Original Title** by Author — context
+- **[Original Title](https://…)** by Author — context
 - ...
 
 ## 🧭 延伸探索建议

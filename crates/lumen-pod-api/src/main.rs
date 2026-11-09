@@ -2689,8 +2689,8 @@ fn article_system_prompt(lang: &str, focus: Option<&str>) -> String {
          8. **Structured Post-Article Curations (结构化尾注：要点 + 书影音清单 + 延伸探索)**:\n\
             At the end of the article, always include these three curated sections:\n\
             - `## 💡 值得记住的核心认知` (Key Points Worth Remembering): 3–5 sharp cognitive takeaways.\n\
-            - `## 📚 视频提及的书影音与工具` (Mentioned Books, Papers, Media & Tools): A structured list of books, papers, films, products, tools, or notable figures mentioned in the episode with their original names and context (if none were mentioned, state so briefly).\n\
-            - `## 🧭 延伸探索建议` (Further Exploration): 2–3 genuinely relevant follow-up topics, search queries, or questions for active learning.\n\
+            - `## 📚 视频提及的书影音与工具` (Mentioned Books, Papers, Media & Tools): A structured list of books, papers, films, products, tools, or notable figures mentioned in the episode with their original names and context (if none were mentioned, state so briefly). **Every entry's title must be a clickable external link** to its official/original page (article/paper → original publication or arXiv/DOI; book → publisher or a reputable catalog page; product/tool → official site; person → homepage or authoritative profile). If you are NOT confident of the exact URL, do NOT fabricate one — link a search query instead (e.g. `[标题](https://www.google.com/search?q=...)`).\n\
+            - `## 🧭 延伸探索建议` (Further Exploration): 2–3 genuinely relevant follow-up topics, search queries, or questions for active learning. When a suggestion names a specific article, book, or video, make its title a clickable external link under the same rule (exact URL when confident, search-query link otherwise).\n\
          9. **Clean Title**:\n\
             - Start the response with a single `# Title` line that is compelling and faithful to the core thesis (avoid clickbait), followed by the article body.\n\
          10. {}\n\
@@ -3898,6 +3898,9 @@ mod tests {
         assert!(article_prompt.contains("值得记住的核心认知"));
         assert!(article_prompt.contains("视频提及的书影音与工具"));
         assert!(article_prompt.contains("延伸探索建议"));
+        // 尾注外链要求：书影音/延伸探索每条名称带外链，不确定 URL 时用搜索链接而非编造
+        assert!(article_prompt.contains("clickable external link"));
+        assert!(article_prompt.contains("do NOT fabricate"));
         assert!(article_prompt.contains("Agent 架构设计"));
 
         let chapter_prompt = deep_read_system_prompt("zh");
@@ -3930,6 +3933,7 @@ mod tests {
         // 长文原有的 9 条约束不能被挤掉
         assert!(article_prompt.contains("值得记住的核心认知"));
         assert!(article_prompt.contains("延伸探索建议"));
+        assert!(article_prompt.contains("clickable external link"));
     }
 
     #[test]
