@@ -95,21 +95,25 @@ impl Store {
 
         sqlx::query(
             "INSERT INTO episodes (
-                id, source_url, source, processing, summary, chapters,
+                id, source_url, source, alt_sources, embed_preference,
+                processing, summary, chapters,
                 mindmap, transcript, keywords, highlights, qas, clips,
                 article, shownotes, is_read, tags, collection_id,
                 owner_id, visibility,
                 search_vector, created_at, updated_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17,
-                $18, $19,
-                to_tsvector('english', $20), $21, $22
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16,
+                $17, $18, $19, $20, $21,
+                to_tsvector('english', $22), $23, $24
             )",
         )
         .bind(&ep.id)
         .bind(&ep.source.url)
         .bind(serde_json::to_value(&ep.source)?)
+        .bind(serde_json::to_value(&ep.alt_sources)?)
+        .bind(&ep.embed_preference)
         .bind(serde_json::to_value(&ep.processing)?)
         .bind(
             ep.summary
@@ -157,7 +161,7 @@ impl Store {
 
     pub async fn get_episode(&self, id: &str) -> PodResult<Episode> {
         let row = sqlx::query(
-            "SELECT source, processing, summary, chapters, mindmap, transcript,
+            "SELECT source, alt_sources, embed_preference, processing, summary, chapters, mindmap, transcript,
                     keywords, highlights, qas, clips, article, shownotes,
                     is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
              FROM episodes WHERE id = $1",
@@ -183,7 +187,7 @@ impl Store {
     ) -> PodResult<Vec<Episode>> {
         let rows = if is_admin {
             sqlx::query(
-                "SELECT id, source, processing, summary, chapters, mindmap, transcript,
+                "SELECT id, source, alt_sources, embed_preference, processing, summary, chapters, mindmap, transcript,
                         keywords, highlights, qas, clips, article, shownotes,
                         is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
                  FROM episodes ORDER BY created_at DESC LIMIT $1 OFFSET $2",
@@ -194,7 +198,7 @@ impl Store {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, source, processing, summary, chapters, mindmap, transcript,
+                "SELECT id, source, alt_sources, embed_preference, processing, summary, chapters, mindmap, transcript,
                         keywords, highlights, qas, clips, article, shownotes,
                         is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
                  FROM episodes
@@ -245,6 +249,7 @@ impl Store {
         let sql = format!(
             "SELECT e.id AS id, e.source AS source, e.processing AS processing,
                     e.summary AS summary, e.is_read AS is_read, e.tags AS tags,
+                    e.alt_sources AS alt_sources, e.embed_preference AS embed_preference,
                     e.collection_id AS collection_id, e.owner_id AS owner_id,
                     e.visibility AS visibility, e.created_at AS created_at,
                     e.updated_at AS updated_at
@@ -356,7 +361,8 @@ impl Store {
         }
         let rows = sqlx::query(
             "SELECT id, source, processing, summary,
-                    is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
+                    is_read, tags, collection_id, owner_id, visibility, created_at, updated_at,
+                    alt_sources, embed_preference
              FROM episodes WHERE id = ANY($1)",
         )
         .bind(ids.to_vec())
@@ -387,6 +393,13 @@ impl Store {
         Ok(Episode {
             id: row.get("id"),
             source: serde_json::from_value(row.get::<serde_json::Value, _>("source"))?,
+            alt_sources: row
+                .try_get::<Option<serde_json::Value>, _>("alt_sources")
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            embed_preference: row.try_get("embed_preference").unwrap_or(None),
             processing: serde_json::from_value(row.get::<serde_json::Value, _>("processing"))?,
             summary: row
                 .get::<Option<serde_json::Value>, _>("summary")
@@ -712,7 +725,7 @@ impl Store {
 
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT source, processing, summary, chapters, mindmap, transcript,
+            "SELECT source, alt_sources, embed_preference, processing, summary, chapters, mindmap, transcript,
                     keywords, highlights, qas, clips, article, shownotes,
                     is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
              FROM episodes WHERE id = $1 FOR UPDATE",
@@ -740,6 +753,21 @@ impl Store {
             if let Ok(s) = serde_json::from_value(v.clone()) {
                 ep.source = s;
             }
+        }
+        // Multi-source registry & embed preference (whole-value replace, like
+        // `source`). The primary dedupe key `source_url` is re-synced below so
+        // switching the primary source keeps lookups consistent.
+        if let Some(v) = updates.get("altSources").or_else(|| updates.get("alt_sources")) {
+            if let Ok(s) = serde_json::from_value(v.clone()) {
+                ep.alt_sources = s;
+            }
+        }
+        if let Some(v) = updates.get("embedPreference").or_else(|| updates.get("embed_preference")) {
+            ep.embed_preference = if v.is_null() {
+                None
+            } else {
+                v.as_str().filter(|s| !s.is_empty()).map(String::from)
+            };
         }
         if let Some(v) = updates.get("processing") {
             if let Ok(p) = serde_json::from_value(v.clone()) {
@@ -815,17 +843,22 @@ impl Store {
 
         sqlx::query(
             "UPDATE episodes SET
-                source = $1, processing = $2, transcript = $3,
-                summary = $4, chapters = $5, mindmap = $6,
-                keywords = $7, highlights = $8, qas = $9,
-                clips = $10, article = $11, shownotes = $12,
-                is_read = $13, tags = $14, collection_id = $15,
-                owner_id = $16, visibility = $17,
-                search_vector = to_tsvector('english', $18),
-                updated_at = $19
-             WHERE id = $20",
+                source = $1, alt_sources = $2, embed_preference = $3,
+                source_url = $4,
+                processing = $5, transcript = $6,
+                summary = $7, chapters = $8, mindmap = $9,
+                keywords = $10, highlights = $11, qas = $12,
+                clips = $13, article = $14, shownotes = $15,
+                is_read = $16, tags = $17, collection_id = $18,
+                owner_id = $19, visibility = $20,
+                search_vector = to_tsvector('english', $21),
+                updated_at = $22
+             WHERE id = $23",
         )
         .bind(serde_json::to_value(&ep.source)?)
+        .bind(serde_json::to_value(&ep.alt_sources)?)
+        .bind(&ep.embed_preference)
+        .bind(&ep.source.url)
         .bind(serde_json::to_value(&ep.processing)?)
         .bind(
             ep.transcript
@@ -1040,20 +1073,31 @@ impl Store {
     }
 
     pub async fn episode_exists_by_url(&self, url: &str) -> PodResult<bool> {
-        let row =
-            sqlx::query("SELECT EXISTS(SELECT 1 FROM episodes WHERE source_url = $1) as exists")
-                .bind(url)
-                .fetch_one(&self.pool)
-                .await?;
+        // Matches either the primary source_url or any registered alt source
+        // URL (GIN-indexed containment) so a twin URL of an existing episode
+        // is still detected as a duplicate.
+        let row = sqlx::query(
+            "SELECT EXISTS(
+                SELECT 1 FROM episodes
+                WHERE source_url = $1
+                   OR alt_sources @> jsonb_build_array(jsonb_build_object('url', $1))
+            ) as exists",
+        )
+        .bind(url)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row.get::<bool, _>("exists"))
     }
 
     pub async fn find_episode_by_url(&self, url: &str) -> PodResult<Option<Episode>> {
         let row = sqlx::query(
-            "SELECT id, source, processing, summary, chapters, mindmap, transcript,
+            "SELECT id, source, alt_sources, embed_preference, processing, summary, chapters, mindmap, transcript,
                     keywords, highlights, qas, clips, article, shownotes,
                     is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
-             FROM episodes WHERE source_url = $1 LIMIT 1",
+             FROM episodes
+             WHERE source_url = $1
+                OR alt_sources @> jsonb_build_array(jsonb_build_object('url', $1))
+             LIMIT 1",
         )
         .bind(url)
         .fetch_optional(&self.pool)
@@ -1858,6 +1902,13 @@ impl Store {
         Ok(Episode {
             id: id.to_string(),
             source: serde_json::from_value(row.get::<serde_json::Value, _>("source"))?,
+            alt_sources: row
+                .try_get::<Option<serde_json::Value>, _>("alt_sources")
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            embed_preference: row.try_get("embed_preference").unwrap_or(None),
             processing: serde_json::from_value(row.get::<serde_json::Value, _>("processing"))?,
             summary: row
                 .get::<Option<serde_json::Value>, _>("summary")
@@ -1975,6 +2026,8 @@ mod tests {
                 audio_path: None,
                 audio_paths: Vec::new(),
             },
+            alt_sources: Vec::new(),
+            embed_preference: None,
             processing: Processing {
                 status: ProcessingStatus::Done,
                 asr_engine: Some("qwen3-asr".into()),
@@ -2129,6 +2182,8 @@ mod tests {
                 audio_path: None,
                 audio_paths: vec![],
             },
+            alt_sources: vec![],
+            embed_preference: None,
             processing: Processing {
                 status: ProcessingStatus::Done,
                 asr_engine: None,
@@ -2282,6 +2337,70 @@ mod tests {
             .episode_exists_by_url("https://nonexistent.url")
             .await
             .unwrap());
+        store.delete_episode(&ep.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multi_source_roundtrip_dedupe_and_primary_switch() {
+        let store = test_store().await;
+        let mut ep = sample_episode();
+        // Primary source = YouTube (the metadata winner); the X twin is
+        // registered as an alt source with its own metadata snapshot.
+        let x_url = format!(
+            "https://x.com/user/status/{}",
+            &uuid::Uuid::new_v4().simple()
+        );
+        ep.alt_sources = vec![AltSource {
+            url: x_url.clone(),
+            platform: "twitter".into(),
+            title: Some("X copy".into()),
+            author: Some("pg".into()),
+            published_at: Some(Utc::now()),
+            thumbnail_url: None,
+            duration: Some(2654.5),
+            description: Some("tweet text".into()),
+        }];
+        ep.embed_preference = Some("twitter".into());
+        store.insert_episode(&ep).await.unwrap();
+
+        // Roundtrip preserves the registry and the embed preference.
+        let loaded = store.get_episode(&ep.id).await.unwrap();
+        assert_eq!(loaded.alt_sources.len(), 1);
+        assert_eq!(loaded.alt_sources[0].platform, "twitter");
+        assert_eq!(loaded.alt_sources[0].duration, Some(2654.5));
+        assert_eq!(loaded.embed_preference.as_deref(), Some("twitter"));
+
+        // The twin URL hits dedupe / lookup through alt_sources containment.
+        assert!(store.episode_exists_by_url(&x_url).await.unwrap());
+        let found = store.find_episode_by_url(&x_url).await.unwrap().unwrap();
+        assert_eq!(found.id, ep.id);
+
+        // PATCH switches the primary source to the X copy: the whole-value
+        // replace semantics apply, `embedPreference: null` clears, and the
+        // `source_url` dedupe column must follow the new primary URL.
+        let yt_url = ep.source.url.clone();
+        let mut new_source = ep.source.clone();
+        new_source.url = x_url.clone();
+        new_source.platform = "twitter".into();
+        let updates = serde_json::json!({
+            "source": serde_json::to_value(&new_source).unwrap(),
+            "altSources": [serde_json::json!({"url": yt_url, "platform": "youtube"})],
+            "embedPreference": serde_json::Value::Null,
+        });
+        let updated = store.update_episode(&ep.id, &updates).await.unwrap();
+        assert_eq!(updated.source.url, x_url);
+        assert_eq!(updated.source.platform, "twitter");
+        assert_eq!(updated.embed_preference, None);
+        assert_eq!(updated.alt_sources.len(), 1);
+        assert_eq!(updated.alt_sources[0].url, yt_url);
+
+        // Both URLs stay dedupe-discoverable after the switch: the new
+        // primary via source_url, the old primary via alt_sources.
+        assert!(store.episode_exists_by_url(&x_url).await.unwrap());
+        assert!(store.episode_exists_by_url(&yt_url).await.unwrap());
+        let refetched = store.find_episode_by_url(&yt_url).await.unwrap().unwrap();
+        assert_eq!(refetched.id, ep.id);
+
         store.delete_episode(&ep.id).await.unwrap();
     }
 

@@ -119,9 +119,12 @@ fn tools() -> Vec<Value> {
         tool(
             "pod_update",
             "Update an existing episode's fields. Pass the episode id and a JSON string with only the fields to update.\n\n\
-             Supported top-level fields: source, processing, transcript, summary, chapters, mindmap, keywords, highlights, qas, clips, article, shownotes, isRead, tags, collectionId.\n\n\
+             Supported top-level fields: source, altSources, embedPreference, processing, transcript, summary, chapters, mindmap, keywords, highlights, qas, clips, article, shownotes, isRead, tags, collectionId.\n\n\
              To set the audio path after uploading via REST API:\n\
              {\"source\": {\"audioPath\": \"/audio/<episode_id>.mp3\", ...keep other source fields}}\n\n\
+             `source` and `altSources` are whole-value replaces (re-send the full object/array); \
+             switching `source.url` also re-syncs the dedupe key. `embedPreference` names the platform \
+             whose embed renders first (e.g. \"twitter\"), or null to clear.\n\n\
              Both camelCase and snake_case field names are accepted.",
             &["id", "updates_json"],
         ),

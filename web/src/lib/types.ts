@@ -1,6 +1,10 @@
 export interface Episode {
   id: string;
   source: Source;
+  /** Secondary sources hosting the same content (e.g. the X twin of a YouTube video). */
+  altSources?: AltSource[];
+  /** Which platform's embed to render preferentially (e.g. "twitter"). */
+  embedPreference?: string;
   processing: Processing;
   summary?: Summary;
   chapters: Chapter[];
@@ -50,6 +54,18 @@ export interface Source {
   audioPath?: string;
   /** Ordered audio parts (chunked uploads); takes precedence over audioPath. */
   audioPaths?: string[];
+}
+
+/** A secondary source registry entry; only url+platform are required. */
+export interface AltSource {
+  url: string;
+  platform: string;
+  title?: string;
+  author?: string;
+  publishedAt?: string;
+  thumbnailUrl?: string;
+  duration?: number;
+  description?: string;
 }
 
 export interface Processing {

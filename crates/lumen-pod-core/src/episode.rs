@@ -16,6 +16,16 @@ use serde::{Deserialize, Serialize};
 pub struct Episode {
     pub id: String,
     pub source: Source,
+    /// Additional sources hosting the same content (e.g. the X twin of a
+    /// YouTube video). Display metadata stays on the primary `source`;
+    /// this list is a registry with each platform's own metadata snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alt_sources: Vec<AltSource>,
+    /// Which platform's embed to render preferentially (e.g. "twitter").
+    /// When absent the frontend falls back to its built-in order
+    /// (twitter > youtube > bilibili).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_preference: Option<String>,
     pub processing: Processing,
 
     // ---- AI-generated content sections (tabs in UI) ----
@@ -114,6 +124,29 @@ pub struct Source {
     /// `audio_path` when non-empty.
     #[serde(default)]
     pub audio_paths: Vec<String>,
+}
+
+/// A secondary source hosting the same content as the episode's primary
+/// `source` (e.g. the X/Twitter twin of a YouTube video). Only `url` and
+/// `platform` are required; the rest is an optional metadata snapshot of
+/// that platform's copy, used for display and embed selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AltSource {
+    pub url: String,
+    pub platform: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+    #[serde(default)]
+    pub duration: Option<f64>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 // ---- Processing state ----

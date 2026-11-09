@@ -165,3 +165,12 @@ CREATE INDEX IF NOT EXISTS idx_chat_episode_user ON chat_messages(episode_id, us
 CREATE INDEX IF NOT EXISTS idx_chat_session_msgs ON chat_messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_episode ON chat_sessions(user_id, episode_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email);
+
+-- Migration: multi-source episodes. `alt_sources` is a registry of
+-- secondary sources hosting the same content (each an AltSource JSON
+-- object with at least url+platform); the primary `source` column keeps
+-- the display metadata and `source_url` stays the primary dedupe key.
+-- `embed_preference` names which platform's embed to render first.
+ALTER TABLE episodes ADD COLUMN IF NOT EXISTS alt_sources JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE episodes ADD COLUMN IF NOT EXISTS embed_preference TEXT;
+CREATE INDEX IF NOT EXISTS idx_episodes_alt_sources ON episodes USING GIN (alt_sources jsonb_path_ops);

@@ -1551,6 +1551,8 @@ async fn submit_url(
             audio_path: None,
             audio_paths: Vec::new(),
         },
+        alt_sources: vec![],
+        embed_preference: None,
         processing: lumen_pod_core::episode::Processing {
             status: lumen_pod_core::episode::ProcessingStatus::Pending,
             asr_engine: None,
@@ -3814,6 +3816,7 @@ mod tests {
                 feed_url: None, description: None, podcast_name: None, episode_cover_url: None,
                 language: None, audio_path: None, audio_paths: vec![],
             },
+            alt_sources: vec![], embed_preference: None,
             processing: lumen_pod_core::episode::Processing {
                 status: lumen_pod_core::episode::ProcessingStatus::Done,
                 asr_engine: None, llm_model: None, processed_at: None, agent_id: None, error: None,
@@ -3965,6 +3968,8 @@ mod tests {
                 audio_path: None,
                 audio_paths: Vec::new(),
             },
+            alt_sources: vec![],
+            embed_preference: None,
             processing: Processing {
                 status: ProcessingStatus::Done,
                 asr_engine: None,
