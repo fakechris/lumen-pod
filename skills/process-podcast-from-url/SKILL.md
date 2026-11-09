@@ -70,6 +70,18 @@ If a subtitle file was written (`.json3`/`.vtt`/`.srt`), parse it into the lumen
 
 If no usable subtitle, continue to Step 2.
 
+### Step 1b: Multi-source episodes（同内容双平台合并）
+
+同一内容常在 X 和 YouTube 各发一份（X 版可嵌入但元数据贫瘠；YouTube 版标题/简介/原生章节/字幕完整）。用户同时给出两个 URL、或你在处理中发现 twin 时，按下面的规则合并成**一条** episode：
+
+1. **主 `source` = 元数据更全的一方**（几乎总是 YouTube）。`source.url`、标题、简介、`publishedAt`、时长、原生 `chapters[]` 全部取自它；转写优先走它的字幕快车道（`asrEngine = "youtube-subs"`，跳过 Step 2–3 的下载和 SenseVoice——音频如需上传，下载的也是这一方的媒体）。
+2. **另一平台登记进 `altSources[]`**：至少 `url` + `platform`，附该平台自身快照（`title` / `author` / `publishedAt` / `duration` / `description`）。Shape 见 `references/transcript-schema.md`。
+3. **`embedPreference = "twitter"`**：同为 X + YouTube 时显式设置，前端优先渲染 X 视频嵌入（不设置时内置顺序也是 X 优先，显式写以防默认变化）。
+4. **时间轴只有一条**：转写、章节、highlights 全部对齐主 `source` 的时长。两平台时长差 <1%（如 2654.5s vs 2655s）忽略不计。
+5. **幂等**：`pod_exists` 对 `altSources` 里的 URL 也会命中——twin 的任一 URL 已发布过都会拦下，不会产出重复 episode。
+
+只有单一来源时完全跳过本步，行为不变。
+
 ## Step 2: Download media — follow the platform fallback chain
 
 Read `references/download-playbook.md` and apply it. The short version:

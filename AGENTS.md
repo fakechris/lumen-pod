@@ -25,3 +25,12 @@
 4. `work_claim` after user chooses — use `suggested_branch`.
 5. Run complete → In Review. Never Done.
 6. Unplanned fixes → `work_propose` with `DISCOVERED_DURING`.
+
+## 4. Deployment
+
+- **Host**: `oracle_5`（ssh config：`ubuntu@129.213.96.84`，ProxyCommand `nc -x localhost:7897`）
+- **Deploy dir**: `/opt/pod`（git checkout，跟踪 `main`）
+- **Production**: `https://pod.lumenopen.com`（Cloudflare + Caddy）
+- **Stack**: `docker compose` 本地构建 — `pod-web` / `pod-api` / `pod-db`（postgres:16-alpine），数据卷 `pod_audiodata` / `pod_staticdata`
+- **上线流程**: merge PR → 服务器 `cd /opt/pod && git pull && docker compose build && docker compose up -d` → 生产验证
+- **Schema**: 迁移幂等（`schema.sql` 启动时在 pg_advisory_lock 下执行），无需手工 DDL

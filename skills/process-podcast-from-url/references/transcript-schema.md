@@ -10,6 +10,8 @@ Source of truth: `crates/lumen-pod-core/src/episode.rs` and `crates/lumen-pod-mc
 {
   "id": "",
   "source": { ... },
+  "altSources": [ ... ],
+  "embedPreference": "twitter" | null,
   "processing": { ... },
   "summary": { ... } | null,
   "chapters": [ ... ],
@@ -54,6 +56,33 @@ The host fills `createdAt` / `updatedAt` on insert — pass them or omit. Same f
 ```
 
 `audioPath` is filled by the server after `pod_upload_audio_guide` runs (it becomes `"/audio/<episode_id>.mp3"`).
+
+## `altSources` / `embedPreference` (optional — multi-source episodes)
+
+同一内容在两个平台都有时（如 X 视频 + YouTube twin），episode 可以登记多个来源：
+
+- **主 `source`**：元数据展示来源 + 去重键。选元数据更全的一方（通常 YouTube：正式标题、完整简介、原生章节、字幕快车道），`source.url` 用该平台 URL。
+- **`altSources[]`**：其余来源的登记表，每项至少 `url` + `platform`，其余为该平台副本的元数据快照：
+
+```json
+{
+  "url": "https://x.com/user/status/1234",
+  "platform": "twitter",
+  "title": "推文标题（可省）",
+  "author": "handle（可省）",
+  "publishedAt": "2026-11-07T00:00:00Z" | null,
+  "thumbnailUrl": null,
+  "duration": 2654.5,
+  "description": "推文正文（可省）"
+}
+```
+
+- **`embedPreference`**：指定优先渲染哪个平台的嵌入（如 `"twitter"`）。省略时前端按内置顺序 `twitter > youtube > bilibili` 选——同为 X + YouTube 时 X 视频嵌入优先。
+
+注意：
+- `altSources` 的 URL 也参与查重——任一平台的 URL 再次提交 `pod_exists` / `submit-url` 都会命中现有 episode。
+- 转写、章节、音频只有一条时间轴（对齐主 `source` 的时长）。两平台时长差 <1% 可忽略。
+- 更新已发布 episode 的来源时，`source` 和 `altSources` 都是**整体替换**（同 `pod_update` 的语义）：改主来源时把原主来源挪进 `altSources`，服务端会同步刷新去重键 `source_url` 列。
 
 ## `processing` (required)
 

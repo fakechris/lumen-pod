@@ -839,18 +839,70 @@ export default function EpisodeDetail({ id }: { id: string }) {
     }
   }, []);
 
-  const youtubeId = useMemo(() => episode ? extractYouTubeId(episode.source.url) : null, [episode]);
-  const bilibiliId = useMemo(() => episode ? extractBilibiliId(episode.source.url) : null, [episode]);
-  const tweetId = useMemo(() => episode ? extractXTweetId(episode.source.url) : null, [episode]);
+  // Embed candidates are collected from ALL registered sources (primary +
+  // altSources), so an episode whose content lives on two platforms (e.g. X
+  // video + YouTube twin) can offer both embeds.
+  const embedCandidates = useMemo(() => {
+    if (!episode) return [];
+    type EmbedCandidate = { platform: "twitter" | "youtube" | "bilibili"; id: string; url: string; thumbnailUrl?: string };
+    const candidates: EmbedCandidate[] = [];
+    const urls = [episode.source.url, ...(episode.altSources ?? []).map((s) => s.url)];
+    for (const url of urls) {
+      const owner = url === episode.source.url ? episode.source : episode.altSources?.find((s) => s.url === url);
+      const yt = extractYouTubeId(url);
+      if (yt) { candidates.push({ platform: "youtube", id: yt, url, thumbnailUrl: owner?.thumbnailUrl ?? episode.source.thumbnailUrl }); continue; }
+      const bv = extractBilibiliId(url);
+      if (bv) { candidates.push({ platform: "bilibili", id: bv, url }); continue; }
+      const tw = extractXTweetId(url);
+      if (tw) candidates.push({ platform: "twitter", id: tw, url });
+    }
+    return candidates;
+  }, [episode]);
+
+  // Which embed renders first: the episode's explicit `embedPreference` when
+  // it matches an available candidate, otherwise the built-in order prefers
+  // the X video embed (twitter > youtube > bilibili).
+  const preferredEmbed = useMemo(() => {
+    if (embedCandidates.length === 0) return null;
+    const pref = episode?.embedPreference;
+    if (pref) {
+      const hit = embedCandidates.find((c) => c.platform === pref);
+      if (hit) return hit;
+    }
+    for (const p of ["twitter", "youtube", "bilibili"] as const) {
+      const hit = embedCandidates.find((c) => c.platform === p);
+      if (hit) return hit;
+    }
+    return embedCandidates[0];
+  }, [embedCandidates, episode?.embedPreference]);
+  const otherEmbeds = useMemo(
+    () => embedCandidates.filter((c) => c !== preferredEmbed),
+    [embedCandidates, preferredEmbed],
+  );
+
   const audioSources = useMemo(() => {
     if (!episode) return [];
     const { audioPaths, audioPath } = episode.source;
     return audioPaths && audioPaths.length > 0 ? audioPaths : audioPath ? [audioPath] : [];
   }, [episode]);
   const hasAudio = audioSources.length > 0;
-  const hasEmbed = !!(youtubeId || bilibiliId || tweetId);
+  const hasEmbed = embedCandidates.length > 0;
   const hasPlayer = hasAudio || hasEmbed;
-  const canSeek = hasAudio || !!youtubeId; // only audio & YouTube support programmatic seek
+  const canSeek = hasAudio || embedCandidates.some((c) => c.platform === "youtube"); // only audio & YouTube support programmatic seek
+
+  // Render one embed candidate. In audio mode the audio element is the seek
+  // timeline, so embeds render passively (no player handle); without audio,
+  // a YouTube embed drives seek/transcript sync via its own handle instead.
+  const renderEmbed = (c: typeof embedCandidates[number] | null, interactive: boolean, key?: string) => {
+    if (!c) return null;
+    if (c.platform === "youtube") {
+      return interactive
+        ? <YouTubePlayer key={key ?? c.id} videoId={c.id} thumbnailUrl={c.thumbnailUrl} autoActivate={ytAutoActivate} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />
+        : <YouTubePlayer key={key ?? c.id} videoId={c.id} thumbnailUrl={c.thumbnailUrl} />;
+    }
+    if (c.platform === "bilibili") return <BilibiliPlayer key={key ?? c.id} bvid={c.id} />;
+    return <XTweetEmbed key={key ?? c.id} tweetId={c.id} url={c.url} />;
+  };
 
   // Player block sticks on the three long-content tabs. Hoisted so the sticky
   // styling, the compact context bar offset and the TOC scroll-margin all use
@@ -997,6 +1049,11 @@ export default function EpisodeDetail({ id }: { id: string }) {
               />
             </span>
             <a href={episode.source.url} target="_blank" rel="noopener" className="text-blue-500 hover:underline ml-1">Source ↗</a>
+            {(episode.altSources ?? []).map((s) => (
+              <a key={s.url} href={s.url} target="_blank" rel="noopener" title={s.title || s.url} className="text-blue-500 hover:underline ml-1">
+                {platformIcons[s.platform] ?? platformIcons.default} {s.platform} ↗
+              </a>
+            ))}
             <span className="text-zinc-300 dark:text-zinc-600">|</span>
             <a href={getExportUrl(id, "markdown")} className="text-blue-500 hover:underline text-xs">📝 MD</a>
             <a href={getExportUrl(id, "srt")} className="text-blue-500 hover:underline text-xs">📄 SRT</a>
@@ -1184,25 +1241,38 @@ export default function EpisodeDetail({ id }: { id: string }) {
                       ))}
                     </div>
                   )}
-                  {(youtubeId || bilibiliId || tweetId) && (
+                  {hasEmbed && embedCandidates.length > 1 && (
+                    <>
+                      {/* Multi-source episode: the preferred embed (per
+                          embedPreference / X-first default) renders expanded
+                          under the audio timeline; the rest stay collapsed. */}
+                      {renderEmbed(preferredEmbed, false, "preferred")}
+                      {otherEmbeds.length > 0 && (
+                        <details className="text-sm">
+                          <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">其他来源嵌入</summary>
+                          <div className="mt-2">
+                            {otherEmbeds.map((c) => renderEmbed(c, false))}
+                          </div>
+                        </details>
+                      )}
+                    </>
+                  )}
+                  {hasEmbed && embedCandidates.length === 1 && (
                     <details className="text-sm">
                       <summary className="text-zinc-400 cursor-pointer hover:text-zinc-600">Show original embed</summary>
                       <div className="mt-2">
-                        {youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} />}
-                        {bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
-                        {tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
+                        {renderEmbed(preferredEmbed, false, "single")}
                       </div>
                     </details>
                   )}
                 </div>
               )}
 
-              {/* Embed-only players (no audio uploaded) */}
-              {!hasAudio && hasPlayer && (
+              {/* Embed-only players (no audio uploaded) — preferred embed first */}
+              {!hasAudio && hasEmbed && (
                 <div className="space-y-3">
-                  {youtubeId && <YouTubePlayer videoId={youtubeId} thumbnailUrl={episode.source.thumbnailUrl} autoActivate={ytAutoActivate} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />}
-                  {bilibiliId && <BilibiliPlayer bvid={bilibiliId} />}
-                  {tweetId && <XTweetEmbed tweetId={tweetId} url={episode.source.url} />}
+                  {preferredEmbed && renderEmbed(preferredEmbed, true, "preferred")}
+                  {otherEmbeds.map((c) => renderEmbed(c, true))}
                 </div>
               )}
 
