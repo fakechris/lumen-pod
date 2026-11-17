@@ -165,7 +165,7 @@ The shape is intentionally compatible with **lumen-cut**'s `Doc` (so you can pip
 - `paragraphs[].speaker` is `Option<String>`. Use the real name once you have mapped it (see `speaker-mapping.md`); before that, keep whatever the ASR gave you.
 - `paragraphs[].sentences[].id` is a `String` (not a number). Use `"s1"`, `"s2"`, ... or any unique string. Other fields (e.g. `highlights[].cueId`, translations) reference these ids.
 - `paragraphs[].sentences[].words[].start` / `end` are **seconds** (float, not MM:SS).
-- `translations` is a 2-level `BTreeMap` keyed by language code → sentence id → translation text. Skip if you are not generating a translation.
+- `translations` is a 2-level `BTreeMap` keyed by language code → **sentence id** → translation text (`{"zh": {"s1": {"text": "…"}}}`). Non-Chinese sources generate `zh` by default — the full batching/salvage/alignment pipeline lives in `references/translation.md`. The key set must align 1:1 with every sentence id or the translation is not written at all (never publish a half translation).
 
 ## `keywords` (optional)
 

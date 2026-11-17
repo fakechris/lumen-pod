@@ -123,6 +123,14 @@ After ASR, replace generic labels (`SPEAKER_00`, `Speaker A`) with real names wh
 
 Build the final `transcript` per the schema in `references/transcript-schema.md`.
 
+### 3d. Translate transcript (non-Chinese sources, default ON)
+
+`source.language` 非中文时，生成 `transcript.translations["zh"]`（句级中文对照，Transcript tab 的语言选择器与句级高亮同步已就绪）。完整流程——EpisodeContext（summary/speakers/术语表）先行、分批带上下文（24 句/2600 字符，context 前后 3/2 句）、`{"t":[{"id","text"}]}` 结构化输出、salvage 逐条兜底、只重问缺失 id、句尾标点恢复、**条数对齐校验（缺一句都不落库）**——见 `references/translation.md`。
+
+- 译文键是**句子的 `id`**（`"s1"`、`"s2"`…），每句一条；
+- 中文源不翻译；用户明确不要翻译或要求快速发布时跳过并说明；
+- 对齐校验不过 → 发布不含 translations 的 episode 并报告（可恢复补翻），绝不发布半个翻译。
+
 ## Step 4: Quality gates — fix BEFORE generating content
 
 Run all six gates from `references/quality-gates.md`. Summary (details and fix procedures live there):
