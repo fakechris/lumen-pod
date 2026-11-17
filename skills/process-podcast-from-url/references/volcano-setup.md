@@ -73,6 +73,44 @@ If your audio is local and the user has not provided a hosted URL, fall back to 
 
 For the 80% case where you have a 1-hour YouTube audio in `.wav` and you just want the transcript fast, **use the upload-via-`POST /api/v2/asr/upload` route** if your local network can reach `openspeech.bytedance.com` (most do).
 
+## ASR 上下文（`request.corpus`：背景 + 热词，专有名词纠偏）
+
+> 策略思路源自 SubCast `asr_context.rs`（AGPL-3.0）——仅借鉴策略，规则表自研重写，未复制代码。
+> 其真实案例：嘉宾「曾鸣」，无背景时 Whisper 写「曾敏」、Qwen3 写「曾明」，注入 show notes 后全部写对。
+
+提交任务前，从 episode 元数据构造背景并放进 `request.corpus`。豆包用它做**软引导**，专有名词命中率显著提升：
+
+```json
+"request": {
+  "corpus": {
+    "context": "{\"context_type\":\"dialog_ctx\",\"context_data\":[{\"text\":\"<背景文本>\"}],\"hotwords\":[{\"word\":\"曾鸣\"},{\"word\":\"Anthropic\"}]}"
+  }
+}
+```
+
+注意 `corpus.context` 的值是**序列化后的 JSON 字符串**（不是嵌套对象）。
+
+### 背景构造（预算 700 字符）
+
+1. 取材顺序：`标题` + `节目名`（"谁和什么"放最前）→ 原生章节标题（≤40 个）→ 简介按行；
+2. 每行清洗：去 HTML 标签 / URL / 邮箱 / emoji / `MM:SS` 时间戳 / `#话题` 的井号；HTML 实体还原；压缩空白；
+3. **锅炉房行整行丢弃**（对"说了什么"零信息量）：关注 / 订阅 / 转发 / 点赞 / 三连 / 投币 / 收藏 / 商务合作 / 合作联系 / 联系方式 / 微信 / 公众号 / 小红书 / 微博 / 抖音 / 赞助 / 广告 / 优惠 / 折扣 / 下载 / APP / 扫码 / 二维码 / 加群 / 入群 / 社群 / 版权 / 转载 / 免责 / follow / subscribe / sponsor / patreon / promo code / affiliate / business inquir / copyright / all rights / link in / instagram / twitter / facebook / tiktok / discord / spotify / apple podcasts（行内命中任一即丢）；
+4. 行内去重（按字母数字小写化比对）；纯符号/数字行丢弃；
+5. 拼装后超 700 字符 → 按"标题节目名 → 章节 → 简介行"的顺序截断。
+
+### 语言匹配（不匹配就不传）
+
+- 背景文字 CJK 占比 >15% 视为中文背景，否则英文背景；
+- **中文背景不配英文音频、英文背景不配中文音频**——错配会把识别往错误方向拉，此时**整体不传 `corpus`**（调用行为与从前完全一致）；音频语言不明时按标题语言。
+
+### hotwords（≤100 个）
+
+从背景里挑确实出现且易写错的人名 / 公司 / 产品 / 术语；长度限制：中文 2–10 字，其他 2–30 字。格式 `[{"word": "…"}]`。
+
+### 回声过滤（转写结果后处理）
+
+引擎在静音/音乐段可能**复读背景**。转写返回后：某行（≥8 个字母数字字符）与背景文本的字符 4-gram 重叠 ≥60% → 判为回声，删掉该行。
+
 ## Poll for the result
 
 ```
