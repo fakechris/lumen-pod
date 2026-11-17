@@ -2,7 +2,7 @@ use chrono::Utc;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use crate::episode::{ApiToken, Chapter, Episode, Invite, User, UserRole};
+use crate::episode::{ApiToken, Chapter, ContentKey, Episode, Invite, User, UserRole};
 use crate::error::{PodError, PodResult};
 
 /// Per-user list filtering/ordering for episode card queries.
@@ -96,6 +96,7 @@ impl Store {
         sqlx::query(
             "INSERT INTO episodes (
                 id, source_url, source, alt_sources, embed_preference,
+                content_keys,
                 processing, summary, chapters,
                 mindmap, transcript, keywords, highlights, qas, clips,
                 article, shownotes, is_read, tags, collection_id,
@@ -103,10 +104,11 @@ impl Store {
                 search_vector, created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5,
-                $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16,
-                $17, $18, $19, $20, $21,
-                to_tsvector('english', $22), $23, $24
+                $6,
+                $7, $8, $9, $10, $11,
+                $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, $21, $22,
+                to_tsvector('english', $23), $24, $25
             )",
         )
         .bind(&ep.id)
@@ -114,6 +116,7 @@ impl Store {
         .bind(serde_json::to_value(&ep.source)?)
         .bind(serde_json::to_value(&ep.alt_sources)?)
         .bind(&ep.embed_preference)
+        .bind(serde_json::to_value(&ep.content_keys)?)
         .bind(serde_json::to_value(&ep.processing)?)
         .bind(
             ep.summary
@@ -161,7 +164,7 @@ impl Store {
 
     pub async fn get_episode(&self, id: &str) -> PodResult<Episode> {
         let row = sqlx::query(
-            "SELECT source, alt_sources, embed_preference, processing, summary, chapters, mindmap, transcript,
+            "SELECT source, alt_sources, embed_preference, content_keys, processing, summary, chapters, mindmap, transcript,
                     keywords, highlights, qas, clips, article, shownotes,
                     is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
              FROM episodes WHERE id = $1",
@@ -187,7 +190,7 @@ impl Store {
     ) -> PodResult<Vec<Episode>> {
         let rows = if is_admin {
             sqlx::query(
-                "SELECT id, source, alt_sources, embed_preference, processing, summary, chapters, mindmap, transcript,
+                "SELECT id, source, alt_sources, embed_preference, content_keys, processing, summary, chapters, mindmap, transcript,
                         keywords, highlights, qas, clips, article, shownotes,
                         is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
                  FROM episodes ORDER BY created_at DESC LIMIT $1 OFFSET $2",
@@ -198,7 +201,7 @@ impl Store {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, source, alt_sources, embed_preference, processing, summary, chapters, mindmap, transcript,
+                "SELECT id, source, alt_sources, embed_preference, content_keys, processing, summary, chapters, mindmap, transcript,
                         keywords, highlights, qas, clips, article, shownotes,
                         is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
                  FROM episodes
@@ -250,6 +253,7 @@ impl Store {
             "SELECT e.id AS id, e.source AS source, e.processing AS processing,
                     e.summary AS summary, e.is_read AS is_read, e.tags AS tags,
                     e.alt_sources AS alt_sources, e.embed_preference AS embed_preference,
+                    e.content_keys AS content_keys,
                     e.collection_id AS collection_id, e.owner_id AS owner_id,
                     e.visibility AS visibility, e.created_at AS created_at,
                     e.updated_at AS updated_at
@@ -362,7 +366,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT id, source, processing, summary,
                     is_read, tags, collection_id, owner_id, visibility, created_at, updated_at,
-                    alt_sources, embed_preference
+                    alt_sources, embed_preference, content_keys
              FROM episodes WHERE id = ANY($1)",
         )
         .bind(ids.to_vec())
@@ -400,6 +404,12 @@ impl Store {
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default(),
             embed_preference: row.try_get("embed_preference").unwrap_or(None),
+            content_keys: row
+                .try_get::<Option<serde_json::Value>, _>("content_keys")
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
             processing: serde_json::from_value(row.get::<serde_json::Value, _>("processing"))?,
             summary: row
                 .get::<Option<serde_json::Value>, _>("summary")
@@ -725,7 +735,7 @@ impl Store {
 
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT source, alt_sources, embed_preference, processing, summary, chapters, mindmap, transcript,
+            "SELECT source, alt_sources, embed_preference, content_keys, processing, summary, chapters, mindmap, transcript,
                     keywords, highlights, qas, clips, article, shownotes,
                     is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
              FROM episodes WHERE id = $1 FOR UPDATE",
@@ -768,6 +778,12 @@ impl Store {
             } else {
                 v.as_str().filter(|s| !s.is_empty()).map(String::from)
             };
+        }
+        // Content dedup keys: whole-value replace (same semantics as altSources).
+        if let Some(v) = updates.get("contentKeys").or_else(|| updates.get("content_keys")) {
+            if let Ok(k) = serde_json::from_value(v.clone()) {
+                ep.content_keys = k;
+            }
         }
         if let Some(v) = updates.get("processing") {
             if let Ok(p) = serde_json::from_value(v.clone()) {
@@ -852,7 +868,8 @@ impl Store {
                 is_read = $16, tags = $17, collection_id = $18,
                 owner_id = $19, visibility = $20,
                 search_vector = to_tsvector('english', $21),
-                updated_at = $22
+                updated_at = $22,
+                content_keys = $24
              WHERE id = $23",
         )
         .bind(serde_json::to_value(&ep.source)?)
@@ -898,6 +915,7 @@ impl Store {
         .bind(&search_text)
         .bind(ep.updated_at)
         .bind(id)
+        .bind(serde_json::to_value(&ep.content_keys)?)
         .execute(&mut *tx)
         .await?;
 
@@ -1089,9 +1107,94 @@ impl Store {
         Ok(row.get::<bool, _>("exists"))
     }
 
+    /// Builds the OR-chain matching any of `keys` against `content_keys`
+    /// (one GIN-indexed containment clause per key) plus bind placeholders.
+    fn content_key_sql(keys: &[ContentKey], start_at: usize) -> (String, Vec<String>) {
+        let mut clauses = Vec::new();
+        let mut values = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            let n = start_at + i;
+            clauses.push(format!(
+                "content_keys @> jsonb_build_array(jsonb_build_object('type', ${n}::text, 'value', ${}::text))",
+                n + 1
+            ));
+            values.push(k.key_type.clone());
+            values.push(k.value.clone());
+        }
+        (clauses.join(" OR "), values)
+    }
+
+    /// Dedup check by URL (primary + alt sources) OR any content key — the
+    /// same episode republished under a different URL is caught by its
+    /// `guid` / `audio_sha1` even when neither URL is registered.
+    pub async fn episode_exists_by_url_or_keys(
+        &self,
+        url: &str,
+        keys: &[ContentKey],
+    ) -> PodResult<bool> {
+        let mut sql = String::from(
+            "SELECT EXISTS(
+                SELECT 1 FROM episodes
+                WHERE source_url = $1
+                   OR alt_sources @> jsonb_build_array(jsonb_build_object('url', $1))",
+        );
+        let mut binds = vec![url.to_string()];
+        if !keys.is_empty() {
+            let (key_sql, key_binds) = Self::content_key_sql(keys, 2);
+            sql.push_str(" OR (");
+            sql.push_str(&key_sql);
+            sql.push(')');
+            binds.extend(key_binds);
+        }
+        sql.push_str(") as exists");
+        let mut q = sqlx::query(&sql);
+        for b in &binds {
+            q = q.bind(b);
+        }
+        let row = q.fetch_one(&self.pool).await?;
+        Ok(row.get::<bool, _>("exists"))
+    }
+
+    /// Find by URL (primary + alt sources) OR any content key.
+    pub async fn find_episode_by_url_or_keys(
+        &self,
+        url: &str,
+        keys: &[ContentKey],
+    ) -> PodResult<Option<Episode>> {
+        let mut sql = String::from(
+            "SELECT id, source, alt_sources, embed_preference, content_keys, processing, summary, chapters, mindmap, transcript,
+                    keywords, highlights, qas, clips, article, shownotes,
+                    is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
+             FROM episodes
+             WHERE source_url = $1
+                OR alt_sources @> jsonb_build_array(jsonb_build_object('url', $1))",
+        );
+        let mut binds = vec![url.to_string()];
+        if !keys.is_empty() {
+            let (key_sql, key_binds) = Self::content_key_sql(keys, 2);
+            sql.push_str(" OR (");
+            sql.push_str(&key_sql);
+            sql.push(')');
+            binds.extend(key_binds);
+        }
+        sql.push_str(" LIMIT 1");
+        let mut q = sqlx::query(&sql);
+        for b in &binds {
+            q = q.bind(b);
+        }
+        let row = q.fetch_optional(&self.pool).await?;
+        match row {
+            Some(r) => {
+                let id: String = r.get("id");
+                Ok(Some(Self::row_to_episode(&id, &r)?))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub async fn find_episode_by_url(&self, url: &str) -> PodResult<Option<Episode>> {
         let row = sqlx::query(
-            "SELECT id, source, alt_sources, embed_preference, processing, summary, chapters, mindmap, transcript,
+            "SELECT id, source, alt_sources, embed_preference, content_keys, processing, summary, chapters, mindmap, transcript,
                     keywords, highlights, qas, clips, article, shownotes,
                     is_read, tags, collection_id, owner_id, visibility, created_at, updated_at
              FROM episodes
@@ -1909,6 +2012,12 @@ impl Store {
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default(),
             embed_preference: row.try_get("embed_preference").unwrap_or(None),
+            content_keys: row
+                .try_get::<Option<serde_json::Value>, _>("content_keys")
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
             processing: serde_json::from_value(row.get::<serde_json::Value, _>("processing"))?,
             summary: row
                 .get::<Option<serde_json::Value>, _>("summary")
@@ -2027,6 +2136,7 @@ mod tests {
                 audio_paths: Vec::new(),
             },
             alt_sources: Vec::new(),
+            content_keys: Vec::new(),
             embed_preference: None,
             processing: Processing {
                 status: ProcessingStatus::Done,
@@ -2184,6 +2294,7 @@ mod tests {
             },
             alt_sources: vec![],
             embed_preference: None,
+            content_keys: vec![],
             processing: Processing {
                 status: ProcessingStatus::Done,
                 asr_engine: None,
@@ -2400,6 +2511,69 @@ mod tests {
         assert!(store.episode_exists_by_url(&yt_url).await.unwrap());
         let refetched = store.find_episode_by_url(&yt_url).await.unwrap().unwrap();
         assert_eq!(refetched.id, ep.id);
+
+        store.delete_episode(&ep.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn content_keys_dedupe_same_content_across_urls() {
+        let store = test_store().await;
+        let mut ep = sample_episode();
+        ep.content_keys = vec![
+            ContentKey { key_type: "guid".into(), value: "podnews-261117".into() },
+            ContentKey { key_type: "audio_sha1".into(), value: "abc123def456".into() },
+        ];
+        store.insert_episode(&ep).await.unwrap();
+
+        // Roundtrip preserves the keys.
+        let loaded = store.get_episode(&ep.id).await.unwrap();
+        assert_eq!(loaded.content_keys.len(), 2);
+
+        // A different URL with the same guid OR the same audio sha1 hits the
+        // existing episode (INV-1910: same content under another URL).
+        let other_url = format!("https://other.example.com/{}", uuid::Uuid::new_v4().simple());
+        assert!(store
+            .episode_exists_by_url_or_keys(&other_url, &[ContentKey { key_type: "guid".into(), value: "podnews-261117".into() }])
+            .await
+            .unwrap());
+        assert!(store
+            .episode_exists_by_url_or_keys(&other_url, &[ContentKey { key_type: "audio_sha1".into(), value: "abc123def456".into() }])
+            .await
+            .unwrap());
+        let found = store
+            .find_episode_by_url_or_keys(&other_url, &[ContentKey { key_type: "guid".into(), value: "podnews-261117".into() }])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, ep.id);
+
+        // Different content must NOT hit: unknown keys + unknown URL.
+        assert!(!store
+            .episode_exists_by_url_or_keys(&other_url, &[ContentKey { key_type: "guid".into(), value: "another-episode".into() }])
+            .await
+            .unwrap());
+        assert!(!store
+            .episode_exists_by_url_or_keys(&other_url, &[])
+            .await
+            .unwrap());
+
+        // update_episode whole-value replaces keys: the old guid stops
+        // matching, the new one starts matching.
+        let updated = store
+            .update_episode(&ep.id, &serde_json::json!({
+                "contentKeys": [{"type": "guid", "value": "brand-new-guid"}]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(updated.content_keys.len(), 1);
+        assert!(!store
+            .episode_exists_by_url_or_keys(&other_url, &[ContentKey { key_type: "guid".into(), value: "podnews-261117".into() }])
+            .await
+            .unwrap());
+        assert!(store
+            .episode_exists_by_url_or_keys(&other_url, &[ContentKey { key_type: "guid".into(), value: "brand-new-guid".into() }])
+            .await
+            .unwrap());
 
         store.delete_episode(&ep.id).await.unwrap();
     }
