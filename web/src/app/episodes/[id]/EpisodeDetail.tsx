@@ -7,6 +7,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import PosterDialog, { type PosterData } from "./PosterDialog";
 import { getEpisode, updateEpisode, deleteEpisode, listCollections, createCollection, formatTimestamp, formatDuration, formatDate, getExportUrl, sendChatMessage, listChatMessages, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, setFavorite, setMyTags, reportEvents, listChatSessions, createChatSession, listSessionMessages, sendSessionMessage, renameChatSession, deleteChatSession, type ChatMsg, type ChatAnchor, type ChatSession, type BatchStatus } from "@/lib/api";
 import { normalizeMathDelimiters } from "@/lib/markdown";
 import { useAuth } from "@/lib/auth";
@@ -597,7 +598,7 @@ function TimestampMarkdown({
 
 type DeepReadState = Record<number, { loading: boolean; content?: string; error?: string; collapsed?: boolean }>;
 
-export default function EpisodeDetail({ id }: { id: string }) {
+export default function EpisodeDetail({ id, initialTime }: { id: string; initialTime?: number }) {
   const router = useRouter();
   const { user } = useAuth();
   const canEdit = Boolean(user?.role === "admin" || user?.can_edit);
@@ -838,6 +839,16 @@ export default function EpisodeDetail({ id }: { id: string }) {
       pendingSeekRef.current = null;
     }
   }, []);
+
+  // ?t= deep link: seek once after the episode loads. seekTo itself queues a
+  // pending seek (and auto-activates the YouTube embed) until the player is
+  // ready, so this fires exactly once and covers both player kinds.
+  const deepLinkDoneRef = useRef(false);
+  useEffect(() => {
+    if (!episode || deepLinkDoneRef.current || !initialTime) return;
+    deepLinkDoneRef.current = true;
+    seekTo(initialTime);
+  }, [episode, initialTime, seekTo]);
 
   // Embed candidates are collected from ALL registered sources (primary +
   // altSources), so an episode whose content lives on two platforms (e.g. X
@@ -2023,15 +2034,45 @@ function KeywordsTab({ episode }: { episode: Episode }) {
 }
 
 function HighlightsTab({ episode, seekTo, canSeek }: { episode: Episode; seekTo: (t: number) => void; canSeek: boolean }) {
-  if (episode.highlights.length === 0) return <EmptyState text="No highlights available" />;
+  const [poster, setPoster] = useState<PosterData | null>(null);
+  if (episode.highlights.length === 0 && episode.clips.length === 0) return <EmptyState text="No highlights available" />;
   return (
     <div className="space-y-3">
       {episode.highlights.map((h, i) => (
-        <div key={i} onClick={() => canSeek && seekTo(h.time)} className={`flex gap-4 p-4 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 ${canSeek ? "cursor-pointer" : ""} hover:border-amber-300 dark:hover:border-amber-700 hover:shadow-sm transition-all`}>
+        <div key={i} onClick={() => canSeek && seekTo(h.time)} className={`group flex gap-4 p-4 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 ${canSeek ? "cursor-pointer" : ""} hover:border-amber-300 dark:hover:border-amber-700 hover:shadow-sm transition-all`}>
           <div className="shrink-0"><span className="inline-block px-2 py-1 font-mono text-xs rounded-lg bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400">{formatTimestamp(h.time)}</span></div>
-          <div><p className="text-zinc-800 dark:text-zinc-200 font-medium">{h.content}</p>{h.note && <p className="mt-1 text-sm text-zinc-500 italic">{h.note}</p>}</div>
+          <div className="flex-1 min-w-0"><p className="text-zinc-800 dark:text-zinc-200 font-medium">{h.content}</p>{h.note && <p className="mt-1 text-sm text-zinc-500 italic">{h.note}</p>}</div>
+          <button
+            title="生成分享海报"
+            onClick={(e) => { e.stopPropagation(); setPoster({ text: h.content, time: h.time }); }}
+            className="shrink-0 self-start opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity text-zinc-400 hover:text-amber-500"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="w-5 h-5"><path d="M4 12v8a2 2 0 002 2h12a2 2 0 002-2v-8" /><polyline points="16 6 12 2 8 6" /><line x1="12" y1="2" x2="12" y2="15" /></svg>
+          </button>
         </div>
       ))}
+      {episode.clips.length > 0 && (
+        <>
+          <p className="pt-2 text-sm font-semibold text-zinc-500">Clips</p>
+          {episode.clips.map((c) => (
+            <div key={c.id} onClick={() => canSeek && seekTo(c.clipStart)} className={`group flex gap-4 p-4 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 ${canSeek ? "cursor-pointer" : ""} hover:border-amber-300 dark:hover:border-amber-700 hover:shadow-sm transition-all`}>
+              <div className="shrink-0"><span className="inline-block px-2 py-1 font-mono text-xs rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400">{formatTimestamp(c.clipStart)}–{formatTimestamp(c.clipEnd)}</span></div>
+              <div className="flex-1 min-w-0">
+                <p className="text-zinc-800 dark:text-zinc-200 font-medium">{c.title}</p>
+                {c.takeaways.length > 0 && <p className="mt-1 text-sm text-zinc-500">{c.takeaways.join(" · ")}</p>}
+              </div>
+              <button
+                title="生成分享海报"
+                onClick={(e) => { e.stopPropagation(); setPoster({ text: c.takeaways.length > 0 ? c.takeaways[0] : c.title, time: c.clipStart, label: c.title }); }}
+                className="shrink-0 self-start opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity text-zinc-400 hover:text-amber-500"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="w-5 h-5"><path d="M4 12v8a2 2 0 002 2h12a2 2 0 002-2v-8" /><polyline points="16 6 12 2 8 6" /><line x1="12" y1="2" x2="12" y2="15" /></svg>
+              </button>
+            </div>
+          ))}
+        </>
+      )}
+      <PosterDialog episode={episode} data={poster} onClose={() => setPoster(null)} />
     </div>
   );
 }

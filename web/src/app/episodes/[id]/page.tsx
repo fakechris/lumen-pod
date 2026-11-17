@@ -3,17 +3,25 @@ import EpisodeDetail from "./EpisodeDetail";
 
 async function EpisodeContent({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const { id } = await params;
-  return <EpisodeDetail id={id} />;
+  const sp = await searchParams;
+  // ?t=<seconds> deep link (INV-1914): seek there once the player is ready.
+  const raw = Array.isArray(sp?.t) ? sp?.t[0] : sp?.t;
+  const t = Number.parseFloat(typeof raw === "string" ? raw : "");
+  return <EpisodeDetail id={id} initialTime={Number.isFinite(t) && t > 0 ? t : undefined} />;
 }
 
 export default function EpisodePage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   return (
     <Suspense
@@ -23,7 +31,7 @@ export default function EpisodePage({
         </div>
       }
     >
-      <EpisodeContent params={params} />
+      <EpisodeContent params={params} searchParams={searchParams} />
     </Suspense>
   );
 }
