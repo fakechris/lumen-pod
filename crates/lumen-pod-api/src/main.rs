@@ -4044,7 +4044,7 @@ mod tests {
                 podcast_name: None, episode_cover_url: None, language: None,
                 audio_path: None, audio_paths: vec![],
             },
-            alt_sources: vec![], embed_preference: None,
+            alt_sources: vec![], embed_preference: None, content_keys: vec![],
             processing: lumen_pod_core::episode::Processing {
                 status: lumen_pod_core::episode::ProcessingStatus::Done,
                 asr_engine: None, llm_model: None, processed_at: None, agent_id: None, error: None,
@@ -4113,7 +4113,7 @@ mod tests {
                 podcast_name: None, episode_cover_url: None, language: None,
                 audio_path: None, audio_paths: vec![],
             },
-            alt_sources: vec![], embed_preference: None,
+            alt_sources: vec![], embed_preference: None, content_keys: vec![],
             processing: lumen_pod_core::episode::Processing {
                 status: lumen_pod_core::episode::ProcessingStatus::Done,
                 asr_engine: None, llm_model: None, processed_at: None, agent_id: None, error: None,
