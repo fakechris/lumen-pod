@@ -111,20 +111,26 @@ fn tools() -> Vec<Value> {
             "Delete an episode by id.",
             &["id"],
         ),
-        tool(
+        tool_opt(
             "pod_exists",
-            "Check if an episode with the given source URL already exists.",
+            "Check if an episode already exists: by source URL (required), and optionally by content \
+             dedup keys — pass `guid` (RSS item guid) and/or `sha1` (sha1 of the downloaded audio) to \
+             also catch the same episode published under a different URL. \
+             Returns {\"exists\": true|false}.",
             &["url"],
+            &["guid", "sha1"],
         ),
         tool(
             "pod_update",
             "Update an existing episode's fields. Pass the episode id and a JSON string with only the fields to update.\n\n\
-             Supported top-level fields: source, altSources, embedPreference, processing, transcript, summary, chapters, mindmap, keywords, highlights, qas, clips, article, shownotes, isRead, tags, collectionId.\n\n\
+             Supported top-level fields: source, altSources, embedPreference, contentKeys, processing, transcript, summary, chapters, mindmap, keywords, highlights, qas, clips, article, shownotes, isRead, tags, collectionId.\n\n\
              To set the audio path after uploading via REST API:\n\
              {\"source\": {\"audioPath\": \"/audio/<episode_id>.mp3\", ...keep other source fields}}\n\n\
-             `source` and `altSources` are whole-value replaces (re-send the full object/array); \
+             `source`, `altSources` and `contentKeys` are whole-value replaces (re-send the full object/array); \
              switching `source.url` also re-syncs the dedupe key. `embedPreference` names the platform \
              whose embed renders first (e.g. \"twitter\"), or null to clear.\n\n\
+             `contentKeys` dedupes the same content under another URL, e.g. \
+             [{\"type\":\"guid\",\"value\":\"<rss item guid>\"},{\"type\":\"audio_sha1\",\"value\":\"<sha1>\"}].\n\n\
              Both camelCase and snake_case field names are accepted.",
             &["id", "updates_json"],
         ),
@@ -142,8 +148,14 @@ fn tools() -> Vec<Value> {
 }
 
 fn tool(name: &str, desc: &str, required: &[&str]) -> Value {
+    tool_opt(name, desc, required, &[])
+}
+
+/// Like [`tool`] but with additional optional string parameters.
+fn tool_opt(name: &str, desc: &str, required: &[&str], optional: &[&str]) -> Value {
     let props: Value = required
         .iter()
+        .chain(optional.iter())
         .map(|p| (p.to_string(), json!({"type":"string"})))
         .collect();
     json!({
@@ -256,7 +268,16 @@ async fn call_tool(
                 .get("url")
                 .and_then(|v| v.as_str())
                 .ok_or("missing url")?;
-            let exists = store.episode_exists_by_url(url).await?;
+            // Optional content dedup keys (INV-1910): same episode under
+            // another URL still hits when guid / audio sha1 matches.
+            let mut keys: Vec<lumen_pod_core::episode::ContentKey> = Vec::new();
+            if let Some(g) = args.get("guid").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                keys.push(lumen_pod_core::episode::ContentKey { key_type: "guid".into(), value: g.to_string() });
+            }
+            if let Some(s) = args.get("sha1").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                keys.push(lumen_pod_core::episode::ContentKey { key_type: "audio_sha1".into(), value: s.to_string() });
+            }
+            let exists = store.episode_exists_by_url_or_keys(url, &keys).await?;
             Ok(json!({"exists": exists}).to_string())
         }
         "pod_update" => {

@@ -30,6 +30,8 @@ Call `pod_exists` with the source URL. If the response is `{"exists": true}`, st
 - title and author (from `pod_list` or `pod_get`)
 - a link to view it
 
+播客单集还知道 RSS `<guid>` 或已下载音频的 sha1 时，把它们一并传入（`pod_exists` 支持 `guid` / `sha1` 可选参数）——同一集换 URL 分发也会被内容键命中。
+
 Do not re-process. Do not ask the user to confirm.
 
 ## Step 1: Extract metadata and try subtitle fast track
@@ -224,6 +226,10 @@ Build the full `Episode` JSON per `references/transcript-schema.md`. Set:
 - `processing.processedAt = <ISO-8601 now>`
 - `isRead = false`
 - `visibility = "public"` (or `"private"` if the user asked)
+- `contentKeys`（内容键去重，INV-1910 语义）：有就登记，让同集异 URL 的重复提交被拦下——
+  - 播客单集：`{"type": "guid", "value": "<RSS item guid>"}`（feed 里 `<guid>` 的文本）；
+  - 下载过音频：`{"type": "audio_sha1", "value": "<sha1>"}`，用 `shasum -a 1 /tmp/lumen-pod/<ID>.<ext> | awk '{print $1}'` 计算（**发布上传前的原始文件**，不是 16k 转码 wav）；
+  - 形如 `contentKeys: [{"type":"guid","value":"..."},{"type":"audio_sha1","value":"..."}]`，整体替换语义（`pod_update` 同字段名）。
 
 Publish via MCP:
 ```

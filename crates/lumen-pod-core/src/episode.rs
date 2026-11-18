@@ -26,6 +26,12 @@ pub struct Episode {
     /// (twitter > youtube > bilibili).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embed_preference: Option<String>,
+    /// Content dedup keys: the same episode distributed under another URL
+    /// (multi-platform podcasts, guid vs page link) still hits the existing
+    /// episode via any registered key. Known key types: `guid` (RSS item
+    /// guid) and `audio_sha1` (sha1 of the downloaded audio).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_keys: Vec<ContentKey>,
     pub processing: Processing,
 
     // ---- AI-generated content sections (tabs in UI) ----
@@ -91,6 +97,18 @@ pub struct ApiToken {
 }
 
 // ---- Source metadata ----
+
+/// A content dedup key — `pod_exists` / `submit-url` / `lookup` match on any
+/// registered key, so republishing the same content under a different URL is
+/// caught even when neither URL is registered as a source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentKey {
+    /// Key namespace, e.g. "guid" | "audio_sha1".
+    #[serde(rename = "type")]
+    pub key_type: String,
+    pub value: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

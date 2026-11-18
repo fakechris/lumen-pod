@@ -174,3 +174,10 @@ CREATE INDEX IF NOT EXISTS idx_invites_email ON invites(email);
 ALTER TABLE episodes ADD COLUMN IF NOT EXISTS alt_sources JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE episodes ADD COLUMN IF NOT EXISTS embed_preference TEXT;
 CREATE INDEX IF NOT EXISTS idx_episodes_alt_sources ON episodes USING GIN (alt_sources jsonb_path_ops);
+
+-- Migration: content dedup keys (INV-1910). The same episode under another URL
+-- (multi-platform distribution, RSS guid vs page link) is caught by any
+-- registered key (`guid:<rss item guid>`, `audio_sha1:<sha1 of the audio>`)
+-- via JSONB containment — same pattern as alt_sources above.
+ALTER TABLE episodes ADD COLUMN IF NOT EXISTS content_keys JSONB NOT NULL DEFAULT '[]'::jsonb;
+CREATE INDEX IF NOT EXISTS idx_episodes_content_keys ON episodes USING GIN (content_keys jsonb_path_ops);

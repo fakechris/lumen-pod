@@ -1491,6 +1491,10 @@ struct SubmitUrlRequest {
     url: String,
     title: Option<String>,
     visibility: Option<String>,
+    /// Content dedup keys (INV-1910): the same episode under another URL is
+    /// rejected as a duplicate when any key (`guid` / `audio_sha1`) matches.
+    #[serde(default)]
+    content_keys: Vec<lumen_pod_core::episode::ContentKey>,
 }
 
 async fn submit_url(
@@ -1522,10 +1526,10 @@ async fn submit_url(
             .into_response();
     }
 
-    if let Ok(true) = state.store.episode_exists_by_url(&url).await {
+    if let Ok(true) = state.store.episode_exists_by_url_or_keys(&url, &req.content_keys).await {
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "episode with this URL already exists"})),
+            Json(serde_json::json!({"error": "episode with this URL or content key already exists"})),
         )
             .into_response();
     }
@@ -1553,6 +1557,7 @@ async fn submit_url(
         },
         alt_sources: vec![],
         embed_preference: None,
+        content_keys: req.content_keys.clone(),
         processing: lumen_pod_core::episode::Processing {
             status: lumen_pod_core::episode::ProcessingStatus::Pending,
             asr_engine: None,
@@ -1624,7 +1629,11 @@ fn detect_platform(url: &str) -> String {
 
 #[derive(Deserialize)]
 struct LookupParams {
-    url: String,
+    url: Option<String>,
+    /// Content dedup keys (INV-1910): either matches an existing episode
+    /// even under a different URL. At least one of url/guid/sha1 is required.
+    guid: Option<String>,
+    sha1: Option<String>,
 }
 
 async fn lookup_episode_by_url(
@@ -1636,13 +1645,20 @@ async fn lookup_episode_by_url(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let url = params.url.trim().to_string();
-    if url.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "url parameter required"}))).into_response();
+    let url = params.url.as_deref().map(str::trim).unwrap_or("").to_string();
+    let mut keys: Vec<lumen_pod_core::episode::ContentKey> = Vec::new();
+    if let Some(g) = params.guid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        keys.push(lumen_pod_core::episode::ContentKey { key_type: "guid".into(), value: g.to_string() });
+    }
+    if let Some(s) = params.sha1.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        keys.push(lumen_pod_core::episode::ContentKey { key_type: "audio_sha1".into(), value: s.to_string() });
+    }
+    if url.is_empty() && keys.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "at least one of url / guid / sha1 is required"}))).into_response();
     }
 
-    // Try exact URL match first
-    match state.store.find_episode_by_url(&url).await {
+    // Try URL (primary + alt sources) or any content key
+    match state.store.find_episode_by_url_or_keys(&url, &keys).await {
         Ok(Some(mut ep)) if viewer.can_view_episode(&ep) => {
             ep.is_read = state
                 .store
@@ -3816,7 +3832,7 @@ mod tests {
                 feed_url: None, description: None, podcast_name: None, episode_cover_url: None,
                 language: None, audio_path: None, audio_paths: vec![],
             },
-            alt_sources: vec![], embed_preference: None,
+            alt_sources: vec![], embed_preference: None, content_keys: vec![],
             processing: lumen_pod_core::episode::Processing {
                 status: lumen_pod_core::episode::ProcessingStatus::Done,
                 asr_engine: None, llm_model: None, processed_at: None, agent_id: None, error: None,
@@ -3974,6 +3990,7 @@ mod tests {
             },
             alt_sources: vec![],
             embed_preference: None,
+            content_keys: vec![],
             processing: Processing {
                 status: ProcessingStatus::Done,
                 asr_engine: None,
