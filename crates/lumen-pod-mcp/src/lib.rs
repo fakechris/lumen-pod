@@ -129,12 +129,9 @@ fn tools() -> Vec<Value> {
              `source`, `altSources` and `contentKeys` are whole-value replaces (re-send the full object/array); \
              switching `source.url` also re-syncs the dedupe key. `embedPreference` names the platform \
              whose embed renders first (e.g. \"twitter\"), or null to clear.\n\n\
-<<<<<<< HEAD
              `contentKeys` dedupes the same content under another URL, e.g. \
              [{\"type\":\"guid\",\"value\":\"<rss item guid>\"},{\"type\":\"audio_sha1\",\"value\":\"<sha1>\"}].\n\n\
-=======
              To backfill translations for a published episode: pod_get the transcript, add \"translations\": {\"zh\": {\"s1\": {\"text\": \"…\"}}} keyed by sentence id (see the skill's references/translation.md), and pod_update the whole transcript object.\n\n\
->>>>>>> origin/feat/inv-1909-transcript-translations
              Both camelCase and snake_case field names are accepted.",
             &["id", "updates_json"],
         ),
