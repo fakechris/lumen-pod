@@ -39,11 +39,19 @@ python3 scripts/thumbnail.py extract /tmp/lumen-pod/<ID>.mp4 -o /tmp/lumen-pod/<
 - 抽到的帧在 **Step 7 发布后**上传：`POST /api/episodes/<id>/thumbnail`（Bearer 认证，裸字节流 jpg/png/webp ≤10MB，同音频上传风格），成功后 `source.thumbnailUrl` 自动指向 `/static/thumbs/<id>.jpg`。
 - 播客纯音频（无视频）：无封面可抽是正常的，保持平台缩略图或空，不算 G2 失败。
 
-## G3 转写完整性
+## G3 转写完整性（含幻觉过滤）
 
 - `max(sentence.end)`（转写覆盖时长）与 info.json `duration` 偏差 > 10% → ASR 被截断，重跑转写；
 - 文本量 sanity：中文 ≥ 120 字/分钟、英文 ≥ 90 词/分钟，明显低于此值大概率截断或空转；
 - 0 转写 = 硬失败，走 skill 的失败处理（不发布）。
+
+**入库前删除以下三类噪声句**（Whisper 系引擎的已知失败模式；删除条数记入 G3 报告）：
+
+1. **幻觉黑名单行**：行文本含 `谢谢观看` / `感谢观看` / `请不吝点赞` / `字幕由` / `字幕by` / `thanks for watching` / `thank you for watching` / `subtitles by` / `amara.org` 任一，**且**该句时长 < 4s 且 < 30 字符 → 删（短促的黑名单命中几乎必是静音/音乐段的编造；长句可能是正文真实讨论字幕制作，不删）；
+2. **相邻完全重复行**：与前一句文本完全相同（引擎卡住复读）→ 保留第一句，删后续；
+3. **音乐/掌声括注行**：整句仅为 `♪` / `[Music]` / `(applause)` / `[Laughter]` 等括注 → 删。
+
+删除后重新按覆盖时长判定一次（幻觉行通常也拉偏覆盖）。正常正文不得误删——黑名单词出现在 >30 字符或 >4s 的句子里时保留。
 
 ## G4 说话人标签
 

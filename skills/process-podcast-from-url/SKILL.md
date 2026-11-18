@@ -132,7 +132,7 @@ This produces `/tmp/lumen-pod/<ID>.json` (lumen-cut `Doc` format with `paragraph
 
 ### 3b. Volcengine Doubao ASR (only if 3a failed or user asked for cloud)
 
-Follow `references/volcano-setup.md` to call the Doubao 录音文件识别 2.0 endpoint (`volc.seedasr.auc`). Convert the response to lumen-pod `Transcript`. Set `processing.asrEngine = "volcengine-doubao-v2"`.
+Follow `references/volcano-setup.md` to call the Doubao 录音文件识别 2.0 endpoint (`volc.seedasr.auc`). **提交前按 §ASR 上下文 构造 `request.corpus`（背景 + hotwords，专有名词纠偏）并做语言匹配；转写返回后跑回声过滤。** Convert the response to lumen-pod `Transcript`. Set `processing.asrEngine = "volcengine-doubao-v2"`.
 
 ### 3c. Map real speaker names
 
@@ -154,7 +154,7 @@ Run all six gates from `references/quality-gates.md`. Summary (details and fix p
 
 - **G1 标题匹配**：`source.title` 必须概括转写内容；营销号式/答非所问的标题要重写（≤60 字），原标题以 `> 原标题：...` 前置进 shownotes。
 - **G2 封面**：`python3 scripts/thumbnail.py check "<thumbnailUrl>"`。判黑或缺图且有视频文件时，`extract` 跳过片头黑帧抽一帧备用（发布后上传，见 Step 7）。
-- **G3 转写完整**：转写覆盖时长 vs `duration` 偏差 >10%，或文本量 sanity 不达标 → 重跑转写。
+- **G3 转写完整（含幻觉过滤）**：转写覆盖时长 vs `duration` 偏差 >10%，或文本量 sanity 不达标 → 重跑转写；入库前删除幻觉黑名单行/相邻重复行/音乐括注行（细则见 quality-gates.md G3）。
 - **G4 说话人**：无 `SPEAKER_00` 残留。
 - **G5 时间戳**：`[MM:SS]` / `[H:MM:SS]` 规范，无前导零小时；highlights 用句级时间。
 - **G6 媒体完整**：文件非 0 字节，`ffprobe` 时长与 `duration` 偏差 <5%。
