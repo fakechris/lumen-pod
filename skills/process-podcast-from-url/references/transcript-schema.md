@@ -167,6 +167,54 @@ The shape is intentionally compatible with **lumen-cut**'s `Doc` (so you can pip
 - `paragraphs[].sentences[].words[].start` / `end` are **seconds** (float, not MM:SS).
 - `translations` is a 2-level `BTreeMap` keyed by language code → **sentence id** → translation text (`{"zh": {"s1": {"text": "…"}}}`). Non-Chinese sources generate `zh` by default — the full batching/salvage/alignment pipeline lives in `references/translation.md`. The key set must align 1:1 with every sentence id or the translation is not written at all (never publish a half translation).
 
+## Official transcript formats (`podcast:transcript`)
+
+Podcasting 2.0 feeds advertise official transcripts per `<item>` as `<podcast:transcript url="..." type="..." rel="captions|captions_verified"/>`. Three formats appear in the wild — all convert to the shape above with **one sentence per cue, one Word per cue** (the Word carries the cue's start/end so sentence timing stays exact):
+
+### `text/vtt` (WebVTT)
+
+```
+WEBVTT
+
+00:00:04.730 --> 00:00:06.360
+Gamut Podcast Network.
+```
+
+- Cue line is `HH:MM:SS.mmm --> HH:MM:SS.mmm` (times are absolute; the `MM:SS.mmm` short form also occurs — treat missing hours as 0). Convert to **seconds**.
+- Strip `WEBVTT` headers, NOTE blocks, `<v Speaker>` voice tags (capture the name into `paragraphs[].speaker` when present) and inline tags (`<c>`, `<i>`, `&amp;` entities).
+- Merge consecutive cues into one sentence while the text clearly continues (cue ends without sentence punctuation and the next cue starts lowercase); keep each cue's own timing on its Word.
+
+### `text/srt` (SubRip)
+
+```
+1
+00:00:04,730 --> 00:00:06,360
+Gamut Podcast Network.
+```
+
+Same as VTT except: a numeric index line precedes each cue and the millisecond separator is a **comma**. Drop the index lines; stripping, merging and timing are identical.
+
+### `application/json` (Podcasting 2.0 JSON transcript)
+
+```json
+{
+  "version": "1.0.0",
+  "segments": [
+    {"startTime": 4.73, "endTime": 6.36, "body": "Gamut Podcast Network.", "speaker": "Host"}
+  ]
+}
+```
+
+- `segments[].startTime` / `endTime` are already **seconds** (float); `body` is the text, `speaker` is optional.
+- No merging needed — segments are usually already sentence-sized.
+
+### Conversion rules (all three formats)
+
+1. Cue → `Sentence { id: "s<N>", text, words: [one Word with the cue's start/end] }`. Do not fabricate per-word timing — one Word per cue is exact and sufficient (the Web UI seeks on sentence-level timestamps).
+2. Sentences → paragraphs: break at a pause ≥2s between cues or at a ~30s window; a speaker change also breaks the paragraph.
+3. Empty / music-only cues (`♪`, `[Music]`, `(applause)`) are dropped; adjacent duplicate cues (a stuck generator repeating itself) keep only the first.
+4. Then run **G3** against `source.duration` as usual (>10% deviation → discard, fall back to the ASR path).
+
 ## `keywords` (optional)
 
 ```json

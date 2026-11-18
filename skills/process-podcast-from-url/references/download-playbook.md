@@ -40,6 +40,21 @@ yt-dlp 对 B 站经常被 412（风控）。按序尝试：
 
 ### 小宇宙 / 播客 RSS
 - 页面或 RSS 里的 `mediaUrl`（如 `media.xyzcdn.net/*.m4a`）是直链，直接 `curl -L` 或 yt-dlp 均可，无需登录。
+- **先探 `podcast:transcript` 再下载音频**（SKILL.md Step 1a）：feed 里带官方转写标签时整段音频+ASR 都省掉。
+
+#### 播客 feed 发现与抓取要点
+| 来源 | feed 怎么找 |
+|---|---|
+| 已知 feedUrl | `source.feedUrl` 直接用 |
+| 小宇宙单集页 | 页面 HTML 引用节目 RSS（多为 `feed.xyzfm.space/<id>`）；或 yt-dlp info JSON 里的 feed 字段 |
+| Apple Podcasts | `https://itunes.apple.com/lookup?id=<podcastId>&entity=podcast` → `feedUrl`（无登录、无限流，缓存 24h） |
+| 裸 RSS 链接 | 直接当 feed 用 |
+
+抓取约定：
+- 统一 `curl -sL -A "Mozilla/5.0 (compatible)"`；feed 可能是 gzip（`--compressed`）；
+- 大 feed（几百 item）先落盘再 grep 目标 `<item>`（匹配 `<guid>` 或单集 link），不要管道全量解析；
+- 单 feed 一轮抓取内只请求一次，避免限速；`ETag`/`Last-Modified` 可用于幂等重跑；
+- transcript 文件（VTT/SRT/JSON）同 UA 直链下载，失败一次即放弃走 ASR 路径，不重试硬啃。
 
 ### 抖音 / 视频号 / 小红书 / 小鹅通（仅当有浏览器环境时）
 这类平台的 CDN 直链带签名和 Referer 校验，无头环境不要硬啃；有浏览器时可参考乔木的思路——从播放器 DOM 的 `video.currentSrc` 或 Performance Resource Timing 里捞已签名直链，交给 helper 用 `Referer: <页面URL> + 浏览器 UA` 抓取。lumen-pod 的 agent 场景默认不做，遇到就明确报告"该平台需要浏览器环境"。

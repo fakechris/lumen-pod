@@ -72,6 +72,21 @@ If a subtitle file was written (`.json3`/`.vtt`/`.srt`), parse it into the lumen
 
 If no usable subtitle, continue to Step 2.
 
+### Step 1a: Podcast official transcript fast track（podcast:transcript）
+
+For **podcast** URLs (`platform` is `xiaoyuzhou`, `apple`, or `other` with an RSS/audio direct link), probe the feed for a Podcasting 2.0 `podcast:transcript` tag **before downloading any audio**. Many shows publish official transcripts (VTT/SRT/JSON with cue-level timing) — using one skips Steps 2–3 entirely and is usually better quality than local ASR.
+
+1. **Find the feed**: use `source.feedUrl` when present. Otherwise: 小宇宙 episode pages reference the show's RSS (usually `feed.xyzfm.space/<id>` — grep the page HTML or the yt-dlp info JSON for it); Apple podcast URLs resolve via the iTunes lookup API (`https://itunes.apple.com/lookup?id=<podcastId>&entity=podcast` → `feedUrl`); a bare feed URL is used directly. See `references/download-playbook.md` §2 Podcast feeds.
+2. **Probe the item**: `curl -sL -A "Mozilla/5.0 (compatible)" <feed-url>`, locate the `<item>` matching the target episode (match `<guid>` or the episode link), and look inside it for:
+   ```xml
+   <podcast:transcript url="https://.../x.vtt" type="text/vtt" rel="captions"/>
+   ```
+   Prefer `rel="captions_verified"` over `rel="captions"`; when several languages exist, pick the one matching the audio language.
+3. **Download & parse**: save to `/tmp/lumen-pod/<ID>.transcript.<vtt|srt|json>` and convert to the lumen-pod `Transcript` shape per `references/transcript-schema.md` §Official transcript formats (one sentence per cue, one Word per cue carrying start/end; group cues into paragraphs at ≥2s pauses or ~30s windows).
+4. Set `processing.asrEngine = "podcast-transcript"`. Speaker names are usually absent — Step 3c speaker mapping still applies.
+5. **G3 applies unchanged** (`references/quality-gates.md`): if covered duration deviates >10% from `source.duration`, or text volume fails the sanity check, discard the official transcript and continue to Step 2 (download + ASR). Never publish a half transcript.
+6. A usable official transcript **skips Steps 2–3** (whether to still download and upload audio is decided later at publish time). No tag / fetch failure / failed G3 → continue to Step 2 exactly as before; nothing changes for feeds without transcripts.
+
 ### Step 1b: Multi-source episodes（同内容双平台合并）
 
 同一内容常在 X 和 YouTube 各发一份（X 版可嵌入但元数据贫瘠；YouTube 版标题/简介/原生章节/字幕完整）。用户同时给出两个 URL、或你在处理中发现 twin 时，按下面的规则合并成**一条** episode：
