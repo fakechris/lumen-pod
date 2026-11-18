@@ -31,6 +31,15 @@ pub struct Store {
     >,
 }
 
+    /// A "continue listening" card: the episode plus where to resume.
+    #[derive(Debug, Clone, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ContinueListeningItem {
+        pub episode: Episode,
+        /// Seconds into the episode where the user left off.
+        pub resume_at: f64,
+    }
+
 impl Store {
     pub async fn new(database_url: &str) -> PodResult<Self> {
         let pool = PgPoolOptions::new()
@@ -598,6 +607,50 @@ impl Store {
     }
 
     /// Favorite episode ids for a user, newest first.
+    /// Latest `play_progress` per episode for the user, filtered to episodes
+    /// worth resuming (started >= 30s, not >= 95% finished). Consumes the
+    /// behavioral event stream written by INV-1635.
+    pub async fn continue_listening(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> PodResult<Vec<ContinueListeningItem>> {
+        let rows = sqlx::query(
+            "SELECT e.id AS id, e.source AS source, e.processing AS processing,                     e.summary AS summary, e.is_read AS is_read, e.tags AS tags,                     e.alt_sources AS alt_sources, e.embed_preference AS embed_preference,                                          e.collection_id AS collection_id, e.owner_id AS owner_id,                     e.visibility AS visibility, e.created_at AS created_at,                     e.updated_at AS updated_at, ev.payload AS payload              FROM (SELECT DISTINCT ON (episode_id) episode_id, payload, created_at                    FROM user_events                    WHERE user_id = $1 AND event_type = 'play_progress'                    ORDER BY episode_id, created_at DESC) ev              JOIN episodes e ON e.id = ev.episode_id              WHERE (e.visibility = 'public' OR e.owner_id = $1)                AND (e.source->>'duration')::float8 > 0              ORDER BY ev.created_at DESC              LIMIT $2",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let episode = Self::row_to_episode_card(&row)?;
+            let duration = episode.source.duration;
+            let payload: Option<serde_json::Value> =
+                row.try_get::<Option<serde_json::Value>, _>("payload").ok().flatten();
+            // Absolute seconds when the event carries it (newer events);
+            // fall back to percent x duration for the older progressPct-only events.
+            let resume_at = payload
+                .as_ref()
+                .and_then(|p| p.get("time"))
+                .and_then(|v| v.as_f64())
+                .or_else(|| {
+                    payload
+                        .as_ref()
+                        .and_then(|p| p.get("progressPct"))
+                        .and_then(|v| v.as_f64())
+                        .map(|pct| duration * pct / 100.0)
+                })
+                .unwrap_or(0.0);
+            if resume_at < 30.0 || resume_at > duration * 0.95 {
+                continue;
+            }
+            out.push(ContinueListeningItem { episode, resume_at });
+        }
+        Ok(out)
+    }
+
     pub async fn list_user_favorite_ids(&self, user_id: &str) -> PodResult<Vec<String>> {
         let rows = sqlx::query(
             "SELECT episode_id FROM user_favorites WHERE user_id = $1
@@ -2576,6 +2629,53 @@ mod tests {
             .unwrap());
 
         store.delete_episode(&ep.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn continue_listening_filters_and_resumes_latest_progress() {
+        let store = test_store().await;
+        let uid = format!("u-{}", uuid::Uuid::new_v4().simple());
+
+        // Mid-episode episode: resumed with the latest absolute time.
+        let mut ep = sample_episode();
+        ep.source.duration = 1000.0;
+        store.insert_episode(&ep).await.unwrap();
+        // Older pct-only event (legacy shape)…
+        store.record_user_events(&uid, &[(ep.id.clone(), "play_progress".into(), Some(serde_json::json!({"progressPct": 40})))]).await.unwrap();
+        // …then a newer event with absolute seconds — the latest wins.
+        store.record_user_events(&uid, &[(ep.id.clone(), "play_progress".into(), Some(serde_json::json!({"time": 420.0, "progressPct": 42})))]).await.unwrap();
+
+        // Barely started (<30s) → filtered out.
+        let mut ep2 = sample_episode();
+        ep2.id = format!("ep-{}", uuid::Uuid::new_v4().simple());
+        ep2.source.url = format!("https://example.com/{}", &ep2.id);
+        ep2.source.duration = 1000.0;
+        store.insert_episode(&ep2).await.unwrap();
+        store.record_user_events(&uid, &[(ep2.id.clone(), "play_progress".into(), Some(serde_json::json!({"time": 10.0})))]).await.unwrap();
+
+        // Finished (>=95%) → filtered out.
+        let mut ep3 = sample_episode();
+        ep3.id = format!("ep-{}", uuid::Uuid::new_v4().simple());
+        ep3.source.url = format!("https://example.com/{}", &ep3.id);
+        ep3.source.duration = 1000.0;
+        store.insert_episode(&ep3).await.unwrap();
+        store.record_user_events(&uid, &[(ep3.id.clone(), "play_progress".into(), Some(serde_json::json!({"time": 990.0})))]).await.unwrap();
+
+        let items = store.continue_listening(&uid, 12).await.unwrap();
+        assert_eq!(items.len(), 1, "only the mid-episode survives the filters");
+        assert_eq!(items[0].episode.id, ep.id);
+        assert!((items[0].resume_at - 420.0).abs() < 1e-6, "latest absolute time wins over legacy pct");
+
+        // Legacy pct-only events still resolve via pct * duration.
+        let uid2 = format!("u-{}", uuid::Uuid::new_v4().simple());
+        store.record_user_events(&uid2, &[(ep.id.clone(), "play_progress".into(), Some(serde_json::json!({"progressPct": 50})))]).await.unwrap();
+        let items2 = store.continue_listening(&uid2, 12).await.unwrap();
+        assert_eq!(items2.len(), 1);
+        assert!((items2[0].resume_at - 500.0).abs() < 1e-6, "pct fallback = pct * duration");
+
+        store.delete_episode(&ep.id).await.unwrap();
+        store.delete_episode(&ep2.id).await.unwrap();
+        store.delete_episode(&ep3.id).await.unwrap();
     }
 
     #[tokio::test]

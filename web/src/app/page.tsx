@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
-import { listEpisodes, listMyTags, setFavorite, setMyTags, formatDuration, formatDate, getGoogleLoginUrl } from "@/lib/api";
+import { listEpisodes, listMyTags, setFavorite, setMyTags, formatDuration, formatDate, getGoogleLoginUrl, getContinueListening, type ContinueListeningItem } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { Episode } from "@/lib/types";
 
@@ -257,6 +257,8 @@ export default function Home() {
   const { user, loading: authLoading, logout } = useAuth();
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [total, setTotal] = useState(0);
+  // Continue listening (INV-1912): latest play_progress per episode, server-side.
+  const [continueItems, setContinueItems] = useState<ContinueListeningItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -335,6 +337,17 @@ export default function Home() {
       setLoading(false);
     }
   }, [authLoading, user, fetchEpisodes, refreshTagCloud, filterMode, tagFilter, sortMode]);
+
+  // Refresh the continue-listening strip whenever the user changes (also
+  // after coming back from an episode — refetch on focus is cheap).
+  useEffect(() => {
+    if (!user) { setContinueItems([]); return; }
+    let alive = true;
+    getContinueListening().then((items) => { if (alive) setContinueItems(items); });
+    const onFocus = () => getContinueListening().then((items) => { if (alive) setContinueItems(items); });
+    window.addEventListener("focus", onFocus);
+    return () => { alive = false; window.removeEventListener("focus", onFocus); };
+  }, [user]);
 
   const handleToggleFavorite = useCallback(
     (id: string, favorited: boolean) => {
@@ -444,6 +457,42 @@ export default function Home() {
               onSubmitted={fetchEpisodes}
               canPublishPrivate={Boolean(user.role === "admin" || user.can_publish_private)}
             />
+          </div>
+        )}
+
+        {continueItems.length > 0 && (
+          <div className="mb-8">
+            <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100 mb-3">
+              ▶️ 继续收听
+            </h2>
+            <div className="flex gap-3 overflow-x-auto pb-2">
+              {continueItems.map(({ episode: ep, resumeAt }) => {
+                const pct = ep.source.duration > 0 ? Math.min(100, (resumeAt / ep.source.duration) * 100) : 0;
+                return (
+                  <Link
+                    key={ep.id}
+                    href={`/episodes/${ep.id}?t=${Math.floor(resumeAt)}`}
+                    className="group shrink-0 w-64 p-3 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 hover:border-blue-400 hover:shadow-sm transition-all"
+                  >
+                    <div className="flex gap-3">
+                      {ep.source.thumbnailUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={ep.source.thumbnailUrl} alt="" className="w-16 h-16 rounded-lg object-cover" />
+                      ) : (
+                        <div className="w-16 h-16 rounded-lg bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center text-2xl">🎙️</div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-medium text-zinc-800 dark:text-zinc-200 line-clamp-2 group-hover:text-blue-600 dark:group-hover:text-blue-400">{ep.source.title}</p>
+                        <p className="mt-1 text-xs text-zinc-400">{formatDuration(resumeAt)} / {formatDuration(ep.source.duration)}</p>
+                        <div className="mt-2 h-1.5 rounded-full bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
+                          <div className="h-full bg-blue-600 rounded-full" style={{ width: `${pct}%` }} />
+                        </div>
+                      </div>
+                    </div>
+                  </Link>
+                );
+              })}
+            </div>
           </div>
         )}
 

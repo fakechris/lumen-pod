@@ -7,7 +7,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
-import { getEpisode, updateEpisode, deleteEpisode, listCollections, createCollection, formatTimestamp, formatDuration, formatDate, getExportUrl, sendChatMessage, listChatMessages, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, setFavorite, setMyTags, reportEvents, listChatSessions, createChatSession, listSessionMessages, sendSessionMessage, renameChatSession, deleteChatSession, type ChatMsg, type ChatAnchor, type ChatSession, type BatchStatus } from "@/lib/api";
+import { getEpisode, updateEpisode, deleteEpisode, listCollections, listFavoriteEpisodes, createCollection, formatTimestamp, formatDuration, formatDate, getExportUrl, sendChatMessage, listChatMessages, requestChapterDeepRead, requestEpisodeArticle, startBatchDeepRead, getBatchDeepReadStatus, cancelBatchDeepRead, setFavorite, setMyTags, reportEvents, listChatSessions, createChatSession, listSessionMessages, sendSessionMessage, renameChatSession, deleteChatSession, type ChatMsg, type ChatAnchor, type ChatSession, type BatchStatus } from "@/lib/api";
 import { normalizeMathDelimiters } from "@/lib/markdown";
 import { useAuth } from "@/lib/auth";
 import type { Article, Collection, Episode } from "@/lib/types";
@@ -49,11 +49,19 @@ interface PlayerHandle {
 // Audio Player
 // ---------------------------------------------------------------------------
 
-function AudioPlayer({ sources, onReady, onTimeUpdate }: {
+function AudioPlayer({ sources, onReady, onTimeUpdate, onPlaybackFinished, autoPlay }: {
   sources: string[];
   onReady?: (h: PlayerHandle) => void;
   onTimeUpdate?: (t: number) => void;
+  /** Fired when the LAST part finishes playing (whole episode done). */
+  onPlaybackFinished?: () => void;
+  /** Try to start playback as soon as the timeline is ready (autoplay queue). */
+  autoPlay?: boolean;
 }) {
+  const onFinishedRef = useRef(onPlaybackFinished);
+  onFinishedRef.current = onPlaybackFinished;
+  const autoPlayRef = useRef(autoPlay);
+  autoPlayRef.current = autoPlay;
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
   const [durations, setDurations] = useState<number[]>(() => sources.map(() => 0));
@@ -72,6 +80,7 @@ function AudioPlayer({ sources, onReady, onTimeUpdate }: {
   }, [durations]);
   const totalDuration = useMemo(() => durations.reduce((a, d) => a + (d || 0), 0), [durations]);
   const durationsReady = totalDuration > 0;
+  const autoPlayTriedRef = useRef(false);
 
   // Refs mirroring the timeline so event listeners always read fresh values.
   const offsetsRef = useRef(offsets);
@@ -123,6 +132,12 @@ function AudioPlayer({ sources, onReady, onTimeUpdate }: {
     };
     const handle: PlayerHandle = { seekTo: seekToGlobal, getCurrentTime: () => offsetsRef.current[partIndexRef.current] + audio.currentTime };
     const onLoaded = () => {
+      // Autoplay queue: start as soon as the first part is playable. Browsers
+      // may refuse without a fresh gesture — that's fine, just don't retry.
+      if (autoPlayRef.current && !autoPlayTriedRef.current) {
+        autoPlayTriedRef.current = true;
+        audioRef.current?.play().catch(() => {});
+      }
       setDurations((prev) => {
         const next = [...prev];
         next[partIndexRef.current] = audio.duration || 0;
@@ -151,6 +166,9 @@ function AudioPlayer({ sources, onReady, onTimeUpdate }: {
           setPartIndex(next);
           // autoplay continues via onLoaded + wasPlayingRef
         }
+      } else {
+        // Whole episode finished — let the host decide (autoplay queue).
+        onFinishedRef.current?.();
       }
     };
     audio.addEventListener("loadedmetadata", onLoaded);
@@ -622,6 +640,39 @@ export default function EpisodeDetail({ id }: { id: string }) {
 
   // YouTube: trigger activation from chapter click
   const [ytAutoActivate, setYtAutoActivate] = useState(false);
+  // Autoplay queue (INV-1912): after the last audio part ends, jump to the
+  // next favorite. Toggle persists in localStorage; the queued page starts
+  // playback via a session flag.
+  const [autoQueue, setAutoQueue] = useState(() => {
+    try { return localStorage.getItem("lp-autoplay-next") !== "0"; } catch { return true; }
+  });
+  const [autoQueueStart, setAutoQueueStart] = useState(false);
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem("lp-autoplay-go") === "1") {
+        sessionStorage.removeItem("lp-autoplay-go");
+        setAutoQueueStart(true);
+      }
+    } catch {}
+  }, []);
+  const queueBusyRef = useRef(false);
+  const handlePlaybackFinished = useCallback(() => {
+    if (!autoQueue || queueBusyRef.current) return;
+    queueBusyRef.current = true;
+    (async () => {
+      try {
+        const favorites = await listFavoriteEpisodes();
+        const idx = favorites.findIndex((f) => f.id === id);
+        if (idx >= 0 && favorites.length > 1) {
+          const next = favorites[(idx + 1) % favorites.length];
+          try { sessionStorage.setItem("lp-autoplay-go", "1"); } catch {}
+          router.push(`/episodes/${next.id}`);
+        }
+      } finally {
+        queueBusyRef.current = false;
+      }
+    })();
+  }, [autoQueue, id, router]);
 
   // Anchored chat: a session to create as soon as ChatTab mounts/updates
   // (started from a chapter card or a text selection in Article/Transcript).
@@ -682,7 +733,7 @@ export default function EpisodeDetail({ id }: { id: string }) {
     reportEvents([{
       episodeId: id,
       type: "play_progress",
-      payload: duration > 0 ? { progressPct: Math.round((currentTime / duration) * 100) } : undefined,
+      payload: duration > 0 ? { time: Math.round(currentTime * 10) / 10, progressPct: Math.round((currentTime / duration) * 100) } : undefined,
     }]);
   }, [currentTime, episode, id]);
 
@@ -1231,7 +1282,22 @@ export default function EpisodeDetail({ id }: { id: string }) {
                       : "-mx-4 px-4 pb-1"
                   }`}
                 >
-                  <AudioPlayer sources={audioSources} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} />
+                  <AudioPlayer sources={audioSources} onReady={handlePlayerReady} onTimeUpdate={setCurrentTime} onPlaybackFinished={hasAudio ? handlePlaybackFinished : undefined} autoPlay={autoQueueStart} />
+                  {hasAudio && (
+                    <div className="flex items-center justify-end gap-2 pb-1">
+                      <button
+                        onClick={() => {
+                          const next = !autoQueue;
+                          setAutoQueue(next);
+                          try { localStorage.setItem("lp-autoplay-next", next ? "1" : "0"); } catch {}
+                        }}
+                        className={`text-xs px-2 py-1 rounded-lg border transition-colors ${autoQueue ? "bg-blue-600 text-white border-blue-600" : "border-zinc-300 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:border-blue-400"}`}
+                        title="播完本集后自动播放收藏夹中的下一集"
+                      >
+                        {autoQueue ? "⏭ 连播收藏夹：开" : "⏭ 连播收藏夹：关"}
+                      </button>
+                    </div>
+                  )}
                   {stickyPlayer && (
                     <div className="flex gap-1 overflow-x-auto bg-white dark:bg-zinc-900 rounded-xl border border-zinc-200 dark:border-zinc-800 p-1">
                       {TABS.map((tab) => (

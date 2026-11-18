@@ -103,6 +103,29 @@ export async function setFavorite(
   });
 }
 
+/** A "continue listening" card: the episode plus where to resume (seconds). */
+export interface ContinueListeningItem {
+  episode: Episode;
+  resumeAt: number;
+}
+
+export async function getContinueListening(): Promise<ContinueListeningItem[]> {
+  try {
+    const d = await apiFetch<{ items?: ContinueListeningItem[] }>("/api/me/continue-listening");
+    return d.items ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function listFavoriteEpisodes(): Promise<Episode[]> {
+  try {
+    return await apiFetch("/api/me/favorites");
+  } catch {
+    return [];
+  }
+}
+
 export async function listMyTags(): Promise<{ tags: [string, number][] }> {
   return apiFetch("/api/me/tags");
 }

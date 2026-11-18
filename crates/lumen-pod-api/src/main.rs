@@ -149,6 +149,7 @@ async fn run_server(database_url: &str) {
         .route("/api/episodes/{id}/favorite", axum::routing::put(set_favorite))
         .route("/api/episodes/{id}/my-tags", axum::routing::put(set_my_tags))
         .route("/api/me/favorites", get(list_favorites))
+        .route("/api/me/continue-listening", get(continue_listening))
         .route("/api/me/tags", get(list_my_tags))
         .route("/api/events", axum::routing::post(record_events))
         .route(
@@ -870,6 +871,29 @@ async fn set_favorite(
         Json(serde_json::json!({ "favorited": req.favorited })),
     )
         .into_response()
+}
+
+async fn continue_listening(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let viewer = match auth::resolve_viewer(&state, &headers).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match state.store.continue_listening(&viewer.user_id, 12).await {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "items": items.iter().map(|it| serde_json::json!({
+                    "episode": serde_json::to_value(&it.episode).unwrap_or_default(),
+                    "resumeAt": it.resume_at,
+                })).collect::<Vec<_>>()
+            })),
+        )
+            .into_response(),
+        Err(e) => err_500(e),
+    }
 }
 
 async fn list_favorites(
